@@ -2997,7 +2997,8 @@ app.use(async (req, res) => {
 </html>`);
 });
 
-const PORT = 7697;
-app.listen(PORT, () => {
-    console.log(`🏦 NORV Bank running on http://localhost:${PORT}`);
+const PORT = process.env.PORT || 7622;
+
+app.listen(PORT, "0.0.0.0", () => {
+    console.log(`🚀 Server running on port ${PORT}`);
 });
