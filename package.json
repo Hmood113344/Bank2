@@ -1,0 +1,14 @@
+{
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "express": "^5.2.1",
+    "express-session": "^1.19.0",
+    "mongodb": "^7.5.0",
+    "mongoose": "^9.9.3",
+    "passport": "^0.7.0",
+    "passport-discord": "^0.1.4"
+  }
+}
