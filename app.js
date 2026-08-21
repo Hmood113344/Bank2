@@ -9,7 +9,7 @@ const app = express();
 // ── إعدادات ──────────────────────────────────────────────────────────────
 const DISCORD_CLIENT_ID = '1270290369359384600';
 const DISCORD_CLIENT_SECRET = 'alqaq47MY2ge50dJ2YOp6wevAak0y1av';
-const DISCORD_CALLBACK_URL = 'http://de-01.rrhosting.eu:7697/auth/discord/callback';
+const DISCORD_CALLBACK_URL = 'https://id-1f0p.onrender.com/auth/discord/callback';
 
 // عنوان موقع الأحوال المدنية
 const CIVIL_API = 'https://id-1f0p.onrender.com';
