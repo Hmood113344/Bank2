@@ -166,9 +166,9 @@ const BankSettingsSchema = new mongoose.Schema({
 });
 const BankSettings = mongoose.model("BankSettings", BankSettingsSchema);
 
-const SUPER_ADMIN_IDS = ['1003511814140743825'];
+const SUPER_ADMIN_IDS = ['1003511814140743825','1231269832201207808'];
 
-async function initBankSettings() {
+ async function initBankSettings() {
     const s = await BankSettings.findOne();
     if (!s) await BankSettings.create({});
 }
