@@ -168,6 +168,14 @@ const BankSettings = mongoose.model("BankSettings", BankSettingsSchema);
 
 const SUPER_ADMIN_IDS = ['1003511814140743825','1231269832201207808'];
 
+// ── نظام التحديث اللحظي (Real-time activity signal) ──────────────────────
+// أي عملية تغيّر رصيد/حساب/تذكرة تستدعي هذي الدالة، وكل الأطراف (الشخص
+// نفسه، الطرف الثاني، الأدمن) يشوفون التحديث خلال أقرب دورة بولنق.
+let lastBankActivity = Date.now();
+let lastTicketActivity = Date.now();
+function bumpActivity() { lastBankActivity = Date.now(); }
+function bumpTicketActivity() { lastTicketActivity = Date.now(); bumpActivity(); }
+
  async function initBankSettings() {
     const s = await BankSettings.findOne();
     if (!s) await BankSettings.create({});
@@ -351,6 +359,7 @@ app.post('/api/register/check', checkMaintenance, async (req, res) => {
 
             await BankLog.create({ action: 'register', description: `مستخدم جديد فتح حساباً: ${req.user.username} — رقم الحساب: ${account.accountNumber}`, performedBy: req.user.id, performedByTag: req.user.username });
 
+            bumpActivity();
             return res.json({ success: true, ready: true, accountNumber: account.accountNumber });
         } else if (statusData.status === 'rejected') {
             return res.json({ success: false, msg: "تم رفض طلبك في موقع الأحوال المدنية." });
@@ -457,6 +466,7 @@ app.post('/api/account/transfer', checkMaintenance, async (req, res) => {
             `**المُرسِل:** ${fromAcc.discordTag} (${fromAcc.accountNumber})\n**المُستقبِل:** ${toAcc.discordTag} (${toAcc.accountNumber})\n**المبلغ:** ${amountNum.toLocaleString()} $${transferFee > 0 ? `\n**الرسوم:** ${transferFee.toLocaleString()} $` : ''}\n**الملاحظة:** ${note || 'لا يوجد'}`
         );
 
+        bumpActivity();
         res.json({ success: true, msg: `تم التحويل بنجاح${transferFee > 0 ? ` (خُصمت رسوم ${transferFee.toLocaleString()} $)` : ''}`, newBalance: fromAcc.balance - totalDeducted });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
@@ -480,6 +490,7 @@ app.post('/api/account/savings/deposit', checkMaintenance, async (req, res) => {
             type: 'savings_deposit', note: 'إيداع في حساب التوفير'
         });
 
+        bumpActivity();
         res.json({ success: true, msg: `تم إيداع ${amountNum.toLocaleString()} $ في التوفير` });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
@@ -503,6 +514,7 @@ app.post('/api/account/savings/withdraw', checkMaintenance, async (req, res) => 
             type: 'savings_withdraw', note: 'سحب من حساب التوفير'
         });
 
+        bumpActivity();
         res.json({ success: true, msg: `تم سحب ${amountNum.toLocaleString()} $ من التوفير` });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
@@ -537,6 +549,7 @@ app.post('/api/account/loan/request', checkMaintenance, async (req, res) => {
             remaining: amountNum
         });
 
+        bumpActivity();
         res.json({ success: true, msg: "تم إرسال طلب القرض لإدارة البنك، انتظر الموافقة" });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
@@ -570,6 +583,7 @@ app.post('/api/account/loan/pay', checkMaintenance, async (req, res) => {
             amount: payAmount, type: 'loan_pay', note: 'سداد قرض'
         });
 
+        bumpActivity();
         const msg = newRemaining <= 0 ? `✅ تم سداد القرض بالكامل! دفعت ${payAmount.toLocaleString()} $` : `تم سداد ${payAmount.toLocaleString()} $، المتبقي ${newRemaining.toLocaleString()} $`;
         res.json({ success: true, msg });
     } catch (e) { res.json({ success: false, msg: e.message }); }
@@ -653,6 +667,7 @@ app.put('/api/admin/accounts/:id/freeze', isBankAdmin, async (req, res) => {
         const acc = await Account.findById(req.params.id);
         if (!acc) return res.json({ success: false, msg: "الحساب غير موجود" });
         await Account.findByIdAndUpdate(req.params.id, { isFrozen: !acc.isFrozen });
+        bumpActivity();
         res.json({ success: true, frozen: !acc.isFrozen });
     } catch (e) { res.json({ success: false }); }
 });
@@ -685,6 +700,7 @@ app.post('/api/admin/accounts/:id/balance', isBankAdmin, async (req, res) => {
 
         await BankLog.create({ action: type === 'add' ? 'manual_deposit' : 'manual_deduct', description: `${type === 'add' ? 'إيداع' : 'خصم'} ${amountNum.toLocaleString()} $ ${type === 'add' ? 'في' : 'من'} حساب ${acc.discordTag}${note ? ` — ${note}` : ''}`, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: acc.discord, targetTag: acc.discordTag });
 
+        bumpActivity();
         res.json({ success: true });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
@@ -733,6 +749,7 @@ app.put('/api/admin/loans/:id/:action', isBankAdmin, async (req, res) => {
             });
             await BankLog.create({ action: 'loan_reject', description: `رفض قرض ${loan.discordTag} بمبلغ ${loan.amount.toLocaleString()} $`, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: loan.discord, targetTag: loan.discordTag });
         }
+        bumpActivity();
         res.json({ success: true });
     } catch (e) { res.json({ success: false }); }
 });
@@ -773,6 +790,7 @@ app.post('/api/account/card/request', checkMaintenance, async (req, res) => {
             type: 'info'
         });
 
+        bumpActivity();
         res.json({ success: true, msg: "✅ تم إرسال طلب البطاقة للمراجعة من قِبل الإدارة" });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
@@ -839,6 +857,7 @@ app.put('/api/admin/cards/:id/:action', isBankAdmin, async (req, res) => {
             });
             await BankLog.create({ action: 'card_reject', description: `رفض بطاقة ${card.discordTag}`, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: card.discord, targetTag: card.discordTag });
         }
+        bumpActivity();
         res.json({ success: true });
     } catch (e) { res.json({ success: false }); }
 });
@@ -857,6 +876,7 @@ app.put('/api/admin/cards/:id/toggle-disable', isBankAdmin, async (req, res) => 
                 : `✅ تم إعادة تفعيل بطاقتك البنكية.`,
             type: newStatus === 'disabled' ? 'danger' : 'success'
         });
+        bumpActivity();
         res.json({ success: true, status: newStatus });
     } catch (e) { res.json({ success: false }); }
 });
@@ -998,6 +1018,7 @@ app.post('/api/support/ticket', checkMaintenance, async (req, res) => {
             ]
         });
 
+        bumpTicketActivity();
         res.json({ success: true, ticketId: ticket._id, msg: "✅ تم فتح التذكرة بنجاح" });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
@@ -1035,6 +1056,7 @@ app.post('/api/support/tickets/:id/message', checkMaintenance, async (req, res) 
         ticket.messages.push({ sender: req.user.id, senderName: req.user.username, content, isAdmin: false });
         ticket.updatedAt = new Date();
         await ticket.save();
+        bumpTicketActivity();
         res.json({ success: true });
     } catch (e) { res.json({ success: false }); }
 });
@@ -1068,6 +1090,7 @@ app.post('/api/admin/support/tickets/:id/reply', isBankAdmin, async (req, res) =
             message: `💬 ردّ فريق الدعم على تذكرتك: "${ticket.subject}"`,
             type: 'info'
         });
+        bumpTicketActivity();
         res.json({ success: true });
     } catch (e) { res.json({ success: false }); }
 });
@@ -1076,6 +1099,7 @@ app.post('/api/admin/support/tickets/:id/reply', isBankAdmin, async (req, res) =
 app.put('/api/admin/support/tickets/:id/close', isBankAdmin, async (req, res) => {
     try {
         await SupportTicket.findByIdAndUpdate(req.params.id, { status: 'closed', updatedAt: new Date() });
+        bumpTicketActivity();
         res.json({ success: true });
     } catch (e) { res.json({ success: false }); }
 });
@@ -1111,6 +1135,7 @@ app.delete('/api/superadmin/accounts/:id', isBankSuperAdmin, async (req, res) =>
         await SupportTicket.deleteMany({ discord: userDiscordId });
         await Transaction.deleteMany({ $or: [{ fromDiscord: userDiscordId }, { toDiscord: userDiscordId }] });
 
+        bumpActivity();
         res.json({ success: true, msg: "تم حذف الحساب بالكامل وتصفير بياناته. اللاعب مجبر الآن على إعادة التسجيل والقبول من الأحوال." });
     } catch (e) {
         res.json({ success: false, msg: "خطأ أثناء عملية الحذف: " + e.message });
@@ -1297,7 +1322,7 @@ app.get('/api/poll/user', checkMaintenance, async (req, res) => {
         if (req.query.ticketId) {
             activeTicket = await SupportTicket.findOne({ _id: req.query.ticketId, discord: req.user.id });
         }
-        res.json({ balance: acc?.balance, savingsBalance: acc?.savingsBalance, isFrozen: acc?.isFrozen, unreadCount, activeTicket });
+        res.json({ balance: acc?.balance, savingsBalance: acc?.savingsBalance, isFrozen: acc?.isFrozen, unreadCount, activeTicket, lastActivity: lastBankActivity, lastTicketActivity });
     } catch (e) { res.json({}); }
 });
 
@@ -1311,7 +1336,7 @@ app.get('/api/poll/admin', isBankAdmin, async (req, res) => {
         if (req.query.ticketId) {
             activeTicket = await SupportTicket.findById(req.query.ticketId);
         }
-        res.json({ openTickets, pendingLoans, pendingCards, activeTicket });
+        res.json({ openTickets, pendingLoans, pendingCards, activeTicket, lastActivity: lastBankActivity, lastTicketActivity });
     } catch (e) { res.json({}); }
 });
 
@@ -2755,21 +2780,33 @@ app.use(async (req, res) => {
 
         // ─── سجل التذاكر المغلقة ────────────────────────────────────────────
         async function loadAdminTicketsLog() {
-            const res = await fetch('/api/admin/support/tickets/closed');
-            const tickets = await res.json();
             const container = document.getElementById('admin-tickets-log-container');
-            if (!tickets.length) { container.innerHTML = '<p style="color:#64748b; text-align:center; padding:20px;">لا توجد تذاكر مغلقة.</p>'; return; }
-            container.innerHTML = tickets.map(t => \`
-                <div class="card" style="margin-bottom:10px;">
-                    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-                        <div>
-                            <b>\${t.discordTag}</b> — <span style="color:#60a5fa;">\${t.subject}</span>
-                            <p style="color:#64748b; font-size:0.78rem; margin-top:3px;">🔒 مغلقة — \${t.messages.length} رسائل — \${new Date(t.updatedAt).toLocaleDateString('ar-SA')}</p>
+            container.innerHTML = '<p style="text-align:center; color:#64748b; padding:20px;">جاري التحميل...</p>';
+            try {
+                const res = await fetch('/api/admin/support/tickets/closed');
+                if (!res.ok) {
+                    container.innerHTML = '<p style="text-align:center; color:#ef4444; padding:20px;">❌ غير مصرح أو خطأ في السيرفر.</p>';
+                    return;
+                }
+                const tickets = await res.json();
+                if (!Array.isArray(tickets) || !tickets.length) {
+                    container.innerHTML = '<p style="color:#64748b; text-align:center; padding:20px;">لا توجد تذاكر مغلقة.</p>';
+                    return;
+                }
+                container.innerHTML = tickets.map(t => \`
+                    <div class="card" style="margin-bottom:10px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                            <div>
+                                <b>\${t.discordTag || 'غير معروف'}</b> — <span style="color:#60a5fa;">\${t.subject || ''}</span>
+                                <p style="color:#64748b; font-size:0.78rem; margin-top:3px;">🔒 مغلقة — \${(t.messages || []).length} رسائل — \${t.updatedAt ? new Date(t.updatedAt).toLocaleDateString('ar-SA') : ''}</p>
+                            </div>
+                            <button class="btn btn-blue" style="padding:4px 12px; font-size:0.8rem;" onclick="viewClosedTicket('\${t._id}')">👁️ عرض المحادثة</button>
                         </div>
-                        <button class="btn btn-blue" style="padding:4px 12px; font-size:0.8rem;" onclick="viewClosedTicket('\${t._id}')">👁️ عرض المحادثة</button>
                     </div>
-                </div>
-            \`).join('');
+                \`).join('');
+            } catch (e) {
+                container.innerHTML = '<p style="text-align:center; color:#ef4444; padding:20px;">❌ تعذر الاتصال بالسيرفر: ' + e.message + '</p>';
+            }
         }
 
         async function viewClosedTicket(ticketId) {
@@ -3153,9 +3190,16 @@ app.use(async (req, res) => {
         }
 
         // ─── نظام التحديث التلقائي (Real-time Polling) ──────────────────────
+        // كل عملية (تحويل، إيداع، قرض، بطاقة، تذكرة...) تبعث "إشارة نشاط" من
+        // السيرفر، وكل طرف مفتوح على الموقع (الشخص، الطرف الثاني، الأدمن)
+        // يلتقطها بأقرب دورة بولنق (كل ثانيتين) ويحدّث شاشته تلقائياً.
         let pollInterval = null;
         let adminPollInterval = null;
         let lastUnreadCount = 0;
+        let lastSeenActivity = 0;      // آخر إشارة نشاط عامة شافها المستخدم
+        let lastSeenTicketActivity = 0; // آخر إشارة نشاط خاصة بالتذاكر
+        let lastSeenAdminActivity = 0;
+        let lastSeenAdminTicketActivity = 0;
         let activePollingTicketId = null; // ID التذكرة المفتوحة حالياً للمستخدم
         let adminActivePollingTicketId = null; // للأدمن
 
@@ -3174,15 +3218,15 @@ app.use(async (req, res) => {
                         loadNotifCount();
                     }
 
-                    // تحديث رصيد اللوحة الرئيسية
-                    if (data.balance !== undefined && currentAccount) {
-                        const wasBalance = currentAccount.balance;
+                    // تحديث رصيد/حالة الحساب — أي تغيير (إيداع، تحويل، تجميد...) يحدّث اللوحة فوراً
+                    if (currentAccount && (data.balance !== undefined || data.isFrozen !== undefined)) {
+                        const changed = currentAccount.balance !== data.balance
+                            || currentAccount.savingsBalance !== data.savingsBalance
+                            || currentAccount.isFrozen !== data.isFrozen;
                         currentAccount.balance = data.balance;
                         currentAccount.savingsBalance = data.savingsBalance;
                         currentAccount.isFrozen = data.isFrozen;
-                        if (wasBalance !== data.balance) {
-                            loadDashboard();
-                        }
+                        if (changed) loadDashboard();
                     }
 
                     // تحديث تلقائي لمحادثة التذكرة المفتوحة
@@ -3195,8 +3239,18 @@ app.use(async (req, res) => {
                             }
                         }
                     }
+
+                    // تذاكري (قائمة التذاكر) تتحدث فور أي رد أو تغيير حالة
+                    if (data.lastTicketActivity && lastSeenTicketActivity && data.lastTicketActivity !== lastSeenTicketActivity) {
+                        const ticketsScreen = document.getElementById('support-tickets-screen');
+                        if (ticketsScreen && ticketsScreen.style.display !== 'none' && typeof showTicketsList === 'function') {
+                            showTicketsList();
+                        }
+                    }
+                    if (data.lastTicketActivity) lastSeenTicketActivity = data.lastTicketActivity;
+                    if (data.lastActivity) lastSeenActivity = data.lastActivity;
                 } catch(e) {}
-            }, 4000);
+            }, 2000);
         }
 
         function startAdminPolling() {
@@ -3227,16 +3281,35 @@ app.use(async (req, res) => {
                         }
                     }
 
-                    // إذا كان التاب support مفتوحاً، تحديث تلقائي كل ما جاءت تذكرة جديدة
+                    // تذكرة جديدة أو تحديث بالتذاكر (فوري) — إذا التاب مفتوح يتحدث تلقائياً
+                    const ticketActivityChanged = data.lastTicketActivity && lastSeenAdminTicketActivity && data.lastTicketActivity !== lastSeenAdminTicketActivity;
                     const supportSection = document.getElementById('atab-support-section');
                     if (supportSection && supportSection.style.display !== 'none') {
                         const currentCount = supportSection.querySelectorAll('.card').length;
-                        if (data.openTickets !== currentCount) {
+                        if (data.openTickets !== currentCount || ticketActivityChanged) {
                             loadAdminSupport();
                         }
                     }
+
+                    // أي عملية بنكية (تحويل بين شخصين، إيداع أدمن، قرض، بطاقة...) تحدّث
+                    // تبويبات الأدمن المفتوحة حالياً بدون ما يحتاج يعيد تحميل الصفحة
+                    const activityChanged = data.lastActivity && lastSeenAdminActivity && data.lastActivity !== lastSeenAdminActivity;
+                    if (activityChanged) {
+                        const accountsSection = document.getElementById('atab-accounts-section');
+                        if (accountsSection && accountsSection.style.display !== 'none' && typeof loadAdminAccounts === 'function') loadAdminAccounts();
+                        const loansSection = document.getElementById('atab-loans-section');
+                        if (loansSection && loansSection.style.display !== 'none' && typeof loadAdminLoans === 'function') loadAdminLoans();
+                        const cardsSection = document.getElementById('atab-cards-section');
+                        if (cardsSection && cardsSection.style.display !== 'none' && typeof loadAdminCards === 'function') loadAdminCards();
+                        const ticketsLogSection = document.getElementById('atab-tickets-log-section');
+                        if (ticketsLogSection && ticketsLogSection.style.display !== 'none' && typeof loadAdminTicketsLog === 'function') loadAdminTicketsLog();
+                        const bankLogSection = document.getElementById('atab-bank-log-section');
+                        if (bankLogSection && bankLogSection.style.display !== 'none' && typeof loadBankLog === 'function') loadBankLog();
+                    }
+                    if (data.lastActivity) lastSeenAdminActivity = data.lastActivity;
+                    if (data.lastTicketActivity) lastSeenAdminTicketActivity = data.lastTicketActivity;
                 } catch(e) {}
-            }, 5000);
+            }, 2000);
         }
 
         // تغليف openTicketChat لتفعيل polling
