@@ -224,10 +224,13 @@ async function checkMaintenance(req, res, next) {
 }
 
 // ── دوال مساعدة ─────────────────────────────────────────────────────────────
+// ترتيب الرتب: user < staff (موظف) < management (إداري) < admin (رئيس البنك) < super_admin (كبار المسؤولين)
 async function getBankRole(discordId) {
     if (SUPER_ADMIN_IDS.includes(discordId)) return 'super_admin';
     const s = await BankSettings.findOne();
     if (s && s.adminList.includes(discordId)) return 'admin';
+    const staff = await Staff.findOne({ discord: discordId, isActive: true });
+    if (staff) return staff.role === 'management' ? 'management' : 'staff';
     return 'user';
 }
 
@@ -243,6 +246,22 @@ async function isBankSuperAdmin(req, res, next) {
     const role = await getBankRole(req.user.id);
     if (role === 'super_admin') return next();
     return res.status(403).json({ success: false, msg: "للمسؤولين الكبار فقط" });
+}
+
+// موظف فما فوق: يقدر يوصل القروض والبطاقات وخدمة العملاء (بدون التحويل/القرض العام ولا الحسابات)
+async function isStaffOrAbove(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ success: false, msg: "يجب تسجيل الدخول" });
+    const role = await getBankRole(req.user.id);
+    if (['staff', 'management', 'admin', 'super_admin'].includes(role)) { req.bankRole = role; return next(); }
+    return res.status(403).json({ success: false, msg: "غير مصرح" });
+}
+
+// إداري فما فوق: زيادة على الموظف، يوصل قسم الحسابات
+async function isManagementOrAbove(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ success: false, msg: "يجب تسجيل الدخول" });
+    const role = await getBankRole(req.user.id);
+    if (['management', 'admin', 'super_admin'].includes(role)) { req.bankRole = role; return next(); }
+    return res.status(403).json({ success: false, msg: "غير مصرح" });
 }
 
 // دالة إرسال الويب هوك للديسكورد عند العمليات المالية
@@ -655,14 +674,14 @@ app.post('/api/admin/toggle-feature', isBankAdmin, async (req, res) => {
     }
 });
 
-app.get('/api/admin/accounts', isBankAdmin, async (req, res) => {
+app.get('/api/admin/accounts', isManagementOrAbove, async (req, res) => {
     try {
         const accounts = await Account.find().sort({ createdAt: -1 });
         res.json(accounts);
     } catch (e) { res.json([]); }
 });
 
-app.put('/api/admin/accounts/:id/freeze', isBankAdmin, async (req, res) => {
+app.put('/api/admin/accounts/:id/freeze', isManagementOrAbove, async (req, res) => {
     try {
         const acc = await Account.findById(req.params.id);
         if (!acc) return res.json({ success: false, msg: "الحساب غير موجود" });
@@ -705,14 +724,14 @@ app.post('/api/admin/accounts/:id/balance', isBankAdmin, async (req, res) => {
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
 
-app.get('/api/admin/loans', isBankAdmin, async (req, res) => {
+app.get('/api/admin/loans', isStaffOrAbove, async (req, res) => {
     try {
         const loans = await Loan.find({ status: { $in: ['pending', 'approved'] } }).sort({ requestedAt: -1 });
         res.json(loans);
     } catch (e) { res.json([]); }
 });
 
-app.put('/api/admin/loans/:id/:action', isBankAdmin, async (req, res) => {
+app.put('/api/admin/loans/:id/:action', isStaffOrAbove, async (req, res) => {
     try {
         const { id, action } = req.params;
         const loan = await Loan.findById(id);
@@ -805,7 +824,7 @@ app.get('/api/account/cards', checkMaintenance, async (req, res) => {
 });
 
 // عرض جميع طلبات البطاقات للأدمن
-app.get('/api/admin/cards', isBankAdmin, async (req, res) => {
+app.get('/api/admin/cards', isStaffOrAbove, async (req, res) => {
     try {
         const cards = await CardRequest.find({ status: 'pending' }).sort({ requestedAt: -1 });
         res.json(cards);
@@ -813,7 +832,7 @@ app.get('/api/admin/cards', isBankAdmin, async (req, res) => {
 });
 
 // قرار الأدمن على طلب البطاقة
-app.put('/api/admin/cards/:id/:action', isBankAdmin, async (req, res) => {
+app.put('/api/admin/cards/:id/:action', isStaffOrAbove, async (req, res) => {
     try {
         const { id, action } = req.params;
         const { adminNote } = req.body;
@@ -948,7 +967,7 @@ app.delete('/api/superadmin/cards/:id', isBankSuperAdmin, async (req, res) => {
 });
 
 // تعيين حد البطاقات لحساب معين
-app.post('/api/admin/accounts/:id/card-limit', isBankAdmin, async (req, res) => {
+app.post('/api/admin/accounts/:id/card-limit', isManagementOrAbove, async (req, res) => {
     try {
         const { limit } = req.body;
         await Account.findByIdAndUpdate(req.params.id, { cardLimit: parseInt(limit) });
@@ -957,16 +976,23 @@ app.post('/api/admin/accounts/:id/card-limit', isBankAdmin, async (req, res) => 
 });
 
 // إرسال إشعار/ملاحظة لحساب من الأدمن
-app.post('/api/admin/accounts/:id/notify', isBankAdmin, async (req, res) => {
+app.post('/api/admin/accounts/:id/notify', isManagementOrAbove, async (req, res) => {
     try {
-        const { message, type } = req.body;
+        const { message } = req.body;
+        let { type } = req.body;
         const acc = await Account.findById(req.params.id);
         if (!acc) return res.json({ success: false, msg: "الحساب غير موجود" });
         if (!message) return res.json({ success: false, msg: "الرسالة مطلوبة" });
+
+        // الإداري (management) يقدر يرسل إشعار غير مهم فقط (info)، ما يجيه أي عداد/رقم إشعار للعضو
+        const isManagementOnly = req.bankRole === 'management';
+        if (isManagementOnly) type = 'info';
+
         await Notification.create({
             discord: acc.discord,
             message: `📢 رسالة من الإدارة: ${message}`,
-            type: type || 'info'
+            type: type || 'info',
+            read: isManagementOnly ? true : false   // مقروء مسبقاً حتى ما يظهر رقم إشعار جديد للعضو
         });
         res.json({ success: true, msg: "تم إرسال الإشعار" });
     } catch (e) { res.json({ success: false }); }
@@ -1062,7 +1088,7 @@ app.post('/api/support/tickets/:id/message', checkMaintenance, async (req, res) 
 });
 
 // عرض جميع التذاكر للأدمن
-app.get('/api/admin/support/tickets', isBankAdmin, async (req, res) => {
+app.get('/api/admin/support/tickets', isStaffOrAbove, async (req, res) => {
     try {
         const tickets = await SupportTicket.find({ status: { $in: ['open', 'in_progress'] } }).sort({ updatedAt: -1 });
         res.json(tickets);
@@ -1070,7 +1096,7 @@ app.get('/api/admin/support/tickets', isBankAdmin, async (req, res) => {
 });
 
 // رد الأدمن على تذكرة
-app.post('/api/admin/support/tickets/:id/reply', isBankAdmin, async (req, res) => {
+app.post('/api/admin/support/tickets/:id/reply', isStaffOrAbove, async (req, res) => {
     try {
         const { content } = req.body;
         if (!content) return res.json({ success: false });
@@ -1096,7 +1122,7 @@ app.post('/api/admin/support/tickets/:id/reply', isBankAdmin, async (req, res) =
 });
 
 // إغلاق تذكرة (أدمن)
-app.put('/api/admin/support/tickets/:id/close', isBankAdmin, async (req, res) => {
+app.put('/api/admin/support/tickets/:id/close', isStaffOrAbove, async (req, res) => {
     try {
         await SupportTicket.findByIdAndUpdate(req.params.id, { status: 'closed', updatedAt: new Date() });
         bumpTicketActivity();
@@ -1297,7 +1323,7 @@ app.put('/api/superadmin/cards/:id/set-expiry', isBankSuperAdmin, async (req, re
 });
 
 // ── API: الحصول على تذكرة واحدة مغلقة (للأدمن) ─────────────────────────
-app.get('/api/admin/support/tickets/:id', isBankAdmin, async (req, res) => {
+app.get('/api/admin/support/tickets/:id', isStaffOrAbove, async (req, res) => {
     try {
         const ticket = await SupportTicket.findById(req.params.id);
         res.json(ticket);
@@ -1305,7 +1331,7 @@ app.get('/api/admin/support/tickets/:id', isBankAdmin, async (req, res) => {
 });
 
 // ── API: سجل التذاكر المغلقة (الأدمن) ──────────────────────────────────
-app.get('/api/admin/support/tickets/closed', isBankAdmin, async (req, res) => {
+app.get('/api/admin/support/tickets/closed', isStaffOrAbove, async (req, res) => {
     try {
         const tickets = await SupportTicket.find({ status: 'closed' }).sort({ updatedAt: -1 }).limit(100);
         res.json(tickets);
@@ -1327,7 +1353,7 @@ app.get('/api/poll/user', checkMaintenance, async (req, res) => {
 });
 
 // ── API: polling للأدمن (تحديث تلقائي) ─────────────────────────────────
-app.get('/api/poll/admin', isBankAdmin, async (req, res) => {
+app.get('/api/poll/admin', isStaffOrAbove, async (req, res) => {
     try {
         const openTickets = await SupportTicket.countDocuments({ status: { $in: ['open', 'in_progress'] } });
         const pendingLoans = await Loan.countDocuments({ status: 'pending' });
@@ -1943,8 +1969,25 @@ app.use(async (req, res) => {
                 <button class="hamburger-btn" id="hamburger-btn" onclick="toggleMobileMenu()">☰</button>
                 <button class="btn btn-red" style="padding:0.4rem 0.8rem; font-size:0.8rem;" onclick="location.href='/logout'">خروج</button>
             \`;
-            if(currentRole === 'admin' || currentRole === 'super_admin') {
+            if(['staff','management','admin','super_admin'].includes(currentRole)) {
                 document.getElementById('admin-fab-btn').style.display = 'block';
+
+                if (currentRole === 'staff') {
+                    // موظف: القروض + البطاقات + الدعم فقط
+                    document.getElementById('admin-fab-btn').innerText = '⚙️ لوحة الموظف';
+                    document.getElementById('admin-panel-title').innerText = "لوحة الموظف 👤";
+                    ['atab-stats','atab-accounts','atab-card-control','atab-tickets-log','atab-staff','atab-locks'].forEach(id => {
+                        const b = document.getElementById(id); if (b) b.style.display = 'none';
+                    });
+                } else if (currentRole === 'management') {
+                    // إداري: القروض + البطاقات + الدعم + الحسابات
+                    document.getElementById('admin-fab-btn').innerText = '⚙️ لوحة الإداري';
+                    document.getElementById('admin-panel-title').innerText = "لوحة الإداري 🏢";
+                    ['atab-stats','atab-card-control','atab-tickets-log','atab-staff','atab-locks'].forEach(id => {
+                        const b = document.getElementById(id); if (b) b.style.display = 'none';
+                    });
+                }
+
                 if(currentRole === 'super_admin') {
                     document.getElementById('atab-settings').style.display = 'block';
                     document.getElementById('atab-bank-log').style.display = 'block';
@@ -1956,7 +1999,7 @@ app.use(async (req, res) => {
             await loadDashboard();
             loadNotifCount();
             startUserPolling();
-            if (currentRole === 'admin' || currentRole === 'super_admin') startAdminPolling();
+            if (['staff','management','admin','super_admin'].includes(currentRole)) startAdminPolling();
         }
 
         async function registerStep1() {
@@ -2187,7 +2230,9 @@ app.use(async (req, res) => {
 
         function openAdminPanel() {
             document.getElementById('adminModal').style.display = 'block';
-            switchAdminTab('stats');
+            // موظف/إداري ما عندهم تبويب إحصائيات، فنفتح لهم على القروض افتراضياً
+            const defaultTab = (currentRole === 'staff' || currentRole === 'management') ? 'loans' : 'stats';
+            switchAdminTab(defaultTab);
         }
         function closeAdminModal() {
             document.getElementById('adminModal').style.display = 'none';
@@ -2303,6 +2348,8 @@ app.use(async (req, res) => {
                 const deleteButton = currentRole === 'super_admin' 
                     ? \`<button class="btn btn-red" style="padding:4px 10px; font-size:0.78rem; background:#dc2626;" onclick="deleteAccountEntirely('\${acc._id}', '\${acc.discordTag}')">🗑️ حذف كامل</button>\` 
                     : '';
+                // الإداري (management) ما يجيه زر حظر الدعم
+                const supportBanButton = currentRole === 'management' ? '' : \`<button class="btn \${acc.supportBanned ? 'btn-green' : 'btn-red'}" style="padding:4px 10px; font-size:0.78rem;" onclick="toggleSupportBan('\${acc._id}', '\${acc.supportBanned}')">\${acc.supportBanned ? '✅ رفع حظر الدعم' : '🚫 حظر من الدعم'}</button>\`;
 
                 return \`
                 <div class="card" style="margin-bottom:10px; \${acc.isFrozen ? 'border-color:#ef4444;' : ''}">
@@ -2321,7 +2368,7 @@ app.use(async (req, res) => {
                             <button class="btn btn-red" style="padding:4px 10px; font-size:0.78rem;" onclick="manualBalance('\${acc._id}', 'deduct')">- خصم</button>
                             <button class="btn" style="padding:4px 10px; font-size:0.78rem; background:#7c3aed;" onclick="setCardLimit('\${acc._id}', \${acc.cardLimit})">💳 حد البطاقات</button>
                             <button class="btn" style="padding:4px 10px; font-size:0.78rem; background:#0891b2;" onclick="sendAccountNotif('\${acc._id}')">📢 إشعار</button>
-                            <button class="btn \${acc.supportBanned ? 'btn-green' : 'btn-red'}" style="padding:4px 10px; font-size:0.78rem;" onclick="toggleSupportBan('\${acc._id}', '\${acc.supportBanned}')">\${acc.supportBanned ? '✅ رفع حظر الدعم' : '🚫 حظر من الدعم'}</button>
+                            \${supportBanButton}
                             \${deleteButton}
                         </div>
                     </div>
@@ -2345,7 +2392,8 @@ app.use(async (req, res) => {
         async function sendAccountNotif(id) {
             const message = prompt('نص الإشعار / الملاحظة للمستخدم:');
             if (!message) return;
-            const type = prompt('نوع الإشعار: info / success / warning / danger') || 'info';
+            // الإداري (management) يقدر يرسل إشعار غير مهم فقط، بدون ما يوصل العضو رقم إشعار جديد
+            const type = currentRole === 'management' ? 'info' : (prompt('نوع الإشعار: info / success / warning / danger') || 'info');
             const res = await fetch(\`/api/admin/accounts/\${id}/notify\`, {
                 method: 'POST', headers: {'Content-Type':'application/json'},
                 body: JSON.stringify({ message, type })
