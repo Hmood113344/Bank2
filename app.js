@@ -345,7 +345,7 @@ app.post('/api/register/check', checkMaintenance, async (req, res) => {
 
             await Notification.create({
                 discord: req.user.id,
-                message: `مرحباً بك في بنك نورف! 🎉 رقم حسابك هو: ${account.accountNumber}`,
+                message: `مرحباً بك في بنك وزارة الداخلية! 🎉 رقم حسابك هو: ${account.accountNumber}`,
                 type: 'success'
             });
 
@@ -993,7 +993,7 @@ app.post('/api/support/ticket', checkMaintenance, async (req, res) => {
             accountNumber: acc?.accountNumber || 'غير معروف',
             subject,
             messages: [
-                { sender: 'bot', senderName: 'بوت خدمة العملاء', content: `مرحباً ${req.user.username}! شكراً لتواصلك مع بنك نورف. سيتم مراجعة طلبك من قِبل فريق الدعم قريباً. يرجى الانتظار.`, isAdmin: false },
+                { sender: 'bot', senderName: 'بوت خدمة العملاء', content: `مرحباً ${req.user.username}! شكراً لتواصلك مع بنك وزارة الداخلية. سيتم مراجعة طلبك من قِبل فريق الدعم قريباً. يرجى الانتظار.`, isAdmin: false },
                 { sender: req.user.id, senderName: req.user.username, content: initialMessage, isAdmin: false }
             ]
         });
@@ -1107,6 +1107,9 @@ app.delete('/api/superadmin/accounts/:id', isBankSuperAdmin, async (req, res) =>
         await Account.findByIdAndDelete(req.params.id);
         await Loan.deleteMany({ discord: userDiscordId });
         await Notification.deleteMany({ discord: userDiscordId });
+        await CardRequest.deleteMany({ discord: userDiscordId });
+        await SupportTicket.deleteMany({ discord: userDiscordId });
+        await Transaction.deleteMany({ $or: [{ fromDiscord: userDiscordId }, { toDiscord: userDiscordId }] });
 
         res.json({ success: true, msg: "تم حذف الحساب بالكامل وتصفير بياناته. اللاعب مجبر الآن على إعادة التسجيل والقبول من الأحوال." });
     } catch (e) {
@@ -1319,7 +1322,7 @@ app.use(async (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>بنك نورف — NORV Bank</title>
+    <title>بنك وزارة الداخلية — MOI Bank</title>
     <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800;900&display=swap" rel="stylesheet">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1357,7 +1360,7 @@ app.use(async (req, res) => {
         .btn-full { width: 100%; padding: 0.75rem; margin-top: 0.3rem; }
 
         .account-card { background: linear-gradient(135deg, #1e3a5f, #0f2848); border: 2px solid #3b82f6; border-radius: 20px; padding: 2rem; margin-bottom: 1.5rem; position: relative; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-        .account-card::before { content: 'NORV BANK'; position: absolute; left: -20px; bottom: -15px; font-size: 5rem; font-weight: 900; color: rgba(255,255,255,0.03); pointer-events: none; }
+        .account-card::before { content: 'MOI BANK'; position: absolute; left: -20px; bottom: -15px; font-size: 5rem; font-weight: 900; color: rgba(255,255,255,0.03); pointer-events: none; }
         .account-number { font-size: 2rem; font-weight: 900; letter-spacing: 4px; color: #93c5fd; margin: 0.5rem 0; }
         .balance-display { font-size: 2.5rem; font-weight: 900; color: #4ade80; margin: 0.5rem 0; }
         .savings-display { font-size: 1.3rem; font-weight: 700; color: #fde047; }
@@ -1460,8 +1463,8 @@ app.use(async (req, res) => {
 
     <div id="login-screen" style="display:none;">
         <div style="text-align:center; padding: 8rem 2rem;">
-            <h1 style="font-size:3.5rem; font-weight:900; background: linear-gradient(90deg,#3b82f6,#60a5fa,#93c5fd); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:1rem;">🏦 بنك نورف</h1>
-            <p style="color:#64748b; margin-bottom:2rem; font-size:1.1rem;">NORV Bank — النظام المصرفي الرسمي</p>
+            <h1 style="font-size:3.5rem; font-weight:900; background: linear-gradient(90deg,#3b82f6,#60a5fa,#93c5fd); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:1rem;">🏦 بنك وزارة الداخلية</h1>
+            <p style="color:#64748b; margin-bottom:2rem; font-size:1.1rem;">MOI Bank — النظام المصرفي الرسمي</p>
             <button class="login-btn" style="padding:1rem 2.5rem; font-size:1.1rem; border-radius:12px;" onclick="location.href='/auth/discord'">
                 🔐 تسجيل الدخول عبر ديسكورد
             </button>
@@ -1495,7 +1498,7 @@ app.use(async (req, res) => {
     <div id="main-site" style="display:none;">
         <nav>
             <div>
-                <span class="logo">NORV BANK</span>
+                <span class="logo">MOI BANK</span>
                 <span class="logo-sub">النظام المصرفي الرسمي</span>
             </div>
             <ul class="nav-links">
@@ -1618,7 +1621,7 @@ app.use(async (req, res) => {
                 <label>المسمى الوظيفي:</label>
                 <input id="card-job" placeholder="مثال: محاسب" />
                 <label>اسم جهة العمل:</label>
-                <input id="card-employer" placeholder="مثال: شركة نورف للتطوير" />
+                <input id="card-employer" placeholder="مثال: شركة وزارة الداخلية للتطوير" />
                 <label>سبب طلب البطاقة:</label>
                 <input id="card-reason" placeholder="اشرح سبب حاجتك للبطاقة..." />
                 <button class="btn btn-blue btn-full" onclick="submitCardRequest()">📤 إرسال الطلب للمراجعة</button>
@@ -1669,7 +1672,7 @@ app.use(async (req, res) => {
             <!-- شاشة البوت (أسئلة أولية) -->
             <div id="support-bot-screen">
                 <div style="background:rgba(59,130,246,0.1); border:1px solid #3b82f6; border-radius:10px; padding:15px; margin-bottom:15px;">
-                    <p style="color:#60a5fa; font-weight:bold;">🤖 مرحباً! أنا مساعد بنك نورف</p>
+                    <p style="color:#60a5fa; font-weight:bold;">🤖 مرحباً! أنا مساعد بنك وزارة الداخلية</p>
                     <p style="color:#94a3b8; font-size:0.9rem; margin-top:5px;">سأساعدك في توجيه طلبك للفريق المناسب. يرجى الإجابة على الأسئلة التالية:</p>
                 </div>
                 <div id="bot-questions-container"></div>
@@ -2494,7 +2497,7 @@ app.use(async (req, res) => {
                         <div style="position:absolute; top:-20px; right:-20px; width:100px; height:100px; background:rgba(255,255,255,0.06); border-radius:50%;"></div>
                         <div style="position:absolute; bottom:-30px; left:-10px; width:130px; height:130px; background:rgba(255,255,255,0.04); border-radius:50%;"></div>
                         \${c.cardFrozen ? '<div style="position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.6); color:#fca5a5; font-size:0.7rem; padding:3px 8px; border-radius:6px; font-family:inherit;">🔒 مجمّدة</div>' : ''}
-                        <p style="font-size:0.7rem; color:\${theme.accent}; letter-spacing:2px; margin-bottom:14px;">NORV BANK</p>
+                        <p style="font-size:0.7rem; color:\${theme.accent}; letter-spacing:2px; margin-bottom:14px;">MOI BANK</p>
                         <p style="font-size:1.25rem; letter-spacing:3px; color:#e2e8f0; margin-bottom:14px;">\${c.cardNumber || '#### #### #### ####'}</p>
                         <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:8px;">
                             <div>
@@ -3255,7 +3258,7 @@ app.use(async (req, res) => {
     </script>
 
 <footer style="text-align: center; padding: 1.5rem; margin-top: 2rem; border-top: 1px solid rgba(59,130,246,0.2); background: rgba(5,15,30,0.8); color: #475569; font-size: 0.9rem;">
-    <p>جميع الحقوق محفوظة © 2026 | <span style="color: #3b82f6; font-weight: bold;">بنك نورف — NORV Bank</span></p>
+    <p>جميع الحقوق محفوظة © 2026 | <span style="color: #3b82f6; font-weight: bold;">بنك وزارة الداخلية — MOI Bank</span></p>
 </footer>
 </body>
 </html>`);
