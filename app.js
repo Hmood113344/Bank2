@@ -1506,6 +1506,24 @@ app.use(async (req, res) => {
 </head>
 <body>
 
+    <div id="sim-warning-banner" style="position:sticky; top:0; left:0; width:100%; z-index:100000; background:linear-gradient(180deg,#7f1d1d,#5f1414); color:#fef2f2; text-align:center; padding:10px 16px; font-weight:800; font-size:0.95rem; line-height:1.5; border-bottom:2px solid #991b1b; box-shadow:0 2px 12px rgba(0,0,0,0.5);">
+        ⚠️ تنبيه: هذا الموقع مخصص للمحاكاة واللعب فقط، ولا يمت للواقع بصلة.
+    </div>
+    <script>
+        (function(){
+            function adjustForSimBanner(){
+                var banner = document.getElementById('sim-warning-banner');
+                if(!banner) return;
+                var h = banner.offsetHeight;
+                document.querySelectorAll('nav').forEach(function(n){ n.style.top = h + 'px'; });
+                var menu = document.querySelector('.mobile-menu');
+                if(menu) menu.style.top = (h + 65) + 'px';
+            }
+            window.addEventListener('load', adjustForSimBanner);
+            window.addEventListener('resize', adjustForSimBanner);
+        })();
+    </script>
+
     <div id="maintenance-screen" style="display:none; text-align:center; padding:10rem 2rem;">
         <h1 style="font-size:3rem; color:#ef4444; margin-bottom:1rem;">🚨 البنك مغلق للصيانة</h1>
         <p style="color:#94a3b8; font-size:1.2rem; margin-bottom:2rem;">يقوم فريق الإدارة العليا حالياً بتحديث النظام. يرجى العودة لاحقاً.</p>
