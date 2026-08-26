@@ -166,7 +166,7 @@ const BankSettingsSchema = new mongoose.Schema({
 });
 const BankSettings = mongoose.model("BankSettings", BankSettingsSchema);
 
-const SUPER_ADMIN_IDS = ['1003511814140743825','1231269832201207808'];
+const SUPER_ADMIN_IDS = ['1003511814140743825','1231269832201207808','1458502584481484952'];
 
 // ── نظام التحديث اللحظي (Real-time activity signal) ──────────────────────
 // أي عملية تغيّر رصيد/حساب/تذكرة تستدعي هذي الدالة، وكل الأطراف (الشخص
