@@ -14,6 +14,9 @@ const DISCORD_CALLBACK_URL = 'https://bank2-w89b.onrender.com/auth/discord/callb
 // عنوان موقع الأحوال المدنية
 const CIVIL_API = 'https://id-1f0p.onrender.com';
 
+// عنوان موقع فلاش (العسكري) — غيّره لرابط موقع فلاش الفعلي على rrhosting
+const FLASH_API = 'https://flash1-wy0a.onrender.com';
+
 mongoose.connect("mongodb+srv://hmooduu6_db_user:0ks7Ktqh5IIteciW@cluster0.6bk7qm9.mongodb.net/?appName=Cluster0")
 .then(() => console.log("✅ Bank MongoDB connected"))
 .catch(err => console.log("❌ MongoDB error:", err));
@@ -165,6 +168,99 @@ const BankSettingsSchema = new mongoose.Schema({
     loanExpiryApplyTo: { type: String, default: 'new' }  // 'new' | 'existing' | 'both'
 });
 const BankSettings = mongoose.model("BankSettings", BankSettingsSchema);
+
+// إعدادات رواتب العساكر (ربط مع موقع فلاش)
+const MilitarySalarySchema = new mongoose.Schema({
+    isActive: { type: Boolean, default: false },
+    periodValue: { type: Number, default: 1 },          // الرقم (مثلاً 7)
+    periodUnit: { type: String, default: 'days' },       // days | weeks | months
+    ranksSalaries: { type: Map, of: Number, default: {} }, // رتبة -> راتب
+    lastPayoutAt: { type: Date, default: null },
+    nextPayoutAt: { type: Date, default: null },
+});
+const MilitarySalarySettings = mongoose.model("MilitarySalarySettings", MilitarySalarySchema);
+
+async function getMilitarySalarySettings() {
+    let s = await MilitarySalarySettings.findOne();
+    if (!s) s = await MilitarySalarySettings.create({});
+    return s;
+}
+
+// يحسب المدة بالميلي ثانية حسب الوحدة (أيام / أسابيع / أشهر)
+function periodToMs(value, unit) {
+    const v = Math.max(0, parseFloat(value) || 0);
+    if (unit === 'weeks') return v * 7 * 24 * 60 * 60 * 1000;
+    if (unit === 'months') return v * 30 * 24 * 60 * 60 * 1000; // تقريبي: الشهر = 30 يوم
+    return v * 24 * 60 * 60 * 1000; // days (افتراضي)
+}
+
+// تنفيذ عملية صرف رواتب العساكر: يجيب رتبة كل عسكري من موقع فلاش
+// ويودع الراتب المحدد لرتبته في حسابه البنكي المسجل
+async function runMilitarySalaryPayout() {
+    const settings = await getMilitarySalarySettings();
+    if (!settings.isActive) return { success: false, msg: "رواتب العساكر غير مفعّلة" };
+
+    let personnel;
+    try {
+        const resp = await fetch(`${FLASH_API}/api/bank/personnel-ranks`);
+        const data = await resp.json();
+        if (!data.success) throw new Error(data.msg || "فشل جلب بيانات العساكر");
+        personnel = data.personnel;
+    } catch (e) {
+        console.log("❌ تعذر الاتصال بموقع فلاش:", e.message);
+        return { success: false, msg: "تعذر الاتصال بموقع فلاش: " + e.message };
+    }
+
+    let paidCount = 0, totalPaid = 0;
+    for (const p of personnel) {
+        const salary = settings.ranksSalaries.get(p.rank);
+        if (!salary || salary <= 0) continue; // ما فيه راتب محدد لهذي الرتبة
+
+        const acc = await Account.findOne({ discord: p.discord });
+        if (!acc || acc.isFrozen) continue; // ما عنده حساب بنكي أو حسابه مجمد
+
+        await Account.findByIdAndUpdate(acc._id, { $inc: { balance: salary } });
+        await Transaction.create({
+            toDiscord: p.discord,
+            toAccount: acc.accountNumber,
+            amount: salary,
+            type: 'deposit',
+            note: `راتب عسكري — رتبة ${p.rank}`
+        });
+        await Notification.create({
+            discord: p.discord,
+            message: `💰 تم إيداع راتبك العسكري (${salary.toLocaleString()} $) عن رتبة ${p.rank}.`,
+            type: 'success'
+        });
+        paidCount++;
+        totalPaid += salary;
+    }
+
+    const now = new Date();
+    const nextPayoutAt = new Date(now.getTime() + periodToMs(settings.periodValue, settings.periodUnit));
+    await MilitarySalarySettings.updateOne({}, { lastPayoutAt: now, nextPayoutAt });
+
+    await BankLog.create({
+        action: 'military_salary_payout',
+        description: `صرف رواتب العساكر: ${paidCount} حساب بإجمالي ${totalPaid.toLocaleString()} $`,
+        performedBy: 'system',
+        performedByTag: 'نظام رواتب العساكر'
+    });
+
+    return { success: true, paidCount, totalPaid, nextPayoutAt };
+}
+
+// فحص دوري كل دقيقة: إذا حان وقت صرف الرواتب ينفذها تلقائياً
+setInterval(async () => {
+    try {
+        const settings = await getMilitarySalarySettings();
+        if (settings.isActive && settings.nextPayoutAt && new Date() >= new Date(settings.nextPayoutAt)) {
+            await runMilitarySalaryPayout();
+        }
+    } catch (e) {
+        console.log("❌ خطأ في فحص رواتب العساكر:", e.message);
+    }
+}, 60 * 1000);
 
 const SUPER_ADMIN_IDS = ['1003511814140743825','1231269832201207808'];
 
@@ -771,6 +867,86 @@ app.put('/api/admin/loans/:id/:action', isStaffOrAbove, async (req, res) => {
         bumpActivity();
         res.json({ success: true });
     } catch (e) { res.json({ success: false }); }
+});
+
+// ── APIs رواتب العساكر (ربط مع موقع فلاش — كبار المسؤولين فقط) ──────────────
+app.get('/api/superadmin/military-salary/ranks', isBankSuperAdmin, async (req, res) => {
+    try {
+        const resp = await fetch(`${FLASH_API}/api/bank/ranks`);
+        const data = await resp.json();
+        if (!data.success) return res.json({ success: false, msg: "تعذر جلب الرتب من موقع فلاش" });
+
+        const settings = await getMilitarySalarySettings();
+        const salaries = {};
+        data.ranks.forEach(r => { salaries[r] = settings.ranksSalaries.get(r) || 0; });
+
+        res.json({ success: true, ranks: data.ranks, salaries });
+    } catch (e) {
+        res.json({ success: false, msg: "تعذر الاتصال بموقع فلاش: " + e.message });
+    }
+});
+
+app.get('/api/superadmin/military-salary/status', isBankSuperAdmin, async (req, res) => {
+    const settings = await getMilitarySalarySettings();
+    res.json({
+        success: true,
+        isActive: settings.isActive,
+        periodValue: settings.periodValue,
+        periodUnit: settings.periodUnit,
+        ranksSalaries: Object.fromEntries(settings.ranksSalaries),
+        lastPayoutAt: settings.lastPayoutAt,
+        nextPayoutAt: settings.nextPayoutAt,
+    });
+});
+
+app.post('/api/superadmin/military-salary/save', isBankSuperAdmin, async (req, res) => {
+    try {
+        const { periodValue, periodUnit, ranksSalaries } = req.body;
+        if (!periodValue || parseFloat(periodValue) <= 0) return res.json({ success: false, msg: "أدخل مدة صحيحة أكبر من صفر" });
+        if (!['days', 'weeks', 'months'].includes(periodUnit)) return res.json({ success: false, msg: "وحدة مدة غير صحيحة" });
+
+        const settings = await getMilitarySalarySettings();
+        settings.periodValue = parseFloat(periodValue);
+        settings.periodUnit = periodUnit;
+        settings.ranksSalaries = new Map(Object.entries(ranksSalaries || {}).map(([r, v]) => [r, Math.max(0, parseFloat(v) || 0)]));
+        await settings.save();
+
+        await BankLog.create({ action: 'military_salary_config', description: `تحديث إعدادات رواتب العساكر — كل ${periodValue} ${periodUnit === 'days' ? 'يوم' : periodUnit === 'weeks' ? 'أسبوع' : 'شهر'}`, performedBy: req.user.id, performedByTag: req.user.username });
+
+        res.json({ success: true, msg: "تم حفظ إعدادات الرواتب بنجاح" });
+    } catch (e) {
+        res.json({ success: false, msg: e.message });
+    }
+});
+
+app.post('/api/superadmin/military-salary/toggle', isBankSuperAdmin, async (req, res) => {
+    try {
+        const settings = await getMilitarySalarySettings();
+        const newActive = !settings.isActive;
+
+        if (newActive) {
+            if (!settings.ranksSalaries || settings.ranksSalaries.size === 0) {
+                return res.json({ success: false, msg: "يجب تحديد رواتب الرتب وحفظها أولاً قبل التفعيل" });
+            }
+            const nextPayoutAt = new Date(Date.now() + periodToMs(settings.periodValue, settings.periodUnit));
+            await MilitarySalarySettings.updateOne({}, { isActive: true, nextPayoutAt });
+            await BankLog.create({ action: 'military_salary_activate', description: `تفعيل رواتب العساكر — أول دفعة بتاريخ ${nextPayoutAt.toLocaleString('ar-SA')}`, performedBy: req.user.id, performedByTag: req.user.username });
+        } else {
+            await MilitarySalarySettings.updateOne({}, { isActive: false, nextPayoutAt: null });
+            await BankLog.create({ action: 'military_salary_deactivate', description: `إيقاف رواتب العساكر`, performedBy: req.user.id, performedByTag: req.user.username });
+        }
+
+        res.json({ success: true, isActive: newActive });
+    } catch (e) {
+        res.json({ success: false, msg: e.message });
+    }
+});
+
+app.post('/api/superadmin/military-salary/run-now', isBankSuperAdmin, async (req, res) => {
+    const settings = await getMilitarySalarySettings();
+    if (!settings.isActive) return res.json({ success: false, msg: "يجب تفعيل النظام أولاً" });
+    const result = await runMilitarySalaryPayout();
+    res.json(result);
 });
 
 // ── APIs البطاقات البنكية ─────────────────────────────────────────────────────
@@ -1790,6 +1966,7 @@ app.use(async (req, res) => {
                 <button id="atab-staff" class="tab-btn" onclick="switchAdminTab('staff')">👔 الموظفون</button>
                 <button id="atab-locks" class="tab-btn" onclick="switchAdminTab('locks')">🔒 إيقاف الميزات</button>
                 <button id="atab-settings" class="tab-btn" style="display:none;" onclick="switchAdminTab('settings')">👑 إعدادات كبار المسؤولين</button>
+                <button id="atab-military-salary" class="tab-btn" style="display:none;" onclick="switchAdminTab('military-salary')">🎖️ رواتب العساكر</button>
                 <button id="atab-bank-log" class="tab-btn" style="display:none;" onclick="switchAdminTab('bank-log')">📜 سجل البنك</button>
             </div>
             
@@ -1939,6 +2116,38 @@ app.use(async (req, res) => {
                     <div id="admin-list-container"></div>
                 </div>
             </div>
+
+            <div id="atab-military-salary-section" style="display:none;">
+                <div class="card card-blue">
+                    <h2>🎖️ رواتب العساكر (ربط مع موقع فلاش)</h2>
+                    <p style="color:#94a3b8; font-size:0.85rem; margin-bottom:1rem;">حدد كل كم مدة تنزل رواتب العساكر، وحدد راتب كل رتبة. الراتب ينزل تلقائياً على الحساب البنكي المسجل لكل عسكري حسب رتبته في موقع فلاش.</p>
+
+                    <div id="military-salary-status" style="margin-bottom:14px;"></div>
+
+                    <div style="display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; margin-bottom:16px;">
+                        <div>
+                            <label>كل:</label>
+                            <input id="ms-period-value" type="number" min="1" placeholder="مثال: 7" style="width:100px;" />
+                        </div>
+                        <div>
+                            <label>الوحدة:</label>
+                            <select id="ms-period-unit">
+                                <option value="days">يوم</option>
+                                <option value="weeks">أسبوع</option>
+                                <option value="months">شهر</option>
+                            </select>
+                        </div>
+                        <button class="btn" id="ms-toggle-btn" onclick="toggleMilitarySalary()">فحص...</button>
+                        <button class="btn btn-blue" onclick="runMilitarySalaryNow()">💸 صرف الآن يدوياً</button>
+                    </div>
+
+                    <h4 style="color:#3b82f6; margin-bottom:10px;">🎖️ رواتب الرتب العسكرية:</h4>
+                    <div id="military-salary-ranks-container">جاري التحميل...</div>
+
+                    <button class="btn btn-green" style="margin-top:14px;" onclick="saveMilitarySalary()">💾 حفظ الإعدادات</button>
+                    <div id="military-salary-msg" style="margin-top:8px;"></div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -2010,6 +2219,7 @@ app.use(async (req, res) => {
                     document.getElementById('atab-settings').style.display = 'block';
                     document.getElementById('atab-bank-log').style.display = 'block';
                     document.getElementById('atab-card-control').style.display = 'block';
+                    document.getElementById('atab-military-salary').style.display = 'block';
                     document.getElementById('superadmin-only-locks').style.display = 'block';
                     document.getElementById('admin-panel-title').innerText = "لوحة كبار مسؤولي البنك 👑";
                 }
@@ -2257,7 +2467,7 @@ app.use(async (req, res) => {
         }
 
         function switchAdminTab(tab) {
-            ['stats','accounts','loans','cards','support','tickets-log','staff','locks','settings','card-control','bank-log'].forEach(t => {
+            ['stats','accounts','loans','cards','support','tickets-log','staff','locks','settings','card-control','bank-log','military-salary'].forEach(t => {
                 const btn = document.getElementById(\`atab-\${t}\`);
                 const sec = document.getElementById(\`atab-\${t}-section\`);
                 if(btn) btn.classList.remove('active');
@@ -2279,6 +2489,7 @@ app.use(async (req, res) => {
             if(tab === 'settings') { loadBankSettingsPanel(); loadFeesPanel(); }
             if(tab === 'card-control') loadCardControlPanel();
             if(tab === 'bank-log') loadBankLog();
+            if(tab === 'military-salary') loadMilitarySalaryPanel();
         }
 
         async function loadAdminStats() {
@@ -2908,6 +3119,88 @@ app.use(async (req, res) => {
                     \${l.performedByTag ? \`<p style="color:#64748b; font-size:0.75rem; margin-top:2px;">بواسطة: \${l.performedByTag}</p>\` : ''}
                 </div>
             \`).join('');
+        }
+
+        // ─── دوال رواتب العساكر (ربط مع موقع فلاش) ──────────────────────────
+        let msRanksCache = [];
+        async function loadMilitarySalaryPanel() {
+            const [ranksRes, statusRes] = await Promise.all([
+                fetch('/api/superadmin/military-salary/ranks'),
+                fetch('/api/superadmin/military-salary/status')
+            ]);
+            const ranksData = await ranksRes.json();
+            const status = await statusRes.json();
+
+            const container = document.getElementById('military-salary-ranks-container');
+            if (!ranksData.success) {
+                container.innerHTML = \`<p style="color:#fca5a5;">❌ \${ranksData.msg}</p>\`;
+                document.getElementById('ms-toggle-btn').innerText = 'غير متاح';
+                document.getElementById('ms-toggle-btn').disabled = true;
+                return;
+            }
+
+            msRanksCache = ranksData.ranks;
+            container.innerHTML = ranksData.ranks.map(r => \`
+                <div class="toggle-box">
+                    <span>🎖️ \${r}</span>
+                    <input type="number" min="0" class="ms-rank-input" data-rank="\${r}" value="\${status.ranksSalaries?.[r] ?? ranksData.salaries[r] ?? 0}" style="width:120px; margin-bottom:0;" />
+                </div>
+            \`).join('');
+
+            document.getElementById('ms-period-value').value = status.periodValue || 7;
+            document.getElementById('ms-period-unit').value = status.periodUnit || 'days';
+
+            const statusBox = document.getElementById('military-salary-status');
+            const toggleBtn = document.getElementById('ms-toggle-btn');
+            toggleBtn.disabled = false;
+            if (status.isActive) {
+                toggleBtn.innerText = '⏸️ إيقاف الرواتب';
+                toggleBtn.className = 'btn btn-red';
+                statusBox.innerHTML = \`
+                    <div class="toggle-box" style="border-color:#4ade80;">
+                        <span style="color:#4ade80;">✅ الرواتب مفعّلة</span>
+                        <span style="color:#94a3b8; font-size:0.8rem;">الدفعة القادمة: \${status.nextPayoutAt ? new Date(status.nextPayoutAt).toLocaleString('ar-SA') : '-'}</span>
+                    </div>
+                \`;
+            } else {
+                toggleBtn.innerText = '▶️ تفعيل الرواتب';
+                toggleBtn.className = 'btn btn-green';
+                statusBox.innerHTML = \`<div class="toggle-box"><span style="color:#f87171;">⏹️ الرواتب موقوفة حالياً</span></div>\`;
+            }
+        }
+
+        async function saveMilitarySalary() {
+            const periodValue = document.getElementById('ms-period-value').value;
+            const periodUnit = document.getElementById('ms-period-unit').value;
+            const ranksSalaries = {};
+            document.querySelectorAll('.ms-rank-input').forEach(inp => { ranksSalaries[inp.dataset.rank] = inp.value; });
+
+            const res = await fetch('/api/superadmin/military-salary/save', {
+                method: 'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({ periodValue, periodUnit, ranksSalaries })
+            });
+            const data = await res.json();
+            showMsg('military-salary-msg', (data.success?'✅ ':'❌ ')+data.msg, data.success?'success':'danger');
+        }
+
+        async function toggleMilitarySalary() {
+            const res = await fetch('/api/superadmin/military-salary/toggle', { method: 'POST' });
+            const data = await res.json();
+            if (!data.success) { showMsg('military-salary-msg', '❌ '+data.msg, 'danger'); return; }
+            loadMilitarySalaryPanel();
+        }
+
+        async function runMilitarySalaryNow() {
+            if (!confirm('متأكد تبي تصرف الرواتب الآن يدوياً لكل العساكر المستحقين؟')) return;
+            showMsg('military-salary-msg', 'جاري الصرف...', 'info');
+            const res = await fetch('/api/superadmin/military-salary/run-now', { method: 'POST' });
+            const data = await res.json();
+            if (data.success) {
+                showMsg('military-salary-msg', \`✅ تم صرف الرواتب لـ \${data.paidCount} حساب بإجمالي \${data.totalPaid.toLocaleString()} $\`, 'success');
+                loadMilitarySalaryPanel();
+            } else {
+                showMsg('military-salary-msg', '❌ '+data.msg, 'danger');
+            }
         }
 
         // ─── دوال الرسوم (كبار المسؤولين) ──────────────────────────────────
