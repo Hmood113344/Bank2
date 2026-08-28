@@ -1731,7 +1731,7 @@ app.use(async (req, res) => {
                 <div style="background:rgba(234,179,8,0.1); border:1px solid #eab308; border-radius:10px; padding:15px; margin-bottom:1rem;">
                     <p style="color:#fde047; font-weight:bold;">الخطوة 2: اذهب لموقع الأحوال المدنية</p>
                     <p style="color:#94a3b8; font-size:0.9rem; margin-top:8px;">افتح صفحة "طلبات البنك" في موقع الأحوال المدنية واضغط قبول، ثم عد هنا.</p>
-                    <a href="http://de-01.rrhosting.eu:7556" target="_blank" class="btn btn-yellow btn-full" style="display:block; text-align:center; margin-top:10px; text-decoration:none;">🔗 فتح موقع الأحوال المدنية</a>
+                    <a href="https://id-1f0p.onrender.com" target="_blank" class="btn btn-yellow btn-full" style="display:block; text-align:center; margin-top:10px; text-decoration:none;">🔗 فتح موقع الأحوال المدنية</a>
                 </div>
                 <button class="btn btn-green btn-full" onclick="registerStep2()" id="check-btn">✅ تحققت وقبلت — ادخلني للبنك</button>
                 <div id="reg-msg2" style="margin-top:1rem;"></div>
