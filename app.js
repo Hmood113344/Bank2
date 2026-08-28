@@ -17,7 +17,7 @@ const CIVIL_API = 'https://id-1f0p.onrender.com';
 // عنوان موقع فلاش (العسكري) — غيّره لرابط موقع فلاش الفعلي على rrhosting
 const FLASH_API = 'https://flash1-wy0a.onrender.com';
 
-mongoose.connect("mongodb+srv://hmooduu6_db_user:0ks7Ktqh5IIteciW@cluster0.6bk7qm9.mongodb.net/?appName=Cluster0")
+mongoose.connect("mongodb+srv://Flashidbank:1598@cluster0.c40vzpy.mongodb.net/?appName=Cluster0")
 .then(() => console.log("✅ Bank MongoDB connected"))
 .catch(err => console.log("❌ MongoDB error:", err));
 
