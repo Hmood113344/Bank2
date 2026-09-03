@@ -8,7 +8,7 @@ const app = express();
 
 // ── إعدادات ──────────────────────────────────────────────────────────────
 const DISCORD_CLIENT_ID = '1270290369359384600';
-const DISCORD_CLIENT_SECRET = 'alqaq47MY2ge50dJ2YOp6wevAak0y1av';
+const DISCORD_CLIENT_SECRET = 'oP2ABG5BXvQL3xyUS7Tkg3CPgD43GJk6';
 const DISCORD_CALLBACK_URL = 'https://bank2-w89b.onrender.com/auth/discord/callback';
 
 // عنوان موقع الأحوال المدنية
