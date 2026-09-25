@@ -15,7 +15,7 @@ const DISCORD_CALLBACK_URL = 'https://bank2-w89b.onrender.com/auth/discord/callb
 const CIVIL_API = 'https://id-1f0p.onrender.com';
 
 // عنوان موقع فلاش (العسكري) — غيّره لرابط موقع فلاش الفعلي على rrhosting
-const FLASH_API = 'https://flash1-wy0a.onrender.com';
+const FLASH_API = 'https://flash1-gtsp.onrender.com';
 
 // مفتاح داخلي مشترك مع موقع فلاش — يتحقق أن طلبات /api/flash/* جايه فعلاً من موقع فلاش
 // (لازم تكون نفس القيمة بالضبط بملف فلاش.js — CONFIG.INTERNAL_API_KEY)
