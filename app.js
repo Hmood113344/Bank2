@@ -316,6 +316,20 @@ passport.use(new DiscordStrategy({
 }, (accessToken, refreshToken, profile, done) => done(null, profile)));
 
 // جدار حماية لفحص صيانة البنك العامة
+// يتحقق أن هذا الشخص مسجّل فعلاً في موقع فلاش (عسكري معه رتبة معتمدة، أو مواطن مقبول ومسجّل)
+async function isFlashMember(discordId) {
+    try {
+        const r = await fetch(`${FLASH_API}/api/bank/verify-member/${discordId}`, {
+            headers: { 'x-internal-key': INTERNAL_API_KEY }
+        });
+        const data = await r.json();
+        return !!data.registered;
+    } catch (e) {
+        console.error('❌ تعذر التحقق من عضوية فلاش:', e.message);
+        return false; // لو تعذر الاتصال بموقع فلاش، نمنع الدخول احتياطاً (أسلم)
+    }
+}
+
 async function checkMaintenance(req, res, next) {
     const s = await BankSettings.findOne();
     if (s && s.isMaintenance) {
@@ -325,6 +339,16 @@ async function checkMaintenance(req, res, next) {
             if (role === 'super_admin' || role === 'admin') return next();
         }
         return res.status(503).json({ success: false, maintenance: true, msg: "🚨 البنك مغلق حالياً للصيانة العامة بطلب من الإدارة العليا." });
+    }
+    // البنك مخصص فقط لمنسوبي فلاش (عسكر مسجلين أو مواطنين مقبولين) — موظفو وإدارة البنك مستثنون من هذا الشرط
+    if (req.isAuthenticated()) {
+        const role = await getBankRole(req.user.id);
+        if (role === 'user') {
+            const member = await isFlashMember(req.user.id);
+            if (!member) {
+                return res.status(403).json({ success: false, notFlashMember: true, msg: "🚫 هذا البنك مخصص لمنسوبي فلاش فقط (عسكر مسجلين أو مواطنين مقبولين)." });
+            }
+        }
     }
     next();
 }
@@ -403,9 +427,11 @@ app.get('/logout', (req, res) => req.logout(() => res.redirect('/')));
 app.get('/api/auth/me', async (req, res) => {
     if (req.isAuthenticated()) {
         const role = await getBankRole(req.user.id);
+        let flashRegistered = true;
+        if (role === 'user') flashRegistered = await isFlashMember(req.user.id);
         const account = await Account.findOne({ discord: req.user.id });
         const settings = await BankSettings.findOne();
-        res.json({ loggedIn: true, user: req.user, role, hasAccount: !!account, maintenance: settings?.isMaintenance || false });
+        res.json({ loggedIn: true, user: req.user, role, hasAccount: !!account, maintenance: settings?.isMaintenance || false, flashRegistered });
     } else {
         const settings = await BankSettings.findOne();
         res.json({ loggedIn: false, maintenance: settings?.isMaintenance || false });
@@ -1778,6 +1804,12 @@ app.use(async (req, res) => {
         <button class="login-btn" onclick="location.href='/auth/discord'">🔐 تسجيل الدخول (للإدارة فقط)</button>
     </div>
 
+    <div id="not-member-screen" style="display:none; text-align:center; padding:10rem 2rem;">
+        <h1 style="font-size:3rem; color:#ef4444; margin-bottom:1rem;">🚫 غير مصرح بالدخول</h1>
+        <p style="color:#94a3b8; font-size:1.2rem; margin-bottom:2rem;">هذا البنك مخصص لمنسوبي فلاش فقط — عسكر مسجلين أو مواطنين مقبولين. سجّل أو راجع الإدارة في موقع فلاش أولاً.</p>
+        <button class="login-btn" onclick="location.href='/logout'">🚪 خروج</button>
+    </div>
+
     <div id="login-screen" style="display:none;">
         <div style="text-align:center; padding: 8rem 2rem;">
             <h1 style="font-size:3.5rem; font-weight:900; background: linear-gradient(90deg,#3b82f6,#60a5fa,#93c5fd); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:1rem;">🏦 بنك وزارة الداخلية</h1>
@@ -2242,6 +2274,11 @@ app.use(async (req, res) => {
 
             if (!data.loggedIn) {
                 document.getElementById('login-screen').style.display = 'block';
+                return;
+            }
+
+            if (!data.flashRegistered) {
+                document.getElementById('not-member-screen').style.display = 'block';
                 return;
             }
 
