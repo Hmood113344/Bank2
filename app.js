@@ -8,7 +8,7 @@ const app = express();
 
 // ── إعدادات ──────────────────────────────────────────────────────────────
 const DISCORD_CLIENT_ID = '1270290369359384600';
-const DISCORD_CLIENT_SECRET = 'oP2ABG5BXvQL3xyUS7Tkg3CPgD43GJk6';
+const DISCORD_CLIENT_SECRET = 'alqaq47MY2ge50dJ2YOp6wevAak0y1av';
 const DISCORD_CALLBACK_URL = 'https://bank2-w89b.onrender.com/auth/discord/callback';
 
 // عنوان موقع الأحوال المدنية
@@ -17,7 +17,17 @@ const CIVIL_API = 'https://id-1f0p.onrender.com';
 // عنوان موقع فلاش (العسكري) — غيّره لرابط موقع فلاش الفعلي على rrhosting
 const FLASH_API = 'https://flash1-wy0a.onrender.com';
 
-mongoose.connect("mongodb+srv://Flashidbank:1598@cluster0.c40vzpy.mongodb.net/?appName=Cluster0")
+// مفتاح داخلي مشترك مع موقع فلاش — يتحقق أن طلبات /api/flash/* جايه فعلاً من موقع فلاش
+// (لازم تكون نفس القيمة بالضبط بملف فلاش.js — CONFIG.INTERNAL_API_KEY)
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || 'flash_bank_internal_2026';
+function ensureInternalFlash(req, res, next) {
+    if (req.headers['x-internal-key'] !== INTERNAL_API_KEY) {
+        return res.status(403).json({ success: false, msg: 'طلب غير مصرّح به' });
+    }
+    next();
+}
+
+mongoose.connect("mongodb+srv://hmooduu6_db_user:0ks7Ktqh5IIteciW@cluster0.6bk7qm9.mongodb.net/?appName=Cluster0")
 .then(() => console.log("✅ Bank MongoDB connected"))
 .catch(err => console.log("❌ MongoDB error:", err));
 
@@ -262,7 +272,7 @@ setInterval(async () => {
     }
 }, 60 * 1000);
 
-const SUPER_ADMIN_IDS = ['1003511814140743825','1231269832201207808', '1470029805507317844'];
+const SUPER_ADMIN_IDS = ['1003511814140743825','1231269832201207808'];
 
 // ── نظام التحديث اللحظي (Real-time activity signal) ──────────────────────
 // أي عملية تغيّر رصيد/حساب/تذكرة تستدعي هذي الدالة، وكل الأطراف (الشخص
@@ -505,6 +515,68 @@ app.get('/api/account/transactions', checkMaintenance, async (req, res) => {
         }).sort({ createdAt: -1 }).limit(50);
         res.json(txs);
     } catch (e) { res.json([]); }
+});
+
+// ── APIs داخلية لموقع فلاش (سداد مخالفات المواطنين) ────────────────────────
+// يتحقق من رصيد المواطن قبل ما يعرض له فورم البطاقة
+app.get('/api/flash/balance/:discordId', ensureInternalFlash, async (req, res) => {
+    try {
+        const account = await Account.findOne({ discord: req.params.discordId });
+        if (!account) return res.json({ success: true, hasAccount: false });
+        res.json({ success: true, hasAccount: true, balance: account.balance, isFrozen: !!account.isFrozen });
+    } catch (e) { res.status(500).json({ success: false, msg: e.message }); }
+});
+
+// يسدد مخالفة عبر بطاقة المواطن (رقم البطاقة + الرقم السري) — يخصم من رصيده مباشرة
+app.post('/api/flash/violations/pay', ensureInternalFlash, checkMaintenance, async (req, res) => {
+    try {
+        const { discordId, cardNumber, cardPIN, amount, reason } = req.body;
+        if (!discordId || !cardNumber || !cardPIN || !amount) {
+            return res.json({ success: false, msg: 'بيانات ناقصة' });
+        }
+        const settings = await BankSettings.findOne();
+        if (settings && settings.disableCards) {
+            return res.json({ success: false, msg: '🔒 الدفع بالبطاقة موقف حالياً من قبل إدارة البنك.' });
+        }
+
+        const account = await Account.findOne({ discord: discordId });
+        if (!account) return res.json({ success: false, msg: 'لا يوجد حساب بنكي لهذا المواطن' });
+        if (account.isFrozen) return res.json({ success: false, msg: 'الحساب البنكي مجمّد' });
+
+        const normalizedInput = String(cardNumber).replace(/\s/g, '');
+        const card = await CardRequest.findOne({ discord: discordId, status: 'approved' });
+        if (!card || !card.cardNumber) return res.json({ success: false, msg: 'لا توجد بطاقة بنكية مفعّلة لهذا المواطن' });
+        if (card.cardFrozen) return res.json({ success: false, msg: 'البطاقة مجمّدة' });
+        if (!card.pinSet) return res.json({ success: false, msg: 'لم يتم تعيين رقم سري لهذه البطاقة بعد' });
+        const normalizedStored = String(card.cardNumber).replace(/\s/g, '');
+        if (normalizedStored !== normalizedInput || String(card.cardPIN) !== String(cardPIN)) {
+            return res.json({ success: false, msg: 'رقم البطاقة أو الرقم السري غير صحيح' });
+        }
+
+        const amt = Number(amount);
+        if (!(amt > 0)) return res.json({ success: false, msg: 'مبلغ غير صالح' });
+        if (account.balance < amt) return res.json({ success: false, msg: 'الرصيد لا يكفي' });
+
+        account.balance -= amt;
+        await account.save();
+
+        await Transaction.create({
+            fromDiscord: discordId, fromAccount: account.accountNumber,
+            toDiscord: null, toAccount: null,
+            amount: amt, type: 'violation_payment', note: reason || 'سداد مخالفة مرورية',
+        });
+        await Notification.create({
+            discord: discordId, type: 'warning',
+            message: `💳 تم خصم ${amt} من حسابك لسداد مخالفة${reason ? ' — ' + reason : ''}. الرصيد الحالي: ${account.balance}`,
+        });
+        await BankLog.create({
+            action: 'violation_payment', description: `سداد مخالفة عبر موقع فلاش — ${reason || ''} — المبلغ: ${amt}`,
+            performedBy: discordId, performedByTag: account.discordTag,
+        });
+        bumpActivity();
+
+        res.json({ success: true, newBalance: account.balance });
+    } catch (e) { res.status(500).json({ success: false, msg: e.message }); }
 });
 
 app.post('/api/account/transfer', checkMaintenance, async (req, res) => {
@@ -1731,7 +1803,7 @@ app.use(async (req, res) => {
                 <div style="background:rgba(234,179,8,0.1); border:1px solid #eab308; border-radius:10px; padding:15px; margin-bottom:1rem;">
                     <p style="color:#fde047; font-weight:bold;">الخطوة 2: اذهب لموقع الأحوال المدنية</p>
                     <p style="color:#94a3b8; font-size:0.9rem; margin-top:8px;">افتح صفحة "طلبات البنك" في موقع الأحوال المدنية واضغط قبول، ثم عد هنا.</p>
-                    <a href="https://id-1f0p.onrender.com" target="_blank" class="btn btn-yellow btn-full" style="display:block; text-align:center; margin-top:10px; text-decoration:none;">🔗 فتح موقع الأحوال المدنية</a>
+                    <a href="http://de-01.rrhosting.eu:7556" target="_blank" class="btn btn-yellow btn-full" style="display:block; text-align:center; margin-top:10px; text-decoration:none;">🔗 فتح موقع الأحوال المدنية</a>
                 </div>
                 <button class="btn btn-green btn-full" onclick="registerStep2()" id="check-btn">✅ تحققت وقبلت — ادخلني للبنك</button>
                 <div id="reg-msg2" style="margin-top:1rem;"></div>
