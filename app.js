@@ -5,6 +5,7 @@ const passport = require("passport");
 const crypto = require("crypto");
 
 const app = express();
+app.get('/healthz', (req, res) => res.type('text').send('ok'));
 
 // ── إعدادات ──────────────────────────────────────────────────────────────
 // عنوان موقع فلاش (تطبيق الويب الأساسي) — يقدر ينغيّر من متغير البيئة FLASH_URL على Render
@@ -19,7 +20,16 @@ const PROXY_TOKEN = INTERNAL_API_KEY ? crypto.createHmac('sha256', INTERNAL_API_
 function pfx(req) {
     return (PROXY_TOKEN && req.get('x-flash-proxy') === PROXY_TOKEN && req.get('x-forwarded-prefix') === '/bank') ? '/bank' : '';
 }
-function flashHome(req) { return pfx(req) ? '/' : FLASH_API; }
+function flashHome(req) { return pfx(req) ? '/' : '/to-flash'; }
+app.get('/api/flash-status', async (req, res) => {
+    try {
+        const r = await fetch(FLASH_API + '/healthz', { signal: AbortSignal.timeout(9000) });
+        res.json({ up: r.status < 500 });
+    } catch (e) { res.json({ up: false }); }
+});
+app.get('/to-flash', (req, res) => {
+    res.set('Cache-Control', 'no-store').type('html').send('<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>فلاش</title><style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0a1628;color:#e2e8f0;font-family:Tahoma,Arial,sans-serif;text-align:center;padding:20px}.sp{width:54px;height:54px;border:5px solid #1e3a5f;border-top-color:#3b82f6;border-radius:50%;animation:r 1s linear infinite;margin:0 auto 18px}@keyframes r{to{transform:rotate(360deg)}}p{font-size:18px;line-height:1.9;margin:0}small{color:#64748b;display:block;margin-top:10px}</style></head><body><div><div class="sp"></div><p>⚡ جاري تشغيل فلاش...</p><small id="m">ثواني ويفتح تلقائياً</small></div><script>var t0=Date.now(),T=' + JSON.stringify(FLASH_API) + ';function chk(){fetch("/api/flash-status").then(function(r){return r.json()}).then(function(d){if(d&&d.up){location.href=T}else{nx()}}).catch(nx)}function nx(){if(Date.now()-t0>180000){document.getElementById("m").textContent="فلاش تأخر، حدّث الصفحة بعد شوي";return}setTimeout(chk,2500)}chk();</script></body></html>');
+});
 async function flashGet(path) {
     if (!INTERNAL_API_KEY) throw new Error('INTERNAL_API_KEY غير مضبوط على خدمة البنك');
     const r = await fetch(FLASH_API + path, { headers: internalHeaders() });
@@ -447,7 +457,7 @@ async function genAccountNumber() {
     throw new Error('تعذر توليد رقم حساب');
 }
 function ssoPage(msg, home) {
-    home = home || FLASH_API;
+    home = home || '/to-flash';
     return `<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>بنك فلاش</title></head>
 <body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0a1628;color:#e2e8f0;font-family:Tahoma,Arial,sans-serif;text-align:center;padding:20px;">
 <div><div style="font-size:48px;">🏦</div><p style="font-size:18px;line-height:1.9;max-width:420px;">${msg}</p>
