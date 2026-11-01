@@ -1302,7 +1302,7 @@ app.post('/api/support/ticket', checkMaintenance, async (req, res) => {
             accountNumber: acc?.accountNumber || 'غير معروف',
             subject,
             messages: [
-                { sender: 'bot', senderName: 'بوت خدمة العملاء', content: `مرحباً ${req.user.username}! شكراً لتواصلك مع بنك وزارة الداخلية. سيتم مراجعة طلبك من قِبل فريق الدعم قريباً. يرجى الانتظار.`, isAdmin: false },
+                { sender: 'bot', senderName: 'بوت خدمة العملاء', content: `مرحباً ${req.user.username}! شكراً لتواصلك مع بنك فلاش. سيتم مراجعة طلبك من قِبل فريق الدعم قريباً. يرجى الانتظار.`, isAdmin: false },
                 { sender: req.user.id, senderName: req.user.username, content: initialMessage, isAdmin: false }
             ]
         });
@@ -1418,7 +1418,29 @@ app.delete('/api/superadmin/accounts/:id', isBankSuperAdmin, async (req, res) =>
 
 app.get('/api/superadmin/settings', isBankSuperAdmin, async (req, res) => {
     const s = await BankSettings.findOne();
-    res.json(s);
+    const out = s ? s.toObject() : {};
+    out.adminNames = {};
+    try {
+        const ids = (out.adminList || []).map(String);
+        const accs = await Account.find({ discord: { $in: ids } }, { discord: 1, discordTag: 1, accountNumber: 1 }).lean();
+        accs.forEach(a => { out.adminNames[a.discord] = { name: a.discordTag, accountNumber: a.accountNumber }; });
+        const missing = ids.filter(i => !out.adminNames[i]);
+        if (missing.length) {
+            const links = await FlashLink.find({ uid: { $in: missing } }, { uid: 1, name: 1 }).lean();
+            links.forEach(l => { out.adminNames[l.uid] = { name: l.name }; });
+        }
+    } catch (e) {}
+    res.json(out);
+});
+
+app.get('/api/admin/account-search', isBankAdmin, async (req, res) => {
+    try {
+        const q = String(req.query.q || '').trim().slice(0, 40);
+        if (q.length < 2) return res.json([]);
+        const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        const accs = await Account.find({ $or: [{ discordTag: rx }, { accountNumber: rx }] }, { discord: 1, discordTag: 1, accountNumber: 1 }).limit(8).lean();
+        res.json(accs.map(a => ({ uid: a.discord, name: a.discordTag, accountNumber: a.accountNumber })));
+    } catch (e) { res.json([]); }
 });
 
 app.post('/api/superadmin/settings', isBankSuperAdmin, async (req, res) => {
@@ -1428,14 +1450,18 @@ app.post('/api/superadmin/settings', isBankSuperAdmin, async (req, res) => {
 });
 
 app.post('/api/superadmin/admin/add', isBankSuperAdmin, async (req, res) => {
-    const { discordId } = req.body;
-    await BankSettings.updateOne({}, { $addToSet: { adminList: discordId } });
-    res.json({ success: true, msg: "تم تعيين مسؤول البنك" });
+    const uid = String(req.body.accountUid || req.body.discordId || '').trim();
+    if (!uid) return res.json({ success: false, msg: "اختر الحساب أولاً" });
+    const acc = await Account.findOne({ discord: uid });
+    if (!acc) return res.json({ success: false, msg: "هذا الحساب غير موجود — لازم يكون دخل البنك من فلاش مرة وحدة على الأقل" });
+    await BankSettings.updateOne({}, { $addToSet: { adminList: uid } });
+    await BankLog.create({ action: 'add_admin', description: `تم تعيين ${acc.discordTag} مسؤول للبنك`, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: uid, targetTag: acc.discordTag });
+    res.json({ success: true, msg: `تم تعيين ${acc.discordTag} مسؤول للبنك` });
 });
 
 app.post('/api/superadmin/admin/remove', isBankSuperAdmin, async (req, res) => {
-    const { discordId } = req.body;
-    await BankSettings.updateOne({}, { $pull: { adminList: discordId } });
+    const uid = String(req.body.accountUid || req.body.discordId || '').trim();
+    await BankSettings.updateOne({}, { $pull: { adminList: uid } });
     res.json({ success: true, msg: "تم إزالة المسؤول" });
 });
 
@@ -1468,11 +1494,15 @@ app.get('/api/superadmin/logs', isBankSuperAdmin, async (req, res) => {
 // توظيف موظف أو إدارة (super_admin يوظف كليهما، admin يوظف staff فقط)
 app.post('/api/staff/hire', isBankAdmin, async (req, res) => {
     try {
-        const { discordId, discordTag, staffRole } = req.body;
+        const { staffRole } = req.body;
+        const discordId = String(req.body.accountUid || req.body.discordId || '').trim();
         const myRole = await getBankRole(req.user.id);
         if (staffRole === 'management' && myRole !== 'super_admin')
             return res.json({ success: false, msg: "فقط كبار المسؤولين يمكنهم تعيين الإدارة" });
-        if (!discordId || !discordTag) return res.json({ success: false, msg: "بيانات ناقصة" });
+        if (!discordId) return res.json({ success: false, msg: "اختر الحساب أولاً" });
+        const targetAcc = await Account.findOne({ discord: discordId });
+        if (!targetAcc) return res.json({ success: false, msg: "هذا الحساب غير موجود — لازم يكون دخل البنك من فلاش مرة وحدة على الأقل" });
+        const discordTag = targetAcc.discordTag;
         const existing = await Staff.findOne({ discord: discordId });
         if (existing && existing.isActive) return res.json({ success: false, msg: "هذا الشخص موظف مسبقاً" });
         await Staff.findOneAndUpdate({ discord: discordId }, {
@@ -1635,7 +1665,7 @@ app.use(async (req, res) => {
             };
         })();
     </script>
-    <title>بنك وزارة الداخلية — MOI Bank</title>
+    <title>بنك فلاش — Flash Bank</title>
     <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800;900&display=swap" rel="stylesheet">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1673,7 +1703,12 @@ app.use(async (req, res) => {
         .btn-full { width: 100%; padding: 0.75rem; margin-top: 0.3rem; }
 
         .account-card { background: linear-gradient(135deg, #1e3a5f, #0f2848); border: 2px solid #3b82f6; border-radius: 20px; padding: 2rem; margin-bottom: 1.5rem; position: relative; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-        .account-card::before { content: 'MOI BANK'; position: absolute; left: -20px; bottom: -15px; font-size: 5rem; font-weight: 900; color: rgba(255,255,255,0.03); pointer-events: none; }
+        .account-card::before { content: 'FLASH BANK'; position: absolute; left: -20px; bottom: -15px; font-size: 5rem; font-weight: 900; color: rgba(255,255,255,0.03); pointer-events: none; }
+        .pick-box { position: relative; }
+        .pick-item { padding: 9px 12px; background: #0f1f3a; border: 1px solid #1e3a5f; border-radius: 8px; margin-top: 4px; cursor: pointer; font-size: 0.9rem; }
+        .pick-item:hover { background: #1e3a5f; }
+        .pick-item small { color: #64748b; margin-right: 8px; }
+        .pick-chosen { margin-top: 6px; color: #4ade80; font-weight: bold; font-size: 0.9rem; }
         .account-number { font-size: 2rem; font-weight: 900; letter-spacing: 4px; color: #93c5fd; margin: 0.5rem 0; }
         .balance-display { font-size: 2.5rem; font-weight: 900; color: #4ade80; margin: 0.5rem 0; }
         .savings-display { font-size: 1.3rem; font-weight: 700; color: #fde047; }
@@ -1800,8 +1835,8 @@ app.use(async (req, res) => {
 
     <div id="login-screen" style="display:none;">
         <div style="text-align:center; padding: 8rem 2rem;">
-            <h1 style="font-size:3.5rem; font-weight:900; background: linear-gradient(90deg,#3b82f6,#60a5fa,#93c5fd); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:1rem;">🏦 بنك وزارة الداخلية</h1>
-            <p style="color:#64748b; margin-bottom:2rem; font-size:1.1rem;">MOI Bank — النظام المصرفي الرسمي</p>
+            <h1 style="font-size:3.5rem; font-weight:900; background: linear-gradient(90deg,#3b82f6,#60a5fa,#93c5fd); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:1rem;">🏦 بنك فلاش</h1>
+            <p style="color:#64748b; margin-bottom:2rem; font-size:1.1rem;">Flash Bank — النظام المصرفي الرسمي</p>
             <p style="color:#94a3b8; margin-bottom:1.6rem; font-size:1rem; line-height:1.9;">الدخول للبنك يتم من داخل تطبيق فلاش.<br>افتح فلاش واضغط زر <b style="color:#fde047;">🏦 بنك فلاش</b> وبيفتح لك حسابك تلقائياً.</p>
             <button class="login-btn" style="padding:1rem 2.5rem; font-size:1.1rem; border-radius:12px;" onclick="location.href='${FLASH_HOME}'">
                 ↩️ الذهاب إلى فلاش
@@ -1812,7 +1847,7 @@ app.use(async (req, res) => {
     <div id="main-site" style="display:none;">
         <nav>
             <div>
-                <span class="logo">MOI BANK</span>
+                <span class="logo">FLASH BANK</span>
                 <span class="logo-sub">النظام المصرفي الرسمي</span>
             </div>
             <ul class="nav-links">
@@ -1935,7 +1970,7 @@ app.use(async (req, res) => {
                 <label>المسمى الوظيفي:</label>
                 <input id="card-job" placeholder="مثال: محاسب" />
                 <label>اسم جهة العمل:</label>
-                <input id="card-employer" placeholder="مثال: شركة وزارة الداخلية للتطوير" />
+                <input id="card-employer" placeholder="مثال: شركة فلاش للتطوير" />
                 <label>سبب طلب البطاقة:</label>
                 <input id="card-reason" placeholder="اشرح سبب حاجتك للبطاقة..." />
                 <button class="btn btn-blue btn-full" onclick="submitCardRequest()">📤 إرسال الطلب للمراجعة</button>
@@ -1986,7 +2021,7 @@ app.use(async (req, res) => {
             <!-- شاشة البوت (أسئلة أولية) -->
             <div id="support-bot-screen">
                 <div style="background:rgba(59,130,246,0.1); border:1px solid #3b82f6; border-radius:10px; padding:15px; margin-bottom:15px;">
-                    <p style="color:#60a5fa; font-weight:bold;">🤖 مرحباً! أنا مساعد بنك وزارة الداخلية</p>
+                    <p style="color:#60a5fa; font-weight:bold;">🤖 مرحباً! أنا مساعد بنك فلاش</p>
                     <p style="color:#94a3b8; font-size:0.9rem; margin-top:5px;">سأساعدك في توجيه طلبك للفريق المناسب. يرجى الإجابة على الأسئلة التالية:</p>
                 </div>
                 <div id="bot-questions-container"></div>
@@ -2067,13 +2102,12 @@ app.use(async (req, res) => {
                 <div class="card card-blue" style="margin-bottom:14px;">
                     <h2>👔 توظيف موظف جديد</h2>
                     <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end;">
-                        <div style="flex:1; min-width:150px;">
-                            <label>Discord ID:</label>
-                            <input id="hire-discord-id" placeholder="مثال: 12345678901234" style="margin-bottom:0;" />
-                        </div>
-                        <div style="flex:1; min-width:120px;">
-                            <label>اسم المستخدم:</label>
-                            <input id="hire-discord-tag" placeholder="مثال: Ahmed" style="margin-bottom:0;" />
+                        <div style="flex:2; min-width:200px;">
+                            <label>الحساب (ابحث بالاسم أو برقم الحساب):</label>
+                            <input id="hire-search" placeholder="اكتب اسم العضو أو رقم حسابه" autocomplete="off" style="margin-bottom:0;" />
+                            <input type="hidden" id="hire-uid" />
+                            <div id="hire-pick-box" class="pick-box"></div>
+                            <div id="hire-chosen" class="pick-chosen"></div>
                         </div>
                         <div>
                             <label>الرتبة:</label>
@@ -2179,7 +2213,12 @@ app.use(async (req, res) => {
                 <div class="card card-blue">
                     <h3>👥 إدارة مسؤولي البنك (رئيس بنك جديد)</h3><br>
                     <div style="display:flex; gap:10px; margin-bottom:10px;">
-                        <input id="new-admin-id" placeholder="Discord ID للمسؤول الجديد" style="margin-bottom:0;" />
+                        <div style="flex:1;">
+                            <input id="new-admin-search" placeholder="ابحث بالاسم أو برقم الحساب" autocomplete="off" style="margin-bottom:0;" />
+                            <input type="hidden" id="new-admin-id" />
+                            <div id="new-admin-pick-box" class="pick-box"></div>
+                            <div id="new-admin-chosen" class="pick-chosen"></div>
+                        </div>
                         <button class="btn btn-green" onclick="addBankAdmin()">تعيين</button>
                     </div>
                     <div id="admin-list-container"></div>
@@ -2601,7 +2640,6 @@ app.use(async (req, res) => {
                     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                         <div>
                             <b>\${acc.discordTag}</b>
-                            <span style="color:#64748b; font-size:0.82rem; margin-right:8px;">\${acc.discord}</span>
                             \${acc.isFrozen ? '<span class="frozen-badge">مجمد</span>' : ''}
                             \${acc.supportBanned ? '<span style="background:rgba(239,68,68,0.2); color:#fca5a5; border:1px solid #ef4444; padding:2px 8px; border-radius:20px; font-size:0.73rem; font-weight:bold; margin-right:4px;">محظور دعم</span>' : ''}
                             <p style="color:#4ade80; font-weight:bold; margin-top:4px;">رقم الحساب: \${acc.accountNumber} | الرصيد: \${acc.balance.toLocaleString()} $ | التوفير: \${acc.savingsBalance.toLocaleString()} $</p>
@@ -2699,7 +2737,7 @@ app.use(async (req, res) => {
                 <div class="card \${loan.status === 'pending' ? 'card-yellow' : 'card-green'}" style="margin-bottom:10px;">
                     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                         <div>
-                            <b>\${loan.discordTag}</b> <span style="color:#64748b; font-size:0.8rem;">\${loan.discord}</span>
+                            <b>\${loan.discordTag}</b>
                             <p style="margin-top:5px;">المبلغ: <b style="color:#fde047;">\${loan.amount.toLocaleString()} $</b></p>
                             \${loan.status === 'approved' ? \`<p>المتبقي: <b style="color:#fca5a5;">\${loan.remaining.toLocaleString()} $</b></p>\` : ''}
                             \${expiryInfo}
@@ -2727,10 +2765,12 @@ app.use(async (req, res) => {
             const s = await res.json();
             document.getElementById('interest-rate-input').value = s.interestRate || 2;
             const adminContainer = document.getElementById('admin-list-container');
+            bindAccountPicker('new-admin-search', 'new-admin-pick-box', 'new-admin-id', 'new-admin-chosen');
+            const adminNames = s.adminNames || {};
             adminContainer.innerHTML = s.adminList.length === 0 ? '<p style="color:#64748b;">لا يوجد مسؤولين.</p>' :
                 s.adminList.map(uid => \`
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                        <span>\${uid}</span>
+                        <span>\${adminNames[uid] ? adminNames[uid].name + (adminNames[uid].accountNumber ? ' — ' + adminNames[uid].accountNumber : '') : 'حساب غير معروف'}</span>
                         <button class="btn btn-red" style="padding:3px 10px; font-size:0.78rem;" onclick="removeBankAdmin('\${uid}')">إزالة</button>
                     </div>
                 \`).join('');
@@ -2747,22 +2787,22 @@ app.use(async (req, res) => {
         }
 
         async function addBankAdmin() {
-            const discordId = document.getElementById('new-admin-id').value.trim();
-            if(!discordId) return alert('أدخل الآيدي');
+            const accountUid = document.getElementById('new-admin-id').value.trim();
+            if(!accountUid) return alert('ابحث واختر الحساب من القائمة');
             const res = await fetch('/api/superadmin/admin/add', {
                 method: 'POST', headers: {'Content-Type':'application/json'},
-                body: JSON.stringify({ discordId })
+                body: JSON.stringify({ accountUid })
             });
             const data = await res.json();
             alert(data.msg);
-            if(data.success) { document.getElementById('new-admin-id').value=''; loadBankSettingsPanel(); }
+            if(data.success) { document.getElementById('new-admin-id').value=''; document.getElementById('new-admin-search').value=''; document.getElementById('new-admin-chosen').textContent=''; loadBankSettingsPanel(); }
         }
 
-        async function removeBankAdmin(discordId) {
+        async function removeBankAdmin(accountUid) {
             if(!confirm('إزالة هذا المسؤول؟')) return;
             const res = await fetch('/api/superadmin/admin/remove', {
                 method: 'POST', headers: {'Content-Type':'application/json'},
-                body: JSON.stringify({ discordId })
+                body: JSON.stringify({ accountUid })
             });
             const data = await res.json();
             alert(data.msg);
@@ -2815,7 +2855,7 @@ app.use(async (req, res) => {
                         <div style="position:absolute; top:-20px; right:-20px; width:100px; height:100px; background:rgba(255,255,255,0.06); border-radius:50%;"></div>
                         <div style="position:absolute; bottom:-30px; left:-10px; width:130px; height:130px; background:rgba(255,255,255,0.04); border-radius:50%;"></div>
                         \${c.cardFrozen ? '<div style="position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.6); color:#fca5a5; font-size:0.7rem; padding:3px 8px; border-radius:6px; font-family:inherit;">🔒 مجمّدة</div>' : ''}
-                        <p style="font-size:0.7rem; color:\${theme.accent}; letter-spacing:2px; margin-bottom:14px;">MOI BANK</p>
+                        <p style="font-size:0.7rem; color:\${theme.accent}; letter-spacing:2px; margin-bottom:14px;">FLASH BANK</p>
                         <p style="font-size:1.25rem; letter-spacing:3px; color:#e2e8f0; margin-bottom:14px;">\${c.cardNumber || '#### #### #### ####'}</p>
                         <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:8px;">
                             <div>
@@ -3029,7 +3069,48 @@ app.use(async (req, res) => {
         }
 
         // ─── دوال الموظفين ──────────────────────────────────────────────────
+        const _pickTimers = {};
+        const _pickBound = {};
+        function bindAccountPicker(inputId, boxId, uidId, chosenId) {
+            if (_pickBound[inputId]) return;
+            const inp = document.getElementById(inputId);
+            if (!inp) return;
+            _pickBound[inputId] = true;
+            inp.addEventListener('input', function() {
+                clearTimeout(_pickTimers[inputId]);
+                const box = document.getElementById(boxId);
+                document.getElementById(uidId).value = '';
+                document.getElementById(chosenId).textContent = '';
+                const q = inp.value.trim();
+                if (q.length < 2) { box.innerHTML = ''; return; }
+                _pickTimers[inputId] = setTimeout(async function() {
+                    try {
+                        const r = await fetch('/api/admin/account-search?q=' + encodeURIComponent(q));
+                        const list = await r.json();
+                        box.innerHTML = '';
+                        if (!list.length) { const e = document.createElement('div'); e.className = 'pick-item'; e.style.cursor = 'default'; e.textContent = 'ما لقيت حساب بهذا الاسم'; box.appendChild(e); return; }
+                        list.forEach(function(a) {
+                            const d = document.createElement('div');
+                            d.className = 'pick-item';
+                            d.textContent = a.name;
+                            const sm = document.createElement('small');
+                            sm.textContent = a.accountNumber;
+                            d.appendChild(sm);
+                            d.addEventListener('click', function() {
+                                document.getElementById(uidId).value = a.uid;
+                                inp.value = a.name;
+                                document.getElementById(chosenId).textContent = '✅ ' + a.name + ' — ' + a.accountNumber;
+                                box.innerHTML = '';
+                            });
+                            box.appendChild(d);
+                        });
+                    } catch (e) { box.innerHTML = ''; }
+                }, 300);
+            });
+        }
+
         async function loadStaff() {
+            bindAccountPicker('hire-search', 'hire-pick-box', 'hire-uid', 'hire-chosen');
             const res = await fetch('/api/staff');
             const staff = await res.json();
             const container = document.getElementById('staff-list-container');
@@ -3042,7 +3123,6 @@ app.use(async (req, res) => {
                             <b>\${s.discordTag}</b>
                             <span style="color:#60a5fa; font-size:0.82rem; margin-right:8px;">\${roleMap[s.role] || s.role}</span>
                             <p style="color:#64748b; font-size:0.78rem; margin-top:3px;">وظّفه: \${s.hiredByTag} — \${new Date(s.hiredAt).toLocaleDateString('ar-SA')}</p>
-                            <p style="color:#64748b; font-size:0.75rem;">\${s.discord}</p>
                         </div>
                         <button class="btn btn-red" style="padding:4px 12px; font-size:0.8rem;" onclick="fireStaff('\${s._id}', '\${s.discordTag}')">🔴 فصل</button>
                     </div>
@@ -3051,17 +3131,16 @@ app.use(async (req, res) => {
         }
 
         async function hireStaff() {
-            const discordId = document.getElementById('hire-discord-id').value.trim();
-            const discordTag = document.getElementById('hire-discord-tag').value.trim();
+            const accountUid = document.getElementById('hire-uid').value.trim();
             const staffRole = document.getElementById('hire-role').value;
-            if (!discordId || !discordTag) return showMsg('hire-msg', 'أدخل الآيدي والاسم', 'danger');
+            if (!accountUid) return showMsg('hire-msg', 'ابحث واختر الحساب من القائمة', 'danger');
             const res = await fetch('/api/staff/hire', {
                 method: 'POST', headers: {'Content-Type':'application/json'},
-                body: JSON.stringify({ discordId, discordTag, staffRole })
+                body: JSON.stringify({ accountUid, staffRole })
             });
             const data = await res.json();
             showMsg('hire-msg', (data.success ? '✅ ' : '❌ ') + data.msg, data.success ? 'success' : 'danger');
-            if (data.success) { document.getElementById('hire-discord-id').value=''; document.getElementById('hire-discord-tag').value=''; loadStaff(); }
+            if (data.success) { document.getElementById('hire-uid').value=''; document.getElementById('hire-search').value=''; document.getElementById('hire-chosen').textContent=''; loadStaff(); }
         }
 
         async function fireStaff(id, name) {
@@ -3706,7 +3785,7 @@ app.use(async (req, res) => {
     </script>
 
 <footer style="text-align: center; padding: 1.5rem; margin-top: 2rem; border-top: 1px solid rgba(59,130,246,0.2); background: rgba(5,15,30,0.8); color: #475569; font-size: 0.9rem;">
-    <p>جميع الحقوق محفوظة © 2026 | <span style="color: #3b82f6; font-weight: bold;">بنك وزارة الداخلية — MOI Bank</span></p>
+    <p>جميع الحقوق محفوظة © 2026 | <span style="color: #3b82f6; font-weight: bold;">بنك فلاش — Flash Bank</span></p>
 </footer>
 </body>
 </html>`);
