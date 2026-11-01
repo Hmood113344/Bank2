@@ -20,6 +20,16 @@ function pfx(req) {
     return (PROXY_TOKEN && req.get('x-flash-proxy') === PROXY_TOKEN && req.get('x-forwarded-prefix') === '/bank') ? '/bank' : '';
 }
 function flashHome(req) { return pfx(req) ? '/' : FLASH_API; }
+async function flashGet(path) {
+    if (!INTERNAL_API_KEY) throw new Error('INTERNAL_API_KEY غير مضبوط على خدمة البنك');
+    const r = await fetch(FLASH_API + path, { headers: internalHeaders() });
+    const txt = await r.text();
+    let data;
+    try { data = JSON.parse(txt); }
+    catch (e) { throw new Error(`رد غير متوقع من ${FLASH_API} (حالة ${r.status}) — تأكد إن FLASH_URL في إعدادات البنك هو رابط موقع فلاش الحقيقي، وإن فلاش محدّث`); }
+    if (r.status === 403 || r.status === 503) throw new Error((data && data.msg) || 'مفتاح INTERNAL_API_KEY مو نفسه بين فلاش والبنك');
+    return data;
+}
 function ensureInternalFlash(req, res, next) {
     if (!INTERNAL_API_KEY || req.headers['x-internal-key'] !== INTERNAL_API_KEY) {
         return res.status(403).json({ success: false, msg: 'طلب غير مصرّح به' });
@@ -234,8 +244,7 @@ async function runMilitarySalaryPayout() {
 
     let personnel;
     try {
-        const resp = await fetch(`${FLASH_API}/api/bank/personnel-ranks`, { headers: internalHeaders() });
-        const data = await resp.json();
+        const data = await flashGet('/api/bank/personnel-ranks');
         if (!data.success) throw new Error(data.msg || "فشل جلب بيانات العساكر");
         personnel = data.personnel;
     } catch (e) {
@@ -951,8 +960,7 @@ app.put('/api/admin/loans/:id/:action', isStaffOrAbove, async (req, res) => {
 // ── APIs رواتب العساكر (ربط مع موقع فلاش — كبار المسؤولين فقط) ──────────────
 app.get('/api/superadmin/military-salary/ranks', isBankSuperAdmin, async (req, res) => {
     try {
-        const resp = await fetch(`${FLASH_API}/api/bank/ranks`, { headers: internalHeaders() });
-        const data = await resp.json();
+        const data = await flashGet('/api/bank/ranks');
         if (!data.success) return res.json({ success: false, msg: "تعذر جلب الرتب من موقع فلاش" });
 
         const settings = await getMilitarySalarySettings();
