@@ -47,7 +47,9 @@ function ensureInternalFlash(req, res, next) {
     next();
 }
 
-mongoose.connect("mongodb+srv://hmooduu6_db_user:0ks7Ktqh5IIteciW@cluster0.6bk7qm9.mongodb.net/?appName=Cluster0")
+const MONGO_URI = String(process.env.MONGO_URI || '').trim();
+if (!MONGO_URI) console.log("❌ MONGO_URI غير مضبوط — أضفه في Environment على Render");
+mongoose.connect(MONGO_URI)
 .then(() => console.log("✅ Bank MongoDB connected"))
 .catch(err => console.log("❌ MongoDB error:", err));
 
