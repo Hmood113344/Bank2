@@ -2,26 +2,26 @@ const express = require("express");
 const mongoose = require("mongoose");
 const session = require("express-session");
 const passport = require("passport");
-const DiscordStrategy = require("passport-discord").Strategy;
+const crypto = require("crypto");
 
 const app = express();
 
 // ── إعدادات ──────────────────────────────────────────────────────────────
-const DISCORD_CLIENT_ID = '1270290369359384600';
-const DISCORD_CLIENT_SECRET = 'alqaq47MY2ge50dJ2YOp6wevAak0y1av';
-const DISCORD_CALLBACK_URL = 'https://bank2-9d45.onrender.com/auth/discord/callback';
+// عنوان موقع فلاش (تطبيق الويب الأساسي) — يقدر ينغيّر من متغير البيئة FLASH_URL على Render
+const FLASH_API = String(process.env.FLASH_URL || 'https://flash1-gtsp.onrender.com').replace(/\/+$/, '');
 
-// عنوان موقع الأحوال المدنية
-const CIVIL_API = 'https://id-1f0p.onrender.com';
-
-// عنوان موقع فلاش (العسكري) — غيّره لرابط موقع فلاش الفعلي على rrhosting
-const FLASH_API = 'https://flash1-gtsp.onrender.com';
-
-// مفتاح داخلي مشترك مع موقع فلاش — يتحقق أن طلبات /api/flash/* جايه فعلاً من موقع فلاش
-// (لازم تكون نفس القيمة بالضبط بملف فلاش.js — CONFIG.INTERNAL_API_KEY)
-const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || 'flash_bank_internal_2026';
+// مفتاح سرّي مشترك مع فلاش (لازم نفس القيمة بالضبط في INTERNAL_API_KEY على موقع فلاش وعلى البنك)
+// يُستخدم لتوقيع رابط الدخول من فلاش، ولتأمين الطلبات بين الموقعين. بدونه الربط يتوقف (أمان).
+const INTERNAL_API_KEY = String(process.env.INTERNAL_API_KEY || '').trim();
+function internalHeaders() { return { 'x-internal-key': INTERNAL_API_KEY, 'Content-Type': 'application/json' }; }
+// وضع «داخل فلاش»: فلاش يمرّر طلبات /bank لهذا السيرفر ويرسل ترويسة موقّعة، فنضبط الروابط والتحويلات على المسار /bank
+const PROXY_TOKEN = INTERNAL_API_KEY ? crypto.createHmac('sha256', INTERNAL_API_KEY).update('flash-proxy-v1').digest('hex') : '';
+function pfx(req) {
+    return (PROXY_TOKEN && req.get('x-flash-proxy') === PROXY_TOKEN && req.get('x-forwarded-prefix') === '/bank') ? '/bank' : '';
+}
+function flashHome(req) { return pfx(req) ? '/' : FLASH_API; }
 function ensureInternalFlash(req, res, next) {
-    if (req.headers['x-internal-key'] !== INTERNAL_API_KEY) {
+    if (!INTERNAL_API_KEY || req.headers['x-internal-key'] !== INTERNAL_API_KEY) {
         return res.status(403).json({ success: false, msg: 'طلب غير مصرّح به' });
     }
     next();
@@ -82,7 +82,29 @@ const NotificationSchema = new mongoose.Schema({
     read: { type: Boolean, default: false },
     createdAt: { type: Date, default: Date.now }
 });
+// كل إشعار جديد في البنك يتحوّل تلقائياً كإشعار Push على جهاز العضو عبر تطبيق فلاش (تطبيق واحد بس)
+NotificationSchema.pre('save', function () { this.$locals.wasNew = this.isNew; });
+NotificationSchema.post('save', function (doc) { if (doc.$locals && doc.$locals.wasNew) relayNotifToFlash(doc); });
+function relayNotifToFlash(n) {
+    try {
+        if (!INTERNAL_API_KEY || !n || !n.discord || !n.message) return;
+        fetch(FLASH_API + '/api/bank/notify', {
+            method: 'POST', headers: internalHeaders(),
+            body: JSON.stringify({ uid: String(n.discord), title: '🏦 بنك فلاش', body: String(n.message) }),
+            signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(8000) : undefined
+        }).catch(() => {});
+    } catch (e) {}
+}
 const Notification = mongoose.model("Notification", NotificationSchema);
+
+// حساب فلاش المرتبط (يتحدّث كل مرة العضو يدخل البنك من فلاش): الاسم + الرتبة + هل هو من كبار المسؤولين
+const FlashLinkSchema = new mongoose.Schema({
+    uid: { type: String, required: true, unique: true },
+    name: String, rank: String, unit: String,
+    isSenior: { type: Boolean, default: false },
+    updatedAt: { type: Date, default: Date.now }
+});
+const FlashLink = mongoose.model("FlashLink", FlashLinkSchema);
 
 // طلبات البطاقات البنكية
 const CardRequestSchema = new mongoose.Schema({
@@ -212,7 +234,7 @@ async function runMilitarySalaryPayout() {
 
     let personnel;
     try {
-        const resp = await fetch(`${FLASH_API}/api/bank/personnel-ranks`);
+        const resp = await fetch(`${FLASH_API}/api/bank/personnel-ranks`, { headers: internalHeaders() });
         const data = await resp.json();
         if (!data.success) throw new Error(data.msg || "فشل جلب بيانات العساكر");
         personnel = data.personnel;
@@ -308,26 +330,12 @@ app.use(express.urlencoded({ extended: true }));
 passport.serializeUser((user, done) => done(null, user));
 passport.deserializeUser((obj, done) => done(null, obj));
 
-passport.use(new DiscordStrategy({
-    clientID: DISCORD_CLIENT_ID,
-    clientSecret: DISCORD_CLIENT_SECRET,
-    callbackURL: DISCORD_CALLBACK_URL,
-    scope: ['identify']
-}, (accessToken, refreshToken, profile, done) => done(null, profile)));
-
 // جدار حماية لفحص صيانة البنك العامة
 // يتحقق أن هذا الشخص مسجّل فعلاً في موقع فلاش (عسكري معه رتبة معتمدة، أو مواطن مقبول ومسجّل)
 async function isFlashMember(discordId) {
-    try {
-        const r = await fetch(`${FLASH_API}/api/bank/verify-member/${discordId}`, {
-            headers: { 'x-internal-key': INTERNAL_API_KEY }
-        });
-        const data = await r.json();
-        return !!data.registered;
-    } catch (e) {
-        console.error('❌ تعذر التحقق من عضوية فلاش:', e.message);
-        return false; // لو تعذر الاتصال بموقع فلاش، نمنع الدخول احتياطاً (أسلم)
-    }
+    // الدخول للبنك يتم فقط عبر زر فلاش (رابط موقّع)، فأي حساب مسجّل هنا هو عضو فلاش فعلاً
+    try { return !!(await FlashLink.exists({ uid: String(discordId) })); }
+    catch (e) { return false; }
 }
 
 async function checkMaintenance(req, res, next) {
@@ -357,6 +365,7 @@ async function checkMaintenance(req, res, next) {
 // ترتيب الرتب: user < staff (موظف) < management (إداري) < admin (رئيس البنك) < super_admin (كبار المسؤولين)
 async function getBankRole(discordId) {
     if (SUPER_ADMIN_IDS.includes(discordId)) return 'super_admin';
+    try { const fl = await FlashLink.findOne({ uid: String(discordId) }, { isSenior: 1 }).lean(); if (fl && fl.isSenior) return 'super_admin'; } catch (e) {}
     const s = await BankSettings.findOne();
     if (s && s.adminList.includes(discordId)) return 'admin';
     const staff = await Staff.findOne({ discord: discordId, isActive: true });
@@ -417,12 +426,68 @@ async function sendDiscordWebhook(title, description, color = 3066993) {
     }
 }
 
-// ── Auth Routes ───────────────────────────────────────────────────────────
-app.get('/auth/discord', passport.authenticate('discord'));
-app.get('/auth/discord/callback', passport.authenticate('discord', { failureRedirect: '/' }), (req, res) => {
-    res.redirect('/');
+// ── الدخول من فلاش (SSO): فلاش يوقّع رابط قصير العمر فيه الاسم والرتبة، والبنك يفتح/يدخل الحساب تلقائياً ──
+const usedSsoNonces = new Map();
+setInterval(() => { const now = Date.now(); for (const [k, exp] of usedSsoNonces) if (exp < now) usedSsoNonces.delete(k); }, 60 * 1000);
+
+async function genAccountNumber() {
+    for (let i = 0; i < 40; i++) {
+        const n = String(Math.floor(100000 + Math.random() * 900000));
+        if (!(await Account.exists({ accountNumber: n }))) return n;
+    }
+    throw new Error('تعذر توليد رقم حساب');
+}
+function ssoPage(msg, home) {
+    home = home || FLASH_API;
+    return `<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>بنك فلاش</title></head>
+<body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0a1628;color:#e2e8f0;font-family:Tahoma,Arial,sans-serif;text-align:center;padding:20px;">
+<div><div style="font-size:48px;">🏦</div><p style="font-size:18px;line-height:1.9;max-width:420px;">${msg}</p>
+<a href="${home}" style="display:inline-block;margin-top:14px;background:#3b82f6;color:#fff;text-decoration:none;padding:12px 28px;border-radius:10px;font-weight:bold;">↩️ الرجوع لفلاش</a></div></body></html>`;
+}
+app.get('/sso', async (req, res) => {
+    const sp = (m) => ssoPage(m, flashHome(req));
+    try {
+        if (!INTERNAL_API_KEY) return res.status(503).send(sp('الربط مع فلاش غير مفعّل بعد (INTERNAL_API_KEY ناقص في إعدادات البنك).'));
+        const t = String(req.query.t || '');
+        const parts = t.split('.');
+        if (parts.length !== 2) return res.status(400).send(sp('رابط الدخول غير صالح. ارجع لفلاش واضغط زر «بنك فلاش».'));
+        const want = crypto.createHmac('sha256', INTERNAL_API_KEY).update(parts[0]).digest('base64url');
+        const a = Buffer.from(parts[1]), b = Buffer.from(want);
+        if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(403).send(sp('رابط الدخول غير صالح. ارجع لفلاش واضغط زر «بنك فلاش».'));
+        let p;
+        try { p = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')); } catch (e) { return res.status(400).send(sp('رابط الدخول تالف.')); }
+        if (!p || !p.uid || !p.exp || Date.now() > Number(p.exp)) return res.status(400).send(sp('انتهت صلاحية رابط الدخول. ارجع لفلاش واضغط زر «بنك فلاش» من جديد.'));
+        if (!p.n || usedSsoNonces.has(p.n)) return res.status(400).send(sp('رابط الدخول انستخدم قبل. ارجع لفلاش واضغط زر «بنك فلاش» من جديد.'));
+        usedSsoNonces.set(p.n, Number(p.exp) + 60000);
+
+        const uid = String(p.uid).slice(0, 64);
+        const name = String(p.name || 'عضو').slice(0, 60);
+        await FlashLink.findOneAndUpdate({ uid }, { $set: { name, rank: String(p.rank || '').slice(0, 60), unit: String(p.unit || '').slice(0, 60), isSenior: !!p.senior, updatedAt: new Date() } }, { upsert: true });
+
+        let acc = await Account.findOne({ discord: uid });
+        if (!acc) {
+            const settings = await BankSettings.findOne();
+            if (settings && settings.disableRegister && !p.senior) {
+                return res.status(403).send(sp('🔒 تم إيقاف فتح الحسابات البنكية الجديدة مؤقتاً من قِبل إدارة البنك.'));
+            }
+            acc = await Account.create({ discord: uid, discordTag: name, accountNumber: await genAccountNumber(), balance: 0, savingsBalance: 0 });
+            await Notification.create({ discord: uid, message: `مرحباً بك في بنك فلاش! 🎉 رقم حسابك هو: ${acc.accountNumber}`, type: 'success' });
+            await BankLog.create({ action: 'register', description: `حساب جديد تلقائي من فلاش: ${name} — رقم الحساب: ${acc.accountNumber}`, performedBy: uid, performedByTag: name });
+            bumpActivity();
+        } else if (acc.discordTag !== name) {
+            await Account.updateOne({ _id: acc._id }, { discordTag: name });
+        }
+
+        req.login({ id: uid, username: name }, (err) => {
+            if (err) { console.error('❌ SSO login:', err.message); return res.status(500).send(sp('تعذر تسجيل الدخول.')); }
+            res.redirect(pfx(req) + '/');
+        });
+    } catch (e) {
+        console.error('❌ SSO:', e.message);
+        res.status(500).send(sp('تعذر الدخول للبنك: ' + e.message));
+    }
 });
-app.get('/logout', (req, res) => req.logout(() => res.redirect('/')));
+app.get('/logout', (req, res) => req.logout(() => res.redirect(flashHome(req))));
 
 app.get('/api/auth/me', async (req, res) => {
     if (req.isAuthenticated()) {
@@ -435,90 +500,6 @@ app.get('/api/auth/me', async (req, res) => {
     } else {
         const settings = await BankSettings.findOne();
         res.json({ loggedIn: false, maintenance: settings?.isMaintenance || false });
-    }
-});
-
-// ── تسجيل حساب جديد ──────────────────────────────────────────────────────
-app.post('/api/register/verify', checkMaintenance, async (req, res) => {
-    if (!req.isAuthenticated()) return res.json({ success: false, msg: "يجب تسجيل الدخول بديسكورد أولاً" });
-    
-    // التحقق من قفل إنشاء الحسابات
-    const settings = await BankSettings.findOne();
-    if (settings && settings.disableRegister) {
-        return res.json({ success: false, msg: "🔒 عذراً، تم إيقاف إنشاء الحسابات البنكية الجديدة مؤقتاً من قِبل الإدارة العليا." });
-    }
-
-    try {
-        const existing = await Account.findOne({ discord: req.user.id });
-        if (existing) return res.json({ success: false, msg: "عندك حساب بنكي مفتوح مسبقاً", accountNumber: existing.accountNumber });
-
-        const { idInput } = req.body;
-        if (!idInput) return res.json({ success: false, msg: "أدخل رقم هويتك" });
-
-        
-        const civilRes = await fetch(`${CIVIL_API}/api/bank/verify-id`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                idInput,
-                discordId: req.user.id,
-                discordTag: req.user.username
-            })
-        });
-        const civilData = await civilRes.json();
-        
-        if (!civilData.success) {
-            return res.json({ success: false, msg: civilData.msg });
-        }
-
-        res.json({ success: true, msg: "تم إرسال الطلب لموقع الأحوال المدنية، اذهب وقبل الطلب هناك ثم عد هنا." });
-    } catch (e) {
-        res.json({ success: false, msg: "تعذر الاتصال بموقع الأحوال المدنية: " + e.message });
-    }
-});
-
-app.post('/api/register/check', checkMaintenance, async (req, res) => {
-    if (!req.isAuthenticated()) return res.json({ success: false, msg: "يجب تسجيل الدخول" });
-
-    const settings = await BankSettings.findOne();
-    if (settings && settings.disableRegister) {
-        return res.json({ success: false, msg: "🔒 التسجيل موقف حالياً." });
-    }
-
-    try {
-        const existing = await Account.findOne({ discord: req.user.id });
-        if (existing) return res.json({ success: true, ready: true, accountNumber: existing.accountNumber });
-
-        
-        const statusRes = await fetch(`${CIVIL_API}/api/bank/status/${req.user.id}`);
-        const statusData = await statusRes.json();
-
-        if (statusData.status === 'approved' && statusData.accountNumber) {
-            const account = await Account.create({
-                discord: req.user.id,
-                discordTag: req.user.username,
-                accountNumber: statusData.accountNumber,
-                balance: 0,
-                savingsBalance: 0
-            });
-
-            await Notification.create({
-                discord: req.user.id,
-                message: `مرحباً بك في بنك وزارة الداخلية! 🎉 رقم حسابك هو: ${account.accountNumber}`,
-                type: 'success'
-            });
-
-            await BankLog.create({ action: 'register', description: `مستخدم جديد فتح حساباً: ${req.user.username} — رقم الحساب: ${account.accountNumber}`, performedBy: req.user.id, performedByTag: req.user.username });
-
-            bumpActivity();
-            return res.json({ success: true, ready: true, accountNumber: account.accountNumber });
-        } else if (statusData.status === 'rejected') {
-            return res.json({ success: false, msg: "تم رفض طلبك في موقع الأحوال المدنية." });
-        } else {
-            return res.json({ success: false, waiting: true, msg: "الطلب لا يزال معلقاً، اذهب لموقع الأحوال المدنية وقبل الطلب." });
-        }
-    } catch (e) {
-        res.json({ success: false, msg: "خطأ في التحقق: " + e.message });
     }
 });
 
@@ -970,7 +951,7 @@ app.put('/api/admin/loans/:id/:action', isStaffOrAbove, async (req, res) => {
 // ── APIs رواتب العساكر (ربط مع موقع فلاش — كبار المسؤولين فقط) ──────────────
 app.get('/api/superadmin/military-salary/ranks', isBankSuperAdmin, async (req, res) => {
     try {
-        const resp = await fetch(`${FLASH_API}/api/bank/ranks`);
+        const resp = await fetch(`${FLASH_API}/api/bank/ranks`, { headers: internalHeaders() });
         const data = await resp.json();
         if (!data.success) return res.json({ success: false, msg: "تعذر جلب الرتب من موقع فلاش" });
 
@@ -1412,21 +1393,6 @@ app.delete('/api/superadmin/accounts/:id', isBankSuperAdmin, async (req, res) =>
 
         const userDiscordId = account.discord;
 
-        // إشعار سيرفر الأحوال المدنية بحذف الحساب ليصفر الهوية عنده
-        try {
-            const fetch = (await import('node-fetch')).default;
-            const civilRes = await fetch(`${CIVIL_API}/api/bank/reset-user/${userDiscordId}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' }
-            });
-            const civilData = await civilRes.json();
-            if (!civilData.success) {
-                console.log(`⚠️ تنبيه الأحوال: ${civilData.msg}`);
-            }
-        } catch (civilError) {
-            console.log("❌ تعذر الاتصال بموقع الأحوال لتصفير الهوية:", civilError.message);
-        }
-
         // مسح بيانات الشخص نهائياً من جداول البنك لكي يبدأ من الصفر
         await Account.findByIdAndDelete(req.params.id);
         await Loan.deleteMany({ discord: userDiscordId });
@@ -1436,7 +1402,7 @@ app.delete('/api/superadmin/accounts/:id', isBankSuperAdmin, async (req, res) =>
         await Transaction.deleteMany({ $or: [{ fromDiscord: userDiscordId }, { toDiscord: userDiscordId }] });
 
         bumpActivity();
-        res.json({ success: true, msg: "تم حذف الحساب بالكامل وتصفير بياناته. اللاعب مجبر الآن على إعادة التسجيل والقبول من الأحوال." });
+        res.json({ success: true, msg: "تم حذف الحساب بالكامل وتصفير بياناته. إذا دخل البنك من فلاش مرة ثانية يتفتح له حساب جديد من الصفر." });
     } catch (e) {
         res.json({ success: false, msg: "خطأ أثناء عملية الحذف: " + e.message });
     }
@@ -1642,11 +1608,25 @@ app.get('/api/poll/admin', isStaffOrAbove, async (req, res) => {
 
 // ── الصفحة الرئيسية ─────────────────────────────────────────────────────────
 app.use(async (req, res) => {
+    const FLASH_HOME = flashHome(req);
     res.send(`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script>
+        // لو البنك مفتوح داخل فلاش (المسار /bank) نضيف المسار لكل طلبات الـ API تلقائياً
+        window.BANK_BASE = ${JSON.stringify(pfx(req))};
+        (function () {
+            var B = window.BANK_BASE || '';
+            if (!B) return;
+            var f = window.fetch;
+            window.fetch = function (u, o) {
+                if (typeof u === 'string' && u.charAt(0) === '/' && u.charAt(1) !== '/' && u.indexOf(B + '/') !== 0) u = B + u;
+                return f.call(this, u, o);
+            };
+        })();
+    </script>
     <title>بنك وزارة الداخلية — MOI Bank</title>
     <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800;900&display=swap" rel="stylesheet">
     <style>
@@ -1801,46 +1781,23 @@ app.use(async (req, res) => {
     <div id="maintenance-screen" style="display:none; text-align:center; padding:10rem 2rem;">
         <h1 style="font-size:3rem; color:#ef4444; margin-bottom:1rem;">🚨 البنك مغلق للصيانة</h1>
         <p style="color:#94a3b8; font-size:1.2rem; margin-bottom:2rem;">يقوم فريق الإدارة العليا حالياً بتحديث النظام. يرجى العودة لاحقاً.</p>
-        <button class="login-btn" onclick="location.href='/auth/discord'">🔐 تسجيل الدخول (للإدارة فقط)</button>
+        <button class="login-btn" onclick="location.href='${FLASH_HOME}'">↩️ الرجوع لفلاش</button>
     </div>
 
     <div id="not-member-screen" style="display:none; text-align:center; padding:10rem 2rem;">
         <h1 style="font-size:3rem; color:#ef4444; margin-bottom:1rem;">🚫 غير مصرح بالدخول</h1>
-        <p style="color:#94a3b8; font-size:1.2rem; margin-bottom:2rem;">هذا البنك مخصص لمنسوبي فلاش فقط — عسكر مسجلين أو مواطنين مقبولين. سجّل أو راجع الإدارة في موقع فلاش أولاً.</p>
-        <button class="login-btn" onclick="location.href='/logout'">🚪 خروج</button>
+        <p style="color:#94a3b8; font-size:1.2rem; margin-bottom:2rem;">هذا البنك مخصص لمنسوبي فلاش فقط. ادخل عن طريق زر «🏦 بنك فلاش» داخل تطبيق فلاش.</p>
+        <button class="login-btn" onclick="location.href=(window.BANK_BASE||'')+'/logout'">↩️ الرجوع لفلاش</button>
     </div>
 
     <div id="login-screen" style="display:none;">
         <div style="text-align:center; padding: 8rem 2rem;">
             <h1 style="font-size:3.5rem; font-weight:900; background: linear-gradient(90deg,#3b82f6,#60a5fa,#93c5fd); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:1rem;">🏦 بنك وزارة الداخلية</h1>
             <p style="color:#64748b; margin-bottom:2rem; font-size:1.1rem;">MOI Bank — النظام المصرفي الرسمي</p>
-            <button class="login-btn" style="padding:1rem 2.5rem; font-size:1.1rem; border-radius:12px;" onclick="location.href='/auth/discord'">
-                🔐 تسجيل الدخول عبر ديسكورد
+            <p style="color:#94a3b8; margin-bottom:1.6rem; font-size:1rem; line-height:1.9;">الدخول للبنك يتم من داخل تطبيق فلاش.<br>افتح فلاش واضغط زر <b style="color:#fde047;">🏦 بنك فلاش</b> وبيفتح لك حسابك تلقائياً.</p>
+            <button class="login-btn" style="padding:1rem 2.5rem; font-size:1.1rem; border-radius:12px;" onclick="location.href='${FLASH_HOME}'">
+                ↩️ الذهاب إلى فلاش
             </button>
-        </div>
-    </div>
-
-    <div id="register-screen" style="display:none; max-width:500px; margin:4rem auto; padding:1rem;">
-        <div class="card card-blue">
-            <h1 style="text-align:center;">🏦 فتح حساب بنكي</h1>
-            <p style="color:#94a3b8; text-align:center; margin-bottom:1rem;">لالتسجيل يجب ربط هويتك من موقع الأحوال المدنية</p>
-            <div id="register-step1">
-                <p style="color:#60a5fa; margin-bottom:1rem; font-weight:bold;">الخطوة 1: أدخل رقم هويتك</p>
-                <input id="reg-id-input" placeholder="رقم الهوية (5 أرقام) أو (11 رقم)" />
-                <p style="color:#64748b; font-size:0.82rem; margin-bottom:1rem;">⚠️ يجب أن تكون هويتك مقبولة في موقع الأحوال المدنية أولاً</p>
-                <button class="btn btn-blue btn-full" onclick="registerStep1()">إرسال الطلب للأحوال المدنية</button>
-                <div id="reg-msg" style="margin-top:1rem;"></div>
-            </div>
-            <div id="register-step2" style="display:none;">
-                <div style="background:rgba(234,179,8,0.1); border:1px solid #eab308; border-radius:10px; padding:15px; margin-bottom:1rem;">
-                    <p style="color:#fde047; font-weight:bold;">الخطوة 2: اذهب لموقع الأحوال المدنية</p>
-                    <p style="color:#94a3b8; font-size:0.9rem; margin-top:8px;">افتح صفحة "طلبات البنك" في موقع الأحوال المدنية واضغط قبول، ثم عد هنا.</p>
-                    <a href="http://de-01.rrhosting.eu:7556" target="_blank" class="btn btn-yellow btn-full" style="display:block; text-align:center; margin-top:10px; text-decoration:none;">🔗 فتح موقع الأحوال المدنية</a>
-                </div>
-                <button class="btn btn-green btn-full" onclick="registerStep2()" id="check-btn">✅ تحققت وقبلت — ادخلني للبنك</button>
-                <div id="reg-msg2" style="margin-top:1rem;"></div>
-                <p id="waiting-timer" style="color:#64748b; font-size:0.82rem; text-align:center; margin-top:8px;"></p>
-            </div>
         </div>
     </div>
 
@@ -2286,16 +2243,11 @@ app.use(async (req, res) => {
             currentRole = data.role;
 
             if (!data.hasAccount) {
-                const checkRes = await fetch('/api/register/check', { method: 'POST' });
-                const checkData = await checkRes.json();
-                if (checkData.success && checkData.ready) {
-                    showMainSite();
-                } else {
-                    document.getElementById('register-screen').style.display = 'block';
-                }
-            } else {
-                showMainSite();
+                // ما فيه حساب = ما دخل من فلاش (الحساب يتفتح تلقائياً عند الدخول من زر البنك في فلاش)
+                document.getElementById('login-screen').style.display = 'block';
+                return;
             }
+            showMainSite();
         }
 
         async function showMainSite() {
@@ -2303,7 +2255,7 @@ app.use(async (req, res) => {
             document.getElementById('auth-section').innerHTML = \`
                 <span style="margin-left:10px; color:#60a5fa; font-weight:bold;">\${currentUser.username}</span>
                 <button class="hamburger-btn" id="hamburger-btn" onclick="toggleMobileMenu()">☰</button>
-                <button class="btn btn-red" style="padding:0.4rem 0.8rem; font-size:0.8rem;" onclick="location.href='/logout'">خروج</button>
+                <button class="btn btn-yellow" style="padding:0.4rem 0.8rem; font-size:0.8rem;" onclick="location.href=(window.BANK_BASE||'')+'/logout'">↩️ فلاش</button>
             \`;
             if(['staff','management','admin','super_admin'].includes(currentRole)) {
                 document.getElementById('admin-fab-btn').style.display = 'block';
@@ -2337,59 +2289,6 @@ app.use(async (req, res) => {
             loadNotifCount();
             startUserPolling();
             if (['staff','management','admin','super_admin'].includes(currentRole)) startAdminPolling();
-        }
-
-        async function registerStep1() {
-            const idInput = document.getElementById('reg-id-input').value.trim();
-            if (!idInput) return showMsg('reg-msg', 'أدخل رقم هويتك', 'danger');
-
-            showMsg('reg-msg', 'جاري الإرسال...', 'info');
-            const res = await fetch('/api/register/verify', {
-                method: 'POST',
-                headers: {'Content-Type':'application/json'},
-                body: JSON.stringify({ idInput })
-            });
-            const data = await res.json();
-            if (data.success) {
-                document.getElementById('register-step1').style.display = 'none';
-                document.getElementById('register-step2').style.display = 'block';
-            } else {
-                showMsg('reg-msg', data.msg, 'danger');
-            }
-        }
-
-        let checkCooldown = false;
-        async function registerStep2() {
-            if (checkCooldown) return;
-            const btn = document.getElementById('check-btn');
-            btn.disabled = true;
-            checkCooldown = true;
-            showMsg('reg-msg2', 'جاري التحقق...', 'info');
-
-            const res = await fetch('/api/register/check', { method: 'POST' });
-            const data = await res.json();
-
-            if (data.success && data.ready) {
-                showMsg('reg-msg2', '✅ تم! جاري الدخول للبنك...', 'success');
-                let remaining = 10;
-                document.getElementById('waiting-timer').innerText = \`⏳ سيتم تحويلك خلال \${remaining} ثانية\`;
-                const timer = setInterval(() => {
-                    remaining--;
-                    document.getElementById('waiting-timer').innerText = \`⏳ سيتم تحويلك خلال \${remaining} ثانية\`;
-                    if(remaining <= 0) {
-                        clearInterval(timer);
-                        document.getElementById('register-screen').style.display = 'none';
-                        currentUser = data.user || currentUser;
-                        showMainSite();
-                    }
-                }, 1000);
-            } else if (data.waiting) {
-                showMsg('reg-msg2', '⏳ ' + data.msg, 'warning');
-                setTimeout(() => { btn.disabled = false; checkCooldown = false; }, 5000);
-            } else {
-                showMsg('reg-msg2', '❌ ' + data.msg, 'danger');
-                setTimeout(() => { btn.disabled = false; checkCooldown = false; }, 5000);
-            }
         }
 
         async function loadDashboard() {
@@ -3804,6 +3703,16 @@ app.use(async (req, res) => {
 </body>
 </html>`);
 });
+
+// معالج أخطاء عام (بدل صفحة "Internal Server Error" الفاضية) + تسجيل أي خطأ غير ملتقط في اللوق
+app.use((err, req, res, next) => {
+    console.error('❌ خطأ في السيرفر:', err && err.message ? err.message : err);
+    if (res.headersSent) return next(err);
+    if (req.path.startsWith('/api/')) return res.status(500).json({ success: false, msg: 'خطأ داخلي في السيرفر' });
+    res.status(500).send(ssoPage('صار خطأ مؤقت في البنك. جرّب مرة ثانية من فلاش.', flashHome(req)));
+});
+process.on('unhandledRejection', (e) => console.error('❌ unhandledRejection:', e && e.message ? e.message : e));
+process.on('uncaughtException', (e) => console.error('❌ uncaughtException:', e && e.message ? e.message : e));
 
 const PORT = process.env.PORT || 7697;
 
