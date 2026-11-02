@@ -2575,8 +2575,31 @@ app.use(async (req, res) => {
                     window.scrollTo(0, 0);
                 } catch (e) {}
             };
-            // التحذير: هزّة خفيفة للجوال
-            if (type === 'warning' && navigator.vibrate) { try { navigator.vibrate(120); } catch (e) {} }
+            // الاهتزاز والصوت حسب نوع الإشعار
+            if (type === 'info') notifVibrate([40]);                         // معلومة: هزّة خفيفة
+            else if (type === 'success') { notifVibrate([30, 60, 30]); playSuccessSound(); }  // نجاح: هزّة خفيفة + صوت «صح»
+            else if (type === 'warning') notifVibrate(VIB_WARNING);           // تحذير: هزّ ثقيل وطويل
+        }
+        // ═══════════ أنماط الاهتزاز (هزّ / وقفة / هزّ ...) بالملي ثانية ═══════════
+        const VIB_WARNING = [700, 150, 700, 150, 600, 150, 400, 150, 200];                         // أصفر: هززززز هززززز هزززز هزز
+        const VIB_DANGER  = [1000, 120, 1000, 120, 900, 120, 800, 120, 500, 120, 300];             // أحمر: أثقل وأطول
+        function notifVibrate(p) { if (navigator.vibrate) { try { navigator.vibrate(p); } catch (e) {} } }
+        // صوت «صح» للنجاح: نغمتين صاعدتين قصيرتين
+        function playSuccessSound() {
+            try {
+                const c = getDangerCtx();
+                if (!c || c.state !== 'running') return;
+                const now = c.currentTime;
+                [[880, 0], [1320, 0.13]].forEach(function (n) {
+                    const o = c.createOscillator(), g = c.createGain();
+                    o.type = 'sine'; o.frequency.value = n[0];
+                    g.gain.setValueAtTime(0.0001, now + n[1]);
+                    g.gain.exponentialRampToValueAtTime(0.25, now + n[1] + 0.02);
+                    g.gain.exponentialRampToValueAtTime(0.0001, now + n[1] + 0.25);
+                    o.connect(g); g.connect(c.destination);
+                    o.start(now + n[1]); o.stop(now + n[1] + 0.27);
+                });
+            } catch (e) {}
         }
         // ═══════════ صوت إنذار الخطر (مولَّد بالكود، ما يحتاج ملف صوت) ═══════════
         let dangerAudioCtx = null, dangerLoop = null, dangerOv = null;
@@ -2627,13 +2650,15 @@ app.use(async (req, res) => {
         }
         function stopDangerSound() {
             if (dangerLoop) { clearInterval(dangerLoop.timer); clearTimeout(dangerLoop.cap); dangerLoop = null; }
+            notifVibrate(0);
         }
         function startDangerSound(hintEl) {
             if (dangerLoop) return;
+            let n = 0;
             function tick() {
                 const ok = dangerBeep();
                 if (hintEl) hintEl.style.display = ok ? 'none' : 'block';
-                if (navigator.vibrate) { try { navigator.vibrate([200, 100, 200]); } catch (e) {} }
+                if (n++ % 3 === 0) notifVibrate(VIB_DANGER);   // اهتزاز ثقيل يتكرر كل ~7 ثواني
             }
             dangerLoop = { timer: setInterval(tick, 2300), cap: setTimeout(stopDangerSound, 120000) };
             tick();
