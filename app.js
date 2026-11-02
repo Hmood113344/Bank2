@@ -6,6 +6,12 @@ const crypto = require("crypto");
 
 const app = express();
 app.get('/healthz', (req, res) => res.type('text').send('ok'));
+app.use((req, res, next) => {
+    if (req.method !== 'GET' && req.path.indexOf('/api/') === 0) {
+        res.on('finish', () => { if (res.statusCode < 400) bumpActivity(); });
+    }
+    next();
+});
 
 // ── إعدادات ──────────────────────────────────────────────────────────────
 // عنوان موقع فلاش (تطبيق الويب الأساسي) — يقدر ينغيّر من متغير البيئة FLASH_URL على Render
@@ -309,6 +315,7 @@ setInterval(async () => {
         const settings = await getMilitarySalarySettings();
         if (settings.isActive && settings.nextPayoutAt && new Date() >= new Date(settings.nextPayoutAt)) {
             await runMilitarySalaryPayout();
+            bumpActivity();
         }
     } catch (e) {
         console.log("❌ خطأ في فحص رواتب العساكر:", e.message);
@@ -1552,7 +1559,8 @@ app.post('/api/account/card/:id/renew', checkMaintenance, async (req, res) => {
     try {
         const card = await CardRequest.findOne({ _id: req.params.id, discord: req.user.id });
         if (!card) return res.json({ success: false, msg: "البطاقة غير موجودة" });
-        if (card.status !== 'expired') return res.json({ success: false, msg: "البطاقة لم تنته بعد" });
+        const expiredByDate = card.status === 'approved' && card.cardExpiry && new Date(card.cardExpiry) < new Date();
+        if (card.status !== 'expired' && !expiredByDate) return res.json({ success: false, msg: "البطاقة لم تنته بعد" });
         const settings = await BankSettings.findOne();
         const fee = settings?.cardRenewalFee || 0;
         const acc = await Account.findOne({ discord: req.user.id });
@@ -1809,15 +1817,15 @@ app.use(async (req, res) => {
             background: rgba(59,130,246,0.18);
             color: #60a5fa;
         }
-        @media (max-width: 768px) {
+        @media (max-width: 1180px) {
             .nav-links { display: none !important; }
             .hamburger-btn { display: inline-flex; }
         }
 
         /* ── ترتيب الهيدر ───────────────────────── */
-        nav { gap: 10px; }
-        nav > div:first-child { min-width: 0; line-height: 1.2; }
-        .logo { display: block; white-space: nowrap; }
+        nav { gap: 10px; height: auto; min-height: 65px; padding-top: 6px; padding-bottom: 6px; }
+        nav > div:first-child { flex-shrink: 0; line-height: 1.2; }
+        .logo { display: inline-block; white-space: nowrap; padding-inline-end: 4px; }
         .logo-sub { white-space: nowrap; }
         #auth-section { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
         .nav-user { display: inline-flex; align-items: center; gap: 5px; max-width: 130px; height: 36px; background: rgba(59,130,246,0.12); border: 1px solid rgba(59,130,246,0.3); color: #93c5fd; padding: 0 0.8rem; border-radius: 999px; font-weight: 700; font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -3646,7 +3654,7 @@ app.use(async (req, res) => {
             if(m && m.contains(e.target) && m.scrollHeight > m.clientHeight + 1) return;
             e.preventDefault();
         }, { passive: false });
-        window.addEventListener('resize', function() { if(window.innerWidth > 768) closeMobileMenu(); });
+        window.addEventListener('resize', function() { if(window.innerWidth > 1180) closeMobileMenu(); });
         function mobileGoPage(page) {
             goPage(page);
             closeMobileMenu();
@@ -3792,10 +3800,38 @@ app.use(async (req, res) => {
                         }
                     }
                     if (data.lastTicketActivity) lastSeenTicketActivity = data.lastTicketActivity;
-                    if (data.lastActivity) lastSeenActivity = data.lastActivity;
+                    if (data.lastActivity) {
+                        if (lastSeenActivity && data.lastActivity !== lastSeenActivity) silentRefreshCurrentPage();
+                        lastSeenActivity = data.lastActivity;
+                    }
+                    if (pendingSilentRefresh) silentRefreshCurrentPage();
                 } catch(e) {}
             }, 2000);
         }
+
+        let pendingSilentRefresh = false;
+        function silentRefreshCurrentPage() {
+            try {
+                if (document.hidden) { pendingSilentRefresh = true; return; }
+                const ae = document.activeElement;
+                const typing = ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName);
+                let modalOpen = false;
+                document.querySelectorAll('.custom-modal').forEach(function(m) { if (getComputedStyle(m).display !== 'none') modalOpen = true; });
+                if (typing || modalOpen) { pendingSilentRefresh = true; return; }
+                pendingSilentRefresh = false;
+                const pg = document.querySelector('.page.active');
+                if (!pg) return;
+                const id = pg.id.replace('page-', '');
+                loadNotifCount();
+                if (id === 'dashboard' || id === 'savings') loadDashboard();
+                else if (id === 'loans') { loadLoanInfo(); loadDashboard(); }
+                else if (id === 'history') loadHistory();
+                else if (id === 'notifications') loadNotifications();
+                else if (id === 'cards') loadMyCards();
+                else if (id === 'transfer') loadDashboard();
+            } catch (e) {}
+        }
+        document.addEventListener('visibilitychange', function() { if (!document.hidden && pendingSilentRefresh) silentRefreshCurrentPage(); });
 
         function startAdminPolling() {
             if (adminPollInterval) clearInterval(adminPollInterval);
