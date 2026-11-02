@@ -4335,4 +4335,29 @@ const PORT = process.env.PORT || 7697;
 
 app.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server running on port ${PORT}`);
+    startKeepAlive();
 });
+
+// ═══════════ نظام التصحية: يخلي البنك (وفلاش) صاحي دايم ═══════════
+// Render المجاني ينيّم الموقع بعد 15 دقيقة بدون زوار، فنرسل طلب خفيف كل 9 دقايق.
+// ملاحظة: هذا يمنع النوم طول ما البنك شغال. لو نام لأي سبب (إعادة تشغيل مثلاً) ما يقدر يصحّي نفسه،
+// عشان كذا يُنصح بخدمة خارجية (UptimeRobot) تفحص /healthz كل 5 دقايق.
+function startKeepAlive() {
+    const selfUrl = String(process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+    const targets = [];
+    if (selfUrl) targets.push({ name: 'البنك', url: selfUrl + '/healthz' });
+    else console.log('⚠️ التصحية: ما لقيت رابط البنك (RENDER_EXTERNAL_URL أو SELF_URL) — ضيف SELF_URL في إعدادات Render');
+    if (String(process.env.KEEP_FLASH_ALIVE || 'true') !== 'false') targets.push({ name: 'فلاش', url: FLASH_API + '/healthz' });
+    if (!targets.length) return;
+    async function pingAll() {
+        for (const t of targets) {
+            try {
+                const r = await fetch(t.url, { signal: AbortSignal.timeout(20000), headers: { 'User-Agent': 'bank-keepalive' } });
+                if (r.status >= 500) console.log('⚠️ التصحية: ' + t.name + ' رد ' + r.status);
+            } catch (e) { console.log('⚠️ التصحية: تعذر الوصول لـ' + t.name + ' (' + (e && e.message ? e.message : e) + ')'); }
+        }
+    }
+    setTimeout(pingAll, 60 * 1000);
+    setInterval(pingAll, 9 * 60 * 1000);
+    console.log('💓 نظام التصحية شغال (كل 9 دقايق): ' + targets.map(t => t.name).join(' + '));
+}
