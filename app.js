@@ -150,7 +150,6 @@ const CardRequestSchema = new mongoose.Schema({
     militarySector: String,
     militaryUnit: String,
     flashRank: String, flashSector: String, flashUnit: String,  // اللي في فلاش فعلياً (للمقارنة)
-    cardType: { type: String, default: 'عادية' },
     pledgeAccepted: { type: Boolean, default: false },
     // حالة الطلب
     status: { type: String, default: 'pending' }, // pending / approved / rejected / disabled / expired
@@ -262,6 +261,36 @@ function periodToMs(value, unit) {
     return v * 24 * 60 * 60 * 1000; // days (افتراضي)
 }
 
+// يصرف الراتب لقائمة عساكر (advance = دفعة مسبقة لأشخاص محددين، ما تغيّر موعد الدفعة القادمة)
+async function payMilitarySalaries(list, settings, advance) {
+    let paidCount = 0, totalPaid = 0;
+    const tag = advance ? ' (دفعة مسبقة)' : '';
+    for (const p of list) {
+        const salary = settings.ranksSalaries.get(p.rank);
+        if (!salary || salary <= 0) continue; // ما فيه راتب محدد لهذي الرتبة
+
+        const acc = await Account.findOne({ discord: p.discord });
+        if (!acc || acc.isFrozen) continue; // ما عنده حساب بنكي أو حسابه مجمد
+
+        await Account.findByIdAndUpdate(acc._id, { $inc: { balance: salary } });
+        await Transaction.create({
+            toDiscord: p.discord,
+            toAccount: acc.accountNumber,
+            amount: salary,
+            type: 'deposit',
+            note: `راتب عسكري${tag} — رتبة ${p.rank}`
+        });
+        await Notification.create({
+            discord: p.discord,
+            message: `💰 تم إيداع راتبك العسكري${tag} (${salary.toLocaleString()} $) عن رتبة ${p.rank}.`,
+            type: 'success'
+        });
+        paidCount++;
+        totalPaid += salary;
+    }
+    return { paidCount, totalPaid };
+}
+
 // تنفيذ عملية صرف رواتب العساكر: يجيب رتبة كل عسكري من موقع فلاش
 // ويودع الراتب المحدد لرتبته في حسابه البنكي المسجل
 async function runMilitarySalaryPayout() {
@@ -278,30 +307,7 @@ async function runMilitarySalaryPayout() {
         return { success: false, msg: "تعذر الاتصال بموقع فلاش: " + e.message };
     }
 
-    let paidCount = 0, totalPaid = 0;
-    for (const p of personnel) {
-        const salary = settings.ranksSalaries.get(p.rank);
-        if (!salary || salary <= 0) continue; // ما فيه راتب محدد لهذي الرتبة
-
-        const acc = await Account.findOne({ discord: p.discord });
-        if (!acc || acc.isFrozen) continue; // ما عنده حساب بنكي أو حسابه مجمد
-
-        await Account.findByIdAndUpdate(acc._id, { $inc: { balance: salary } });
-        await Transaction.create({
-            toDiscord: p.discord,
-            toAccount: acc.accountNumber,
-            amount: salary,
-            type: 'deposit',
-            note: `راتب عسكري — رتبة ${p.rank}`
-        });
-        await Notification.create({
-            discord: p.discord,
-            message: `💰 تم إيداع راتبك العسكري (${salary.toLocaleString()} $) عن رتبة ${p.rank}.`,
-            type: 'success'
-        });
-        paidCount++;
-        totalPaid += salary;
-    }
+    const { paidCount, totalPaid } = await payMilitarySalaries(personnel, settings, false);
 
     const now = new Date();
     const nextPayoutAt = new Date(now.getTime() + periodToMs(settings.periodValue, settings.periodUnit));
@@ -1068,6 +1074,49 @@ app.post('/api/superadmin/military-salary/run-now', isBankSuperAdmin, async (req
     res.json(result);
 });
 
+// قائمة العساكر المستحقين (عندهم حساب + راتب لرتبتهم) لاختيار أشخاص محددين للصرف المسبق
+app.get('/api/superadmin/military-salary/personnel', isBankSuperAdmin, async (req, res) => {
+    try {
+        const settings = await getMilitarySalarySettings();
+        const data = await flashGet('/api/bank/personnel-ranks');
+        if (!data.success) return res.json({ success: false, msg: "تعذر جلب العساكر من فلاش" });
+        const ids = data.personnel.map(p => String(p.discord));
+        const accs = await Account.find({ discord: { $in: ids } }, { discord: 1, discordTag: 1, isFrozen: 1 }).lean();
+        const accMap = new Map(accs.map(a => [String(a.discord), a]));
+        const list = [];
+        for (const p of data.personnel) {
+            const acc = accMap.get(String(p.discord));
+            const salary = settings.ranksSalaries.get(p.rank);
+            if (!acc || acc.isFrozen || !salary || salary <= 0) continue;
+            list.push({ discord: String(p.discord), name: p.registeredName || acc.discordTag || p.discordTag || String(p.discord), rank: p.rank, salary });
+        }
+        res.json({ success: true, list });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+
+// صرف راتب مسبق لأشخاص محددين فقط (ما يغيّر موعد الدفعة القادمة)
+app.post('/api/superadmin/military-salary/pay-selected', isBankSuperAdmin, async (req, res) => {
+    try {
+        const uids = Array.isArray(req.body.uids) ? req.body.uids.map(String).slice(0, 200) : [];
+        if (!uids.length) return res.json({ success: false, msg: "اختر شخص واحد على الأقل" });
+        const settings = await getMilitarySalarySettings();
+        const data = await flashGet('/api/bank/personnel-ranks');
+        if (!data.success) return res.json({ success: false, msg: "تعذر جلب العساكر من فلاش" });
+        const set = new Set(uids);
+        const chosen = data.personnel.filter(p => set.has(String(p.discord)));
+        if (!chosen.length) return res.json({ success: false, msg: "ما لقينا الأشخاص المختارين" });
+        const { paidCount, totalPaid } = await payMilitarySalaries(chosen, settings, true);
+        if (!paidCount) return res.json({ success: false, msg: "ما تم الصرف: تأكد أن لهم حسابات غير مجمدة ورواتب محددة لرتبهم" });
+        await BankLog.create({
+            action: 'military_salary_advance',
+            description: `صرف راتب مسبق لـ ${paidCount} شخص بإجمالي ${totalPaid.toLocaleString()} $`,
+            performedBy: req.user.id, performedByTag: req.user.username
+        });
+        bumpActivity();
+        res.json({ success: true, paidCount, totalPaid });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+
 // ── APIs البطاقات البنكية ─────────────────────────────────────────────────────
 
 // تقديم طلب بطاقة
@@ -1086,13 +1135,12 @@ app.post('/api/account/card/request', checkMaintenance, async (req, res) => {
         const existing = await CardRequest.countDocuments({ discord: req.user.id, status: { $in: ['pending', 'approved'] } });
         if (existing >= limit) return res.json({ success: false, msg: `لقد وصلت للحد الأقصى من البطاقات المسموح بها (${limit})` });
 
-        const { militaryCardNumber, militaryRank, militarySector, militaryUnit, cardType, requestReason, pledge } = req.body;
+        const { militaryCardNumber, militaryRank, militarySector, militaryUnit, requestReason, pledge } = req.body;
         const mRank = String(militaryRank || '').trim().slice(0, 60);
         const mSector = String(militarySector || '').trim().slice(0, 60);
         const mUnit = String(militaryUnit || '').trim().slice(0, 60);
         const num = String(militaryCardNumber || '').trim().slice(0, 20);
         const reason = String(requestReason || '').trim().slice(0, 500);
-        const type = ['عادية', 'ذهبية', 'بلاتينية'].includes(cardType) ? cardType : 'عادية';
         if (!mSector || !mRank || !mUnit) return res.json({ success: false, msg: "يجب تعبئة القطاع والرتبة واليونت" });
         if (!reason) return res.json({ success: false, msg: "اكتب سبب طلب البطاقة" });
         if (!pledge) return res.json({ success: false, msg: "يجب الموافقة على التعهد" });
@@ -1125,7 +1173,6 @@ app.post('/api/account/card/request', checkMaintenance, async (req, res) => {
             flashRank: info.rank || '',
             flashSector: info.sector || '',
             flashUnit: info.unit || '',
-            cardType: type,
             pledgeAccepted: true,
             ...(autoReject ? { status: 'rejected', reviewedAt: new Date(), adminNote: 'رفض تلقائي: ' + autoReject } : {})
         });
@@ -1790,6 +1837,15 @@ app.use(async (req, res) => {
         .cs-opt { display: block; width: 100%; text-align: right; background: rgba(255,255,255,0.05); border: 1px solid transparent; border-radius: 10px; color: #e2e8f0; padding: 13px 14px; margin-bottom: 7px; font-family: inherit; font-size: 0.95rem; cursor: pointer; }
         .cs-opt:hover { background: rgba(59,130,246,0.18); }
         .cs-opt.on { border-color: #3b82f6; background: rgba(59,130,246,0.25); font-weight: 800; }
+        /* قفل تمرير الخلفية لما تنفتح أي قائمة كبيرة أو نافذة */
+        html.modal-open, html.modal-open body { overflow: hidden; }
+        .custom-modal, .ui-ov, .cs-ov, .dg-ov, .modal-content, .cs-box, .ui-box { overscroll-behavior: contain; }
+        .ms-pick-list { max-height: 42vh; overflow-y: auto; -webkit-overflow-scrolling: touch; margin: 8px 0 10px; text-align: right; }
+        .ms-pick-row { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 10px; background: rgba(255,255,255,0.05); margin-bottom: 6px; cursor: pointer; }
+        .ms-pick-row.on { background: rgba(34,197,94,0.18); outline: 1px solid #22c55e; }
+        .ms-pick-row input { width: auto; margin: 0; }
+        .ms-pick-row .nm { flex: 1; color: #e2e8f0; font-size: 0.9rem; }
+        .ms-pick-row .rk { color: #94a3b8; font-size: 0.78rem; }
         
         .btn { border: none; color: #fff; padding: 0.6rem 1.3rem; border-radius: 8px; cursor: pointer; font-family: inherit; font-weight: 700; font-size: 0.88rem; transition: all 0.2s; }
         .btn:hover { opacity: 0.85; transform: translateY(-1px); }
@@ -2185,12 +2241,6 @@ app.use(async (req, res) => {
                 <select id="card-mil-rank"><option value="">— اختر الرتبة —</option></select>
                 <label>🧩 يونتك العسكري:</label>
                 <input id="card-mil-unit" autocomplete="off" placeholder="اكتب اسم اليونت" />
-                <label>💳 نوع البطاقة المطلوبة:</label>
-                <select id="card-type">
-                    <option value="عادية">عادية</option>
-                    <option value="ذهبية">ذهبية</option>
-                    <option value="بلاتينية">بلاتينية</option>
-                </select>
                 <label>سبب طلب البطاقة:</label>
                 <textarea id="card-reason" rows="3" maxlength="500" placeholder="اشرح سبب حاجتك للبطاقة..."></textarea>
                 <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:1rem;">
@@ -2547,6 +2597,60 @@ app.use(async (req, res) => {
         function csEnhanceAll() { document.querySelectorAll('select[id]').forEach(csEnhance); }
         if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', csEnhanceAll); else csEnhanceAll();
 
+        // ── قفل تمرير الخلفية لما تنفتح أي قائمة كبيرة (لوحة الإدارة، نوافذ، قوائم) ──
+        function uiModalOpen() {
+            if (document.querySelector('.ui-ov, .cs-ov, .dg-ov')) return true;
+            const ms = document.querySelectorAll('.custom-modal');
+            for (let i = 0; i < ms.length; i++) { const d = ms[i].style.display; if (d && d !== 'none') return true; }
+            return false;
+        }
+        let uiLockRaf = 0;
+        function uiSyncLock() {
+            if (uiLockRaf) return;
+            uiLockRaf = requestAnimationFrame(function () {
+                uiLockRaf = 0;
+                document.documentElement.classList.toggle('modal-open', uiModalOpen());
+            });
+        }
+        new MutationObserver(uiSyncLock).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['style'] });
+        // آيفون: نمنع سحب الخلفية إلا إذا كان الإصبع داخل عنصر قابل للتمرير في النافذة نفسها
+        document.addEventListener('touchmove', function (e) {
+            if (!document.documentElement.classList.contains('modal-open')) return;
+            let n = e.target;
+            while (n && n !== document.body && n.nodeType === 1) {
+                const oy = getComputedStyle(n).overflowY;
+                if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight) return;
+                n = n.parentElement;
+            }
+            e.preventDefault();
+        }, { passive: false });
+
+        // ── إشعار منبثق عام (تحت يمين) يستخدمه كل الموقع بدل الرسائل داخل الصفحة ──
+        function uiToast(msg, type, ms) {
+            type = UI_COLORS[type] ? type : 'info';
+            const clean = String(msg === undefined || msg === null ? '' : msg).replace(/^(✅|❌|⚠️?)[ ]*/, '').trim();
+            if (!clean) return;
+            let wrap = document.getElementById('notif-toast-wrap');
+            if (!wrap) { wrap = uiEl('div'); wrap.id = 'notif-toast-wrap'; document.body.appendChild(wrap); }
+            const dup = Array.from(wrap.children).some(function (c) { return c._msg === clean; });
+            if (dup) return;
+            const icons = { info: 'ℹ️', success: '✅', warning: '⚠️', danger: '❌' };
+            const titles = { info: 'معلومة', success: 'تمت العملية', warning: 'تنبيه', danger: 'تعذّر التنفيذ' };
+            const dur = ms || NOTIF_TOAST_MS;
+            const t = uiEl('div', 'ntoast ntoast-' + type);
+            t._msg = clean;
+            t.appendChild(uiEl('div', 'ntoast-title', icons[type] + ' ' + titles[type]));
+            t.appendChild(uiEl('div', 'ntoast-text', clean));
+            const bar = uiEl('div', 'ntoast-bar');
+            const fill = document.createElement('i');
+            fill.style.animationDuration = dur + 'ms';
+            bar.appendChild(fill); t.appendChild(bar);
+            wrap.appendChild(t);
+            function closeIt() { t.classList.add('out'); setTimeout(function () { t.remove(); }, 280); }
+            setTimeout(closeIt, dur);
+            t.onclick = closeIt;
+        }
+
         function uiAlert(msg, type) {
             msg = String(msg === undefined || msg === null || msg === '' ? 'تمت العملية' : msg);
             if (!type) type = msg.indexOf('✅') === 0 ? 'success' : msg.indexOf('❌') === 0 ? 'danger' : msg.indexOf('⚠') === 0 ? 'warning' : 'info';
@@ -2659,7 +2763,7 @@ app.use(async (req, res) => {
         }
 
         // ═══════════ إشعار منبثق (تحت يمين) ═══════════
-        const NOTIF_TOAST_MS = 2000;           // مدة بقاء الإشعار (بالملي ثانية)
+        const NOTIF_TOAST_MS = 5000;           // مدة بقاء الإشعار (بالملي ثانية)
         const NOTIF_ADMIN_PREFIX = '📢 رسالة من الإدارة:';
         let notifBaseline = false, lastLatestUnread = null, notifBusy = false;
         const toastedNotifIds = new Set();
@@ -3431,10 +3535,12 @@ app.use(async (req, res) => {
         }
 
         function showMsg(id, msg, type) {
-            const colors = { success: '#4ade80', danger: '#fca5a5', warning: '#fde047', info: '#60a5fa' };
-            const bg = { success: 'rgba(34,197,94,0.1)', danger: 'rgba(239,68,68,0.1)', warning: 'rgba(234,179,8,0.1)', info: 'rgba(59,130,246,0.1)' };
+            // كل رسائل الموقع صارت إشعار منبثق (تحت يمين) بدل ما تطلع داخل الصفحة
             const el = document.getElementById(id);
-            if(el) el.innerHTML = \`<div style="padding:10px; border-radius:8px; background:\${bg[type]}; color:\${colors[type]}; border:1px solid \${colors[type]}; margin-bottom:10px;">\${msg}</div>\`;
+            if (el) el.innerHTML = '';
+            const m = String(msg || '');
+            const progress = type === 'info' && /^(جاري|⏳)/.test(m);
+            uiToast(m, type, progress ? 2000 : 0);
         }
 
         async function loadMyCards() {
@@ -3497,7 +3603,7 @@ app.use(async (req, res) => {
                         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                             <div>
                                 <b style="color:\${colorMap[status]};">\${statusMap[status] || status}</b>
-                                <p style="color:#94a3b8; font-size:0.85rem; margin-top:4px;">\${c.militaryRank ? ('الرتبة: ' + c.militaryRank + ' | القطاع: ' + (c.militarySector || '—') + ' | اليونت: ' + (c.militaryUnit || '—') + ' | النوع: ' + (c.cardType || 'عادية')) : ('المسمى: ' + (c.jobTitle || '—') + ' | جهة العمل: ' + (c.employerName || '—'))}</p>
+                                <p style="color:#94a3b8; font-size:0.85rem; margin-top:4px;">\${c.militaryRank ? ('الرتبة: ' + c.militaryRank + ' | القطاع: ' + (c.militarySector || '—') + ' | اليونت: ' + (c.militaryUnit || '—')) : ('المسمى: ' + (c.jobTitle || '—') + ' | جهة العمل: ' + (c.employerName || '—'))}</p>
                                 \${c.adminNote ? \`<p style="color:#60a5fa; font-size:0.83rem; margin-top:4px;">ملاحظة الإدارة: \${c.adminNote}</p>\` : ''}
                                 \${c.cardExpiry && !isExpired && c.status === 'approved' ? \`<p style="color:#94a3b8; font-size:0.78rem; margin-top:3px;">⏳ تنتهي في: \${new Date(c.cardExpiry).toLocaleDateString('ar-SA')}</p>\` : ''}
                             </div>
@@ -3590,7 +3696,6 @@ app.use(async (req, res) => {
             const sector = document.getElementById('card-mil-sector').value;
             const rank = document.getElementById('card-mil-rank').value;
             const unit = document.getElementById('card-mil-unit').value.trim();
-            const type = document.getElementById('card-type').value;
             const reason = document.getElementById('card-reason').value.trim();
             const pledge = document.getElementById('card-pledge').checked;
             if (!sector || !rank || !unit) return showMsg('card-req-msg', 'عبّي القطاع والرتبة واليونت', 'danger');
@@ -3599,12 +3704,12 @@ app.use(async (req, res) => {
             showMsg('card-req-msg', 'جاري التحقق من بطاقتك العسكرية...', 'info');
             const res = await fetch('/api/account/card/request', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ militaryCardNumber: num, militarySector: sector, militaryRank: rank, militaryUnit: unit, cardType: type, requestReason: reason, pledge: pledge })
+                body: JSON.stringify({ militaryCardNumber: num, militarySector: sector, militaryRank: rank, militaryUnit: unit, requestReason: reason, pledge: pledge })
             });
             const data = await res.json();
             showMsg('card-req-msg', (data.success ? '✅ ' : '❌ ') + data.msg, data.success ? 'success' : 'danger');
             loadMyCards();
-            if (data.success) { ['card-mil-number','card-mil-unit','card-reason'].forEach(function(id){ document.getElementById(id).value = ''; }); document.getElementById('card-mil-sector').value = ''; document.getElementById('card-mil-rank').value = ''; csRefresh('card-mil-sector'); csRefresh('card-mil-rank'); document.getElementById('card-type').value = 'عادية'; csRefresh('card-type'); document.getElementById('card-pledge').checked = false; }
+            if (data.success) { ['card-mil-number','card-mil-unit','card-reason'].forEach(function(id){ document.getElementById(id).value = ''; }); document.getElementById('card-mil-sector').value = ''; document.getElementById('card-mil-rank').value = ''; csRefresh('card-mil-sector'); csRefresh('card-mil-rank'); document.getElementById('card-pledge').checked = false; }
         }
 
         // ─── دوال أدمن البطاقات ────────────────────────────────────────────────
@@ -3640,7 +3745,7 @@ app.use(async (req, res) => {
                             <b>\${c.discordTag}</b> <span style="color:#64748b; font-size:0.8rem;">\${c.discord}</span>
                             <p style="margin-top:5px; color:#94a3b8; font-size:0.85rem;">🎖️ الرتبة: \${c.militaryRank || '—'} | 🛡️ القطاع: \${c.militarySector || '—'} | 🧩 اليونت: \${c.militaryUnit || '—'}</p>
                             \${(c.flashRank && (c.flashRank !== c.militaryRank || c.flashSector !== c.militarySector)) ? ('<p style="color:#fbbf24; font-size:0.8rem;">⚠️ المسجّل في فلاش: ' + c.flashRank + ' — ' + (c.flashSector || '—') + ' — ' + (c.flashUnit || '—') + '</p>') : ''}
-                            <p style="color:#4ade80; font-size:0.85rem;">🪪 البطاقة العسكرية: \${c.militaryCardNumber || '—'} | 💳 النوع: \${c.cardType || 'عادية'}</p>
+                            <p style="color:#4ade80; font-size:0.85rem;">🪪 البطاقة العسكرية: \${c.militaryCardNumber || '—'}</p>
                             <p style="color:#94a3b8; font-size:0.83rem;">السبب: \${c.requestReason}</p>
                             <p style="color:#64748b; font-size:0.78rem;">\${new Date(c.requestedAt).toLocaleString('ar-SA')}</p>
                         </div>
@@ -3911,17 +4016,88 @@ app.use(async (req, res) => {
             loadMilitarySalaryPanel();
         }
 
-        async function runMilitarySalaryNow() {
-            if (!(await uiConfirm('متأكد تبي تصرف الرواتب الآن يدوياً لكل العساكر المستحقين؟', { title: '💰 صرف الرواتب الآن', okText: 'نعم، اصرف' }))) return;
+        async function msPayAll() {
+            if (!(await uiConfirm('متأكد تبي تصرف الرواتب الآن يدوياً لكل العساكر المستحقين؟', { title: '💰 صرف الرواتب للجميع', okText: 'نعم، اصرف' }))) return;
             showMsg('military-salary-msg', 'جاري الصرف...', 'info');
             const res = await fetch('/api/superadmin/military-salary/run-now', { method: 'POST' });
             const data = await res.json();
             if (data.success) {
-                showMsg('military-salary-msg', \`✅ تم صرف الرواتب لـ \${data.paidCount} حساب بإجمالي \${data.totalPaid.toLocaleString()} $\`, 'success');
+                showMsg('military-salary-msg', '✅ تم صرف الرواتب لـ ' + data.paidCount + ' حساب بإجمالي ' + data.totalPaid.toLocaleString() + ' $', 'success');
                 loadMilitarySalaryPanel();
             } else {
-                showMsg('military-salary-msg', '❌ '+data.msg, 'danger');
+                showMsg('military-salary-msg', '❌ ' + data.msg, 'danger');
             }
+        }
+
+        // فورم الصرف اليدوي: زرين (الجميع / محدد)
+        function runMilitarySalaryNow() {
+            const s = uiShell('info', '💰 صرف الرواتب يدوياً');
+            s.box.appendChild(uiEl('div', 'ui-msg', 'لمن تبي تصرف الراتب؟'));
+            const actions = uiEl('div', 'ui-actions');
+            const all = uiEl('button', 'btn btn-blue', '👥 الجميع');
+            const sel = uiEl('button', 'btn btn-green', '🎯 محدد');
+            const no = uiEl('button', 'btn ui-cancel', 'إلغاء');
+            actions.appendChild(all); actions.appendChild(sel); actions.appendChild(no);
+            s.box.appendChild(actions);
+            all.onclick = function () { s.ov.remove(); msPayAll(); };
+            sel.onclick = function () { s.ov.remove(); msPickPeople(); };
+            no.onclick = function () { s.ov.remove(); };
+            s.ov.addEventListener('mousedown', function (e) { if (e.target === s.ov) s.ov.remove(); });
+        }
+
+        // اختيار شخص أو أكثر ويجيهم الراتب مسبق
+        async function msPickPeople() {
+            let data;
+            try { const r = await fetch('/api/superadmin/military-salary/personnel'); data = await r.json(); } catch (e) { data = null; }
+            if (!data || !data.success) { uiToast('❌ ' + ((data && data.msg) || 'تعذر جلب العساكر'), 'danger'); return; }
+            if (!data.list.length) { uiToast('ما فيه عساكر مستحقين (لازم يكون لهم حساب وراتب لرتبتهم)', 'warning'); return; }
+            const s = uiShell('success', '🎯 اختر من يجيه الراتب مسبق');
+            const search = document.createElement('input');
+            search.type = 'text'; search.placeholder = '🔍 ابحث بالاسم أو الرتبة...';
+            s.box.appendChild(search);
+            const listEl = uiEl('div', 'ms-pick-list');
+            s.box.appendChild(listEl);
+            const counter = uiEl('div', 'ui-hint', 'المختارين: 0');
+            s.box.appendChild(counter);
+            const chosen = new Set();
+            const rows = [];
+            data.list.forEach(function (p) {
+                const row = uiEl('label', 'ms-pick-row');
+                const cb = document.createElement('input'); cb.type = 'checkbox';
+                row.appendChild(cb);
+                row.appendChild(uiEl('span', 'nm', p.name));
+                row.appendChild(uiEl('span', 'rk', p.rank + ' • ' + Number(p.salary).toLocaleString() + ' $'));
+                cb.onchange = function () {
+                    if (cb.checked) chosen.add(p.discord); else chosen.delete(p.discord);
+                    row.classList.toggle('on', cb.checked);
+                    counter.textContent = 'المختارين: ' + chosen.size;
+                };
+                row._txt = (p.name + ' ' + p.rank).toLowerCase();
+                listEl.appendChild(row); rows.push(row);
+            });
+            search.oninput = function () {
+                const q = search.value.trim().toLowerCase();
+                rows.forEach(function (r) { r.style.display = (!q || r._txt.indexOf(q) !== -1) ? '' : 'none'; });
+            };
+            const err = uiEl('div', 'ui-err'); s.box.appendChild(err);
+            const actions = uiEl('div', 'ui-actions');
+            const ok = uiEl('button', 'btn btn-green', '💸 صرف مسبق');
+            const no = uiEl('button', 'btn ui-cancel', 'إلغاء');
+            actions.appendChild(ok); actions.appendChild(no); s.box.appendChild(actions);
+            no.onclick = function () { s.ov.remove(); };
+            s.ov.addEventListener('mousedown', function (e) { if (e.target === s.ov) s.ov.remove(); });
+            ok.onclick = async function () {
+                if (!chosen.size) { err.textContent = '⚠️ اختر شخص واحد على الأقل'; return; }
+                ok.disabled = true;
+                const res = await fetch('/api/superadmin/military-salary/pay-selected', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ uids: Array.from(chosen) })
+                });
+                const d = await res.json();
+                s.ov.remove();
+                if (d.success) uiToast('✅ تم صرف الراتب مسبقاً لـ ' + d.paidCount + ' شخص بإجمالي ' + d.totalPaid.toLocaleString() + ' $', 'success');
+                else uiToast('❌ ' + d.msg, 'danger');
+            };
         }
 
         // ─── دوال الرسوم (كبار المسؤولين) ──────────────────────────────────
