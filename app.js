@@ -1642,11 +1642,12 @@ app.get('/api/poll/user', checkMaintenance, async (req, res) => {
     try {
         const acc = await Account.findOne({ discord: req.user.id });
         const unreadCount = await Notification.countDocuments({ discord: req.user.id, read: false });
+        const latestUnread = await Notification.findOne({ discord: req.user.id, read: false }).sort({ createdAt: -1 }).select('_id');
         let activeTicket = null;
         if (req.query.ticketId) {
             activeTicket = await SupportTicket.findOne({ _id: req.query.ticketId, discord: req.user.id });
         }
-        res.json({ balance: acc?.balance, savingsBalance: acc?.savingsBalance, isFrozen: acc?.isFrozen, unreadCount, activeTicket, lastActivity: lastBankActivity, lastTicketActivity });
+        res.json({ balance: acc?.balance, savingsBalance: acc?.savingsBalance, isFrozen: acc?.isFrozen, unreadCount, latestUnreadId: latestUnread ? String(latestUnread._id) : null, activeTicket, lastActivity: lastBankActivity, lastTicketActivity });
     } catch (e) { res.json({}); }
 });
 
@@ -1865,6 +1866,39 @@ app.use(async (req, res) => {
             .nav-user { max-width: 66px; font-size: 0.8rem; }
             .nav-back { padding: 0 0.65rem; font-size: 0.8rem; }
         }
+        /* ═══ نوافذ الموقع (بديل prompt / confirm / alert) ═══ */
+        .ui-ov { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.72); backdrop-filter: blur(6px); z-index: 100000; display: flex; align-items: center; justify-content: center; padding: 16px; animation: uiFade 0.15s ease; }
+        .ui-box { width: 100%; max-width: 410px; background: #07162b; border: 1px solid rgba(59,130,246,0.35); border-top: 4px solid var(--c, #3b82f6); border-radius: 14px; padding: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.6); animation: uiPop 0.18s ease; max-height: 90vh; overflow-y: auto; }
+        .ui-title { font-size: 1.05rem; font-weight: 800; color: var(--c, #60a5fa); margin-bottom: 10px; }
+        .ui-msg { font-size: 0.92rem; color: #e2e8f0; line-height: 1.8; white-space: pre-line; word-break: break-word; }
+        .ui-detail { font-size: 0.82rem; color: #94a3b8; line-height: 1.7; margin-top: 8px; white-space: pre-line; }
+        .ui-field { margin-top: 12px; }
+        .ui-field label { display: block; font-size: 0.82rem; color: #94a3b8; margin-bottom: 5px; }
+        .ui-field input, .ui-field select, .ui-field textarea { margin-bottom: 0; }
+        .ui-field textarea { min-height: 90px; resize: vertical; }
+        .ui-hint { font-size: 0.74rem; color: #64748b; margin-top: 4px; }
+        .ui-err { font-size: 0.8rem; color: #fca5a5; margin-top: 10px; min-height: 0; }
+        .ui-actions { display: flex; gap: 8px; margin-top: 16px; }
+        .ui-actions .btn { flex: 1; padding: 0.65rem 0.5rem; }
+        .ui-cancel { background: #334155; }
+        @keyframes uiFade { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes uiPop { from { opacity: 0; transform: scale(0.94) translateY(8px); } to { opacity: 1; transform: none; } }
+
+        /* ═══ إشعار منبثق تحت يمين ═══ */
+        #notif-toast-wrap { position: fixed; right: 14px; bottom: 14px; z-index: 100001; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; pointer-events: none; }
+        .ntoast { --c: #3b82f6; pointer-events: auto; cursor: pointer; position: relative; overflow: hidden; width: min(310px, calc(100vw - 28px)); background: #07162b; border: 1px solid var(--c); border-right-width: 4px; border-radius: 12px; padding: 10px 12px 13px; box-shadow: 0 10px 30px rgba(0,0,0,0.55); animation: ntIn 0.3s cubic-bezier(.2,.9,.3,1.2); transition: opacity 0.25s, transform 0.25s; direction: rtl; }
+        .ntoast.out { opacity: 0; transform: translateX(40px); }
+        .ntoast-info { --c: #3b82f6; background: linear-gradient(135deg, #07162b, #0b2447); }
+        .ntoast-success { --c: #22c55e; background: linear-gradient(135deg, #07162b, #0a2a1c); }
+        .ntoast-warning { --c: #eab308; background: linear-gradient(135deg, #07162b, #2a2408); }
+        .ntoast-danger { --c: #ef4444; background: linear-gradient(135deg, #07162b, #2b0d12); }
+        .ntoast-title { font-size: 0.78rem; font-weight: 800; color: var(--c); margin-bottom: 3px; }
+        .ntoast-text { font-size: 0.84rem; color: #e2e8f0; line-height: 1.6; word-break: break-word; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+        .ntoast-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255,255,255,0.08); }
+        .ntoast-bar i { display: block; height: 100%; width: 100%; background: var(--c); transform-origin: right center; animation-name: ntBar; animation-timing-function: linear; animation-fill-mode: forwards; }
+        @keyframes ntBar { to { transform: scaleX(0); } }
+        @keyframes ntIn { from { opacity: 0; transform: translateX(60px); } to { opacity: 1; transform: none; } }
+
     </style>
 </head>
 <body>
@@ -2350,6 +2384,198 @@ app.use(async (req, res) => {
         let currentAccount = null;
         let bankSettingsCache = null;
 
+        // ═══════════ نوافذ الموقع: تنبيه / تأكيد / فورم ═══════════
+        const UI_COLORS = { info: '#3b82f6', success: '#22c55e', warning: '#eab308', danger: '#ef4444' };
+        const UI_BTN = { info: 'btn-blue', success: 'btn-green', warning: 'btn-yellow', danger: 'btn-red' };
+        function uiEl(tag, cls, text) {
+            const e = document.createElement(tag);
+            if (cls) e.className = cls;
+            if (text !== undefined && text !== null) e.textContent = text;
+            return e;
+        }
+        function uiShell(type, title) {
+            const ov = uiEl('div', 'ui-ov');
+            const box = uiEl('div', 'ui-box');
+            box.style.setProperty('--c', UI_COLORS[type] || UI_COLORS.info);
+            if (title) box.appendChild(uiEl('div', 'ui-title', title));
+            ov.appendChild(box);
+            document.body.appendChild(ov);
+            return { ov: ov, box: box };
+        }
+        function uiAlert(msg, type) {
+            msg = String(msg === undefined || msg === null || msg === '' ? 'تمت العملية' : msg);
+            if (!type) type = msg.indexOf('✅') === 0 ? 'success' : msg.indexOf('❌') === 0 ? 'danger' : msg.indexOf('⚠') === 0 ? 'warning' : 'info';
+            const clean = msg.replace(/^(✅|❌|⚠️?)[ ]*/, '');
+            const titles = { success: '✅ تمت العملية', danger: '❌ تعذّر التنفيذ', warning: '⚠️ تنبيه', info: 'ℹ️ معلومة' };
+            return new Promise(function (resolve) {
+                const s = uiShell(type, titles[type]);
+                s.box.appendChild(uiEl('div', 'ui-msg', clean));
+                const actions = uiEl('div', 'ui-actions');
+                const ok = uiEl('button', 'btn ' + (UI_BTN[type] || 'btn-blue'), 'حسناً');
+                actions.appendChild(ok);
+                s.box.appendChild(actions);
+                function done() { document.removeEventListener('keydown', onKey, true); s.ov.remove(); resolve(true); }
+                function onKey(e) { if (e.key === 'Escape' || e.key === 'Enter') { e.preventDefault(); done(); } }
+                document.addEventListener('keydown', onKey, true);
+                ok.onclick = done;
+                s.ov.addEventListener('mousedown', function (e) { if (e.target === s.ov) done(); });
+                ok.focus();
+            });
+        }
+        function uiConfirm(msg, o) {
+            o = o || {};
+            const type = o.danger ? 'danger' : 'warning';
+            return new Promise(function (resolve) {
+                const s = uiShell(type, o.title || (o.danger ? '⚠️ تأكيد مهم' : '❓ تأكيد'));
+                s.box.appendChild(uiEl('div', 'ui-msg', msg));
+                if (o.detail) s.box.appendChild(uiEl('div', 'ui-detail', o.detail));
+                const actions = uiEl('div', 'ui-actions');
+                const ok = uiEl('button', 'btn ' + (o.danger ? 'btn-red' : 'btn-blue'), o.okText || 'نعم');
+                const no = uiEl('button', 'btn ui-cancel', o.cancelText || 'لا');
+                actions.appendChild(ok); actions.appendChild(no);
+                s.box.appendChild(actions);
+                function done(v) { document.removeEventListener('keydown', onKey, true); s.ov.remove(); resolve(v); }
+                function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); done(false); } }
+                document.addEventListener('keydown', onKey, true);
+                ok.onclick = function () { done(true); };
+                no.onclick = function () { done(false); };
+                s.ov.addEventListener('mousedown', function (e) { if (e.target === s.ov) done(false); });
+                no.focus();
+            });
+        }
+        // fields: [{ name, label, type: text|number|textarea|select, value, placeholder, min, step, required, hint, options: [{v, l}] }]
+        function uiForm(o) {
+            return new Promise(function (resolve) {
+                const s = uiShell(o.type || 'info', o.title || '');
+                if (o.desc) s.box.appendChild(uiEl('div', 'ui-msg', o.desc));
+                const inputs = {};
+                (o.fields || []).forEach(function (f) {
+                    const wrap = uiEl('div', 'ui-field');
+                    wrap.appendChild(uiEl('label', '', f.label + (f.required ? ' *' : '')));
+                    let inp;
+                    if (f.type === 'select') {
+                        inp = document.createElement('select');
+                        (f.options || []).forEach(function (op) {
+                            const oe = document.createElement('option');
+                            oe.value = op.v; oe.textContent = op.l;
+                            if (String(op.v) === String(f.value)) oe.selected = true;
+                            inp.appendChild(oe);
+                        });
+                    } else if (f.type === 'textarea') {
+                        inp = document.createElement('textarea');
+                        if (f.value !== undefined && f.value !== null) inp.value = f.value;
+                    } else {
+                        inp = document.createElement('input');
+                        inp.type = f.type === 'number' ? 'number' : 'text';
+                        if (f.type === 'number') { inp.inputMode = 'decimal'; inp.step = f.step || 'any'; }
+                        if (f.value !== undefined && f.value !== null) inp.value = f.value;
+                    }
+                    if (f.placeholder) inp.placeholder = f.placeholder;
+                    inputs[f.name] = { el: inp, f: f };
+                    wrap.appendChild(inp);
+                    if (f.hint) wrap.appendChild(uiEl('div', 'ui-hint', f.hint));
+                    s.box.appendChild(wrap);
+                });
+                const err = uiEl('div', 'ui-err');
+                s.box.appendChild(err);
+                const actions = uiEl('div', 'ui-actions');
+                const ok = uiEl('button', 'btn btn-blue', o.okText || 'حفظ');
+                const no = uiEl('button', 'btn ui-cancel', 'إلغاء');
+                actions.appendChild(ok); actions.appendChild(no);
+                s.box.appendChild(actions);
+                function done(v) { document.removeEventListener('keydown', onKey, true); s.ov.remove(); resolve(v); }
+                function submit() {
+                    const out = {};
+                    for (const name in inputs) {
+                        const f = inputs[name].f;
+                        const v = String(inputs[name].el.value).trim();
+                        if (f.required && v === '') { err.textContent = '⚠️ ' + f.label + ' مطلوب'; inputs[name].el.focus(); return; }
+                        if (f.type === 'number' && v !== '') {
+                            const num = Number(v);
+                            if (!isFinite(num)) { err.textContent = '⚠️ ' + f.label + ' لازم يكون رقم'; inputs[name].el.focus(); return; }
+                            if (f.min !== undefined && num < f.min) { err.textContent = '⚠️ ' + f.label + ' لا يقل عن ' + f.min; inputs[name].el.focus(); return; }
+                        }
+                        out[name] = v;
+                    }
+                    done(out);
+                }
+                function onKey(e) {
+                    if (e.key === 'Escape') { e.preventDefault(); done(null); }
+                    else if (e.key === 'Enter' && e.target && e.target.tagName !== 'TEXTAREA') { e.preventDefault(); submit(); }
+                }
+                document.addEventListener('keydown', onKey, true);
+                ok.onclick = submit;
+                no.onclick = function () { done(null); };
+                s.ov.addEventListener('mousedown', function (e) { if (e.target === s.ov) done(null); });
+                const first = Object.keys(inputs)[0];
+                if (first) inputs[first].el.focus();
+            });
+        }
+
+        // ═══════════ إشعار منبثق (تحت يمين) ═══════════
+        const NOTIF_TOAST_MS = 2000;           // مدة بقاء الإشعار (بالملي ثانية)
+        const NOTIF_ADMIN_PREFIX = '📢 رسالة من الإدارة:';
+        let notifBaseline = false, lastLatestUnread = null, notifBusy = false;
+        const toastedNotifIds = new Set();
+        function showNotifToast(n) {
+            let wrap = document.getElementById('notif-toast-wrap');
+            if (!wrap) { wrap = uiEl('div'); wrap.id = 'notif-toast-wrap'; document.body.appendChild(wrap); }
+            const type = UI_COLORS[n.type] ? n.type : 'info';
+            const icons = { info: '🏦', success: '✅', warning: '⚠️', danger: '🚨' };
+            let title = icons[type] + ' إشعار جديد';
+            let text = String(n.message || '');
+            if (text.indexOf(NOTIF_ADMIN_PREFIX) === 0) {
+                title = icons[type] + ' إشعار من الإدارة';
+                text = text.substring(NOTIF_ADMIN_PREFIX.length).trim();
+            }
+            const t = uiEl('div', 'ntoast ntoast-' + type);
+            t.appendChild(uiEl('div', 'ntoast-title', title));
+            t.appendChild(uiEl('div', 'ntoast-text', text));
+            const bar = uiEl('div', 'ntoast-bar');
+            const fill = document.createElement('i');
+            fill.style.animationDuration = NOTIF_TOAST_MS + 'ms';
+            bar.appendChild(fill);
+            t.appendChild(bar);
+            wrap.appendChild(t);
+            let closed = false;
+            function closeToast() {
+                if (closed) return; closed = true;
+                t.classList.add('out');
+                setTimeout(function () { t.remove(); }, 280);
+            }
+            setTimeout(closeToast, NOTIF_TOAST_MS);
+            t.onclick = function () {
+                closeToast();
+                try {
+                    const am = document.getElementById('adminModal');
+                    if (am && am.style.display !== 'none' && typeof closeAdminModal === 'function') closeAdminModal();
+                    goPage('notifications');
+                    window.scrollTo(0, 0);
+                } catch (e) {}
+            };
+            // التحذير: هزّة خفيفة للجوال
+            if (type === 'warning' && navigator.vibrate) { try { navigator.vibrate(120); } catch (e) {} }
+        }
+        async function handleNotifPush(latestId) {
+            if (notifBusy) return;
+            if (notifBaseline && latestId === lastLatestUnread) return;
+            notifBusy = true;
+            try {
+                const res = await fetch('/api/notifications');
+                const list = await res.json();
+                if (!Array.isArray(list)) return;
+                lastLatestUnread = latestId;
+                if (!notifBaseline) {
+                    notifBaseline = true;
+                    list.forEach(function (n) { toastedNotifIds.add(n._id); });
+                    return;
+                }
+                const fresh = list.filter(function (n) { return !n.read && !toastedNotifIds.has(n._id); }).reverse();
+                fresh.forEach(function (n) { toastedNotifIds.add(n._id); });
+                fresh.slice(-3).forEach(showNotifToast);
+            } catch (e) {} finally { notifBusy = false; }
+        }
+
         async function init() {
             const res = await fetch('/api/auth/me');
             const data = await res.json();
@@ -2667,7 +2893,7 @@ app.use(async (req, res) => {
             let reason = '';
             if (newValue) {
                 reason = document.getElementById('support-lock-reason').value.trim();
-                if (!reason) { alert('⚠️ يجب إدخال سبب قفل خدمة العملاء'); return; }
+                if (!reason) { uiAlert('⚠️ يجب إدخال سبب قفل خدمة العملاء'); return; }
             }
             const res = await fetch('/api/admin/toggle-feature', {
                 method: 'POST',
@@ -2675,7 +2901,7 @@ app.use(async (req, res) => {
                 body: JSON.stringify({ feature: 'disableSupport', value: newValue, reason })
             });
             const data = await res.json();
-            alert(data.msg);
+            uiAlert(data.msg, data.success ? 'success' : 'danger');
             if(data.success) loadLockSettingsPanel();
         }
 
@@ -2702,7 +2928,7 @@ app.use(async (req, res) => {
                 body: JSON.stringify({ feature: featureName, value: newValue })
             });
             const data = await res.json();
-            alert(data.msg);
+            uiAlert(data.msg, data.success ? 'success' : 'danger');
             if(data.success) {
                 loadLockSettingsPanel();
             }
@@ -2746,64 +2972,89 @@ app.use(async (req, res) => {
         }
 
         async function setCardLimit(id, currentLimit) {
-            const val = prompt(\`حد البطاقات الحالي: \${currentLimit === -1 ? 'حسب الإعداد العام' : currentLimit}\\nأدخل العدد الجديد (-1 لاتباع الإعداد العام):\`);
-            if (val === null) return;
+            const f = await uiForm({
+                title: '💳 حد البطاقات للحساب',
+                desc: 'الحد الحالي: ' + (Number(currentLimit) === -1 ? 'حسب الإعداد العام' : currentLimit),
+                okText: 'حفظ الحد',
+                fields: [{ name: 'limit', label: 'العدد الجديد', type: 'number', min: -1, step: 1, required: true, value: currentLimit, hint: 'اكتب -1 لاتباع الإعداد العام' }]
+            });
+            if (!f) return;
+            const val = f.limit;
             const res = await fetch(\`/api/admin/accounts/\${id}/card-limit\`, {
                 method: 'POST', headers: {'Content-Type':'application/json'},
                 body: JSON.stringify({ limit: val })
             });
             const data = await res.json();
-            alert(data.success ? '✅ تم تحديث الحد' : '❌ فشل');
+            uiAlert(data.success ? '✅ تم تحديث الحد' : '❌ فشل');
             if(data.success) loadAdminAccounts();
         }
 
         async function sendAccountNotif(id) {
-            const message = prompt('نص الإشعار / الملاحظة للمستخدم:');
-            if (!message) return;
-            // الإداري (management) يقدر يرسل إشعار غير مهم فقط، بدون ما يوصل العضو رقم إشعار جديد
-            const type = currentRole === 'management' ? 'info' : (prompt('نوع الإشعار: info / success / warning / danger') || 'info');
+            const fields = [{ name: 'message', label: 'نص الإشعار / الملاحظة', type: 'textarea', required: true, placeholder: 'اكتب الرسالة للمستخدم...' }];
+            // الإداري (management) يقدر يرسل إشعار غير مهم فقط (info)، بدون ما يوصل العضو رقم إشعار جديد
+            if (currentRole !== 'management') {
+                fields.push({ name: 'type', label: 'نوع الإشعار', type: 'select', value: 'info', options: [
+                    { v: 'info', l: 'ℹ️ معلومة (أزرق)' },
+                    { v: 'success', l: '✅ نجاح (أخضر)' },
+                    { v: 'warning', l: '⚠️ تحذير (أصفر + هزّة)' },
+                    { v: 'danger', l: '🚨 خطر (أحمر)' }
+                ] });
+            }
+            const f = await uiForm({ title: '📢 إرسال إشعار لمستخدم', okText: 'إرسال', fields: fields });
+            if (!f) return;
+            const message = f.message;
+            const type = currentRole === 'management' ? 'info' : (f.type || 'info');
             const res = await fetch(\`/api/admin/accounts/\${id}/notify\`, {
                 method: 'POST', headers: {'Content-Type':'application/json'},
                 body: JSON.stringify({ message, type })
             });
             const data = await res.json();
-            alert(data.success ? '✅ تم إرسال الإشعار' : '❌ فشل: ' + (data.msg||''));
+            uiAlert(data.success ? '✅ تم إرسال الإشعار' : '❌ فشل: ' + (data.msg||''));
         }
 
         async function toggleSupportBan(id, currentBanned) {
             const isBanned = currentBanned === 'true' || currentBanned === true;
-            if (!confirm(isBanned ? 'رفع حظر المستخدم من الدعم؟' : 'حظر هذا المستخدم من خدمة العملاء؟')) return;
+            if (!(await uiConfirm(isBanned ? 'رفع حظر المستخدم من الدعم؟' : 'حظر هذا المستخدم من خدمة العملاء؟', { title: isBanned ? '✅ رفع الحظر' : '🚫 حظر من الدعم', danger: !isBanned, okText: isBanned ? 'نعم، ارفع الحظر' : 'نعم، احظره' }))) return;
             const res = await fetch(\`/api/admin/accounts/\${id}/support-ban\`, { method: 'PUT' });
             const data = await res.json();
-            if(data.success) { alert(data.banned ? 'تم الحظر' : 'تم رفع الحظر'); loadAdminAccounts(); }
+            if(data.success) { uiAlert(data.banned ? 'تم حظر المستخدم من الدعم' : 'تم رفع الحظر', data.banned ? 'warning' : 'success'); loadAdminAccounts(); }
         }
 
         async function toggleFreeze(id, btn) {
             const res = await fetch(\`/api/admin/accounts/\${id}/freeze\`, { method: 'PUT' });
             const data = await res.json();
-            if(data.success) { alert(data.frozen ? 'تم تجميد الحساب' : 'تم رفع التجميد'); loadAdminAccounts(); }
+            if(data.success) { uiAlert(data.frozen ? 'تم تجميد الحساب' : 'تم رفع التجميد', data.frozen ? 'warning' : 'success'); loadAdminAccounts(); }
         }
 
         async function manualBalance(id, type) {
-            const amount = prompt(\`أدخل المبلغ (\${type === 'add' ? 'إيداع' : 'خصم'}):\`);
-            if(!amount) return;
-            const note = prompt("ملاحظة (اختياري):") || '';
+            const f = await uiForm({
+                title: type === 'add' ? '➕ إيداع يدوي' : '➖ خصم يدوي',
+                type: type === 'add' ? 'success' : 'danger',
+                okText: type === 'add' ? 'تنفيذ الإيداع' : 'تنفيذ الخصم',
+                fields: [
+                    { name: 'amount', label: 'المبلغ', type: 'number', min: 1, required: true, placeholder: 'مثال: 5000' },
+                    { name: 'note', label: 'ملاحظة (اختياري)', type: 'text', placeholder: 'سبب العملية' }
+                ]
+            });
+            if (!f) return;
+            const amount = f.amount;
+            const note = f.note || '';
             const res = await fetch(\`/api/admin/accounts/\${id}/balance\`, {
                 method: 'POST', headers: {'Content-Type':'application/json'},
                 body: JSON.stringify({ amount, type, note })
             });
             const data = await res.json();
-            alert(data.success ? '✅ تمت العملية' : '❌ فشل: ' + (data.msg || ''));
+            uiAlert(data.success ? '✅ تمت العملية' : '❌ فشل: ' + (data.msg || ''));
             if(data.success) loadAdminAccounts();
         }
 
         async function deleteAccountEntirely(id, name) {
-            if (!confirm(\`⚠️ تحذير صارم:\\nهل أنت متأكد تماماً من حذف حساب اللاعب (\${name}) نهائياً؟\\nسيتم تصفير أرصده وقروضه وحذفه من الأحوال ليعيد التسجيل من جديد.\`)) return;
+            if (!(await uiConfirm('هل أنت متأكد تماماً من حذف حساب اللاعب (' + name + ') نهائياً؟', { title: '⚠️ تحذير صارم', danger: true, okText: 'نعم، احذفه نهائياً', detail: 'سيتم تصفير أرصدته وقروضه وحذفه من الأحوال ليعيد التسجيل من جديد.' }))) return;
             
             const res = await fetch(\`/api/superadmin/accounts/\${id}\`, { method: 'DELETE' });
             const data = await res.json();
             
-            alert(data.msg);
+            uiAlert(data.msg, data.success ? 'success' : 'danger');
             if (data.success) {
                 loadAdminAccounts();
             }
@@ -2842,7 +3093,7 @@ app.use(async (req, res) => {
         async function actionLoan(id, action) {
             const res = await fetch(\`/api/admin/loans/\${id}/\${action}\`, { method: 'PUT' });
             const data = await res.json();
-            if(data.success) { alert(action === 'approve' ? 'تمت الموافقة على القرض!' : 'تم رفض القرض'); loadAdminLoans(); }
+            if(data.success) { uiAlert(action === 'approve' ? 'تمت الموافقة على القرض!' : 'تم رفض القرض', action === 'approve' ? 'success' : 'warning'); loadAdminLoans(); }
         }
 
         async function loadBankSettingsPanel() {
@@ -2868,29 +3119,29 @@ app.use(async (req, res) => {
                 body: JSON.stringify({ interestRate: parseFloat(interestRate) })
             });
             const data = await res.json();
-            alert(data.success ? '✅ تم الحفظ' : '❌ فشل');
+            uiAlert(data.success ? '✅ تم الحفظ' : '❌ فشل');
         }
 
         async function addBankAdmin() {
             const accountUid = document.getElementById('new-admin-id').value.trim();
-            if(!accountUid) return alert('ابحث واختر الحساب من القائمة');
+            if(!accountUid) return uiAlert('ابحث واختر الحساب من القائمة', 'warning');
             const res = await fetch('/api/superadmin/admin/add', {
                 method: 'POST', headers: {'Content-Type':'application/json'},
                 body: JSON.stringify({ accountUid })
             });
             const data = await res.json();
-            alert(data.msg);
+            uiAlert(data.msg, data.success ? 'success' : 'danger');
             if(data.success) { document.getElementById('new-admin-id').value=''; document.getElementById('new-admin-search').value=''; document.getElementById('new-admin-chosen').textContent=''; loadBankSettingsPanel(); }
         }
 
         async function removeBankAdmin(accountUid) {
-            if(!confirm('إزالة هذا المسؤول؟')) return;
+            if (!(await uiConfirm('إزالة هذا المسؤول؟', { title: '🗑️ إزالة مسؤول بنك', danger: true, okText: 'نعم، أزله' }))) return;
             const res = await fetch('/api/superadmin/admin/remove', {
                 method: 'POST', headers: {'Content-Type':'application/json'},
                 body: JSON.stringify({ accountUid })
             });
             const data = await res.json();
-            alert(data.msg);
+            uiAlert(data.msg, data.success ? 'success' : 'danger');
             if(data.success) loadBankSettingsPanel();
         }
 
@@ -3044,10 +3295,10 @@ app.use(async (req, res) => {
         }
 
         async function renewCard(cardId) {
-            if (!confirm('هل تريد تجديد هذه البطاقة؟')) return;
+            if (!(await uiConfirm('هل تريد تجديد هذه البطاقة؟', { title: '🔄 تجديد البطاقة', okText: 'نعم، جدّد' }))) return;
             const res = await fetch(\`/api/account/card/\${cardId}/renew\`, { method: 'POST' });
             const data = await res.json();
-            alert((data.success ? '✅ ' : '❌ ') + data.msg);
+            uiAlert((data.success ? '✅ ' : '❌ ') + data.msg);
             if (data.success) loadMyCards();
         }
 
@@ -3148,7 +3399,7 @@ app.use(async (req, res) => {
                         body: JSON.stringify({ expiryDate: expiryInput.value })
                     });
                 }
-                alert(action==='approve'?'✅ تمت الموافقة!':'❌ تم الرفض');
+                uiAlert(action==='approve'?'✅ تمت الموافقة!':'❌ تم الرفض');
                 loadAdminCards();
             }
         }
@@ -3229,10 +3480,10 @@ app.use(async (req, res) => {
         }
 
         async function fireStaff(id, name) {
-            if (!confirm(\`فصل \${name}؟\`)) return;
+            if (!(await uiConfirm('فصل ' + name + '؟', { title: '🚪 فصل موظف', danger: true, okText: 'نعم، افصله' }))) return;
             const res = await fetch(\`/api/staff/\${id}/fire\`, { method: 'PUT' });
             const data = await res.json();
-            if (data.success) { alert('تم الفصل'); loadStaff(); }
+            if (data.success) { uiAlert('تم فصل الموظف', 'success'); loadStaff(); }
         }
 
         // ─── سجل التذاكر المغلقة ────────────────────────────────────────────
@@ -3269,7 +3520,7 @@ app.use(async (req, res) => {
         async function viewClosedTicket(ticketId) {
             const res = await fetch(\`/api/admin/support/tickets/\${ticketId}\`);
             const ticket = await res.json();
-            if (!ticket) return alert('لم يتم العثور على التذكرة');
+            if (!ticket) return uiAlert('لم يتم العثور على التذكرة', 'danger');
             const msgs = ticket.messages.map(m => {
                 const isAdmin = m.isAdmin;
                 const isBot = m.sender === 'bot';
@@ -3371,7 +3622,7 @@ app.use(async (req, res) => {
         }
 
         async function runMilitarySalaryNow() {
-            if (!confirm('متأكد تبي تصرف الرواتب الآن يدوياً لكل العساكر المستحقين؟')) return;
+            if (!(await uiConfirm('متأكد تبي تصرف الرواتب الآن يدوياً لكل العساكر المستحقين؟', { title: '💰 صرف الرواتب الآن', okText: 'نعم، اصرف' }))) return;
             showMsg('military-salary-msg', 'جاري الصرف...', 'info');
             const res = await fetch('/api/superadmin/military-salary/run-now', { method: 'POST' });
             const data = await res.json();
@@ -3423,18 +3674,23 @@ app.use(async (req, res) => {
                 body: JSON.stringify({ limit })
             });
             const data = await res.json();
-            alert(data.success ? '✅ تم حفظ الحد العام' : '❌ فشل');
+            uiAlert(data.success ? '✅ تم حفظ الحد العام' : '❌ فشل');
         }
 
         async function allowAllCards() {
-            const limit = prompt('أدخل عدد البطاقات المسموح لكل مستخدم:');
-            if (!limit) return;
+            const f = await uiForm({
+                title: '💳 السماح بعدد بطاقات للجميع',
+                okText: 'تطبيق على الجميع',
+                fields: [{ name: 'limit', label: 'عدد البطاقات المسموح لكل مستخدم', type: 'number', min: 1, step: 1, required: true }]
+            });
+            if (!f) return;
+            const limit = f.limit;
             const res = await fetch('/api/admin/global-card-limit', {
                 method: 'POST', headers:{'Content-Type':'application/json'},
                 body: JSON.stringify({ limit })
             });
             const data = await res.json();
-            alert(data.success ? \`✅ تم السماح بـ \${limit} بطاقة لكل مستخدم\` : '❌ فشل');
+            uiAlert(data.success ? \`✅ تم السماح بـ \${limit} بطاقة لكل مستخدم\` : '❌ فشل');
             if(data.success) loadAdminCards();
         }
 
@@ -3581,7 +3837,7 @@ app.use(async (req, res) => {
             });
             const data = await res.json();
             if(data.success) { document.getElementById('chat-input').value=''; await refreshTicketChat(); }
-            else alert('❌ ' + (data.msg||'فشل الإرسال'));
+            else uiAlert('❌ ' + (data.msg||'فشل الإرسال'));
         }
 
         // ─── أدمن: دوال الدعم ──────────────────────────────────────────────────
@@ -3618,7 +3874,7 @@ app.use(async (req, res) => {
 
         async function adminReplyTicket(id) {
             const content = document.getElementById(\`admin-reply-\${id}\`)?.value.trim();
-            if(!content) return alert('أدخل نص الرد');
+            if(!content) return uiAlert('أدخل نص الرد', 'warning');
             const res = await fetch(\`/api/admin/support/tickets/\${id}/reply\`, {
                 method: 'POST', headers:{'Content-Type':'application/json'},
                 body: JSON.stringify({ content })
@@ -3628,7 +3884,7 @@ app.use(async (req, res) => {
         }
 
         async function adminCloseTicket(id) {
-            if(!confirm('إغلاق هذه التذكرة؟')) return;
+            if (!(await uiConfirm('إغلاق هذه التذكرة؟', { title: '🎧 إغلاق تذكرة', okText: 'نعم، أغلقها' }))) return;
             const res = await fetch(\`/api/admin/support/tickets/\${id}/close\`, { method: 'PUT' });
             const data = await res.json();
             if(data.success) loadAdminSupport();
@@ -3723,11 +3979,11 @@ app.use(async (req, res) => {
         }
 
         async function ccDeleteCard(id) {
-            if (!confirm('هل أنت متأكد من حذف هذه البطاقة نهائياً؟ لا يمكن التراجع.')) return;
+            if (!(await uiConfirm('هل أنت متأكد من حذف هذه البطاقة نهائياً؟', { title: '🗑️ حذف بطاقة', danger: true, okText: 'نعم، احذفها', detail: 'لا يمكن التراجع عن هذا الإجراء.' }))) return;
             const res = await fetch(\`/api/superadmin/cards/\${id}\`, { method: 'DELETE' });
             const data = await res.json();
             if (data.success) loadCardControlPanel();
-            else alert(data.msg || 'فشل الحذف');
+            else uiAlert(data.msg || 'فشل الحذف', 'danger');
         }
 
         async function loadFeesPanel() {
@@ -3769,6 +4025,7 @@ app.use(async (req, res) => {
                         lastUnreadCount = data.unreadCount;
                         loadNotifCount();
                     }
+                    if (data.latestUnreadId !== undefined) handleNotifPush(data.latestUnreadId);
 
                     // تحديث رصيد/حالة الحساب — أي تغيير (إيداع، تحويل، تجميد...) يحدّث اللوحة فوراً
                     if (currentAccount && (data.balance !== undefined || data.isFrozen !== undefined)) {
