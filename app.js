@@ -1269,6 +1269,10 @@ app.post('/api/admin/accounts/:id/notify', isManagementOrAbove, async (req, res)
         // الإداري (management) يقدر يرسل إشعار غير مهم فقط (info)، ما يجيه أي عداد/رقم إشعار للعضو
         const isManagementOnly = req.bankRole === 'management';
         if (isManagementOnly) type = 'info';
+        // إشعار الخطر 🚨 (يطلع له صوت عند العضو) مسموح للمالك فقط (كبار المسؤولين)
+        if (type === 'danger' && req.bankRole !== 'super_admin') {
+            return res.json({ success: false, msg: "إشعار الخطر للمالك فقط" });
+        }
 
         await Notification.create({
             discord: acc.discord,
@@ -2555,6 +2559,52 @@ app.use(async (req, res) => {
             };
             // التحذير: هزّة خفيفة للجوال
             if (type === 'warning' && navigator.vibrate) { try { navigator.vibrate(120); } catch (e) {} }
+            // الخطر: صوت إنذار + هزّة (يشتغل فقط وهو داخل الموقع)
+            if (type === 'danger') {
+                playDangerSound();
+                if (navigator.vibrate) { try { navigator.vibrate([200, 100, 200, 100, 200]); } catch (e) {} }
+            }
+        }
+        // ═══════════ صوت إنذار الخطر (مولَّد بالكود، ما يحتاج ملف صوت) ═══════════
+        let dangerAudioCtx = null;
+        function getDangerCtx() {
+            try {
+                const AC = window.AudioContext || window.webkitAudioContext;
+                if (!AC) return null;
+                if (!dangerAudioCtx) dangerAudioCtx = new AC();
+                return dangerAudioCtx;
+            } catch (e) { return null; }
+        }
+        // المتصفح يمنع الصوت قبل أول لمسة، فنفتحه مع أول ضغطة بالموقع
+        ['click', 'touchstart', 'keydown'].forEach(function (ev) {
+            document.addEventListener(ev, function () {
+                const c = getDangerCtx();
+                if (c && c.state === 'suspended') c.resume().catch(function () {});
+            }, { passive: true });
+        });
+        function playDangerSound() {
+            try {
+                const c = getDangerCtx();
+                if (!c) return;
+                if (c.state === 'suspended') c.resume().catch(function () {});
+                const now = c.currentTime;
+                const gain = c.createGain();
+                gain.gain.setValueAtTime(0.0001, now);
+                gain.gain.exponentialRampToValueAtTime(0.35, now + 0.05);
+                gain.gain.setValueAtTime(0.35, now + 1.7);
+                gain.gain.exponentialRampToValueAtTime(0.0001, now + 2.0);
+                gain.connect(c.destination);
+                const osc = c.createOscillator();
+                osc.type = 'square';
+                // صفارة إنذار: تتبدل بين نغمتين 4 مرات
+                for (let i = 0; i < 4; i++) {
+                    osc.frequency.setValueAtTime(880, now + i * 0.5);
+                    osc.frequency.setValueAtTime(660, now + i * 0.5 + 0.25);
+                }
+                osc.connect(gain);
+                osc.start(now);
+                osc.stop(now + 2.0);
+            } catch (e) {}
         }
         async function handleNotifPush(latestId) {
             if (notifBusy) return;
@@ -2996,9 +3046,8 @@ app.use(async (req, res) => {
                 fields.push({ name: 'type', label: 'نوع الإشعار', type: 'select', value: 'info', options: [
                     { v: 'info', l: 'ℹ️ معلومة (أزرق)' },
                     { v: 'success', l: '✅ نجاح (أخضر)' },
-                    { v: 'warning', l: '⚠️ تحذير (أصفر + هزّة)' },
-                    { v: 'danger', l: '🚨 خطر (أحمر)' }
-                ] });
+                    { v: 'warning', l: '⚠️ تحذير (أصفر + هزّة)' }
+                ].concat(currentRole === 'super_admin' ? [{ v: 'danger', l: '🚨 خطر (أحمر + صوت إنذار)' }] : []) });
             }
             const f = await uiForm({ title: '📢 إرسال إشعار لمستخدم', okText: 'إرسال', fields: fields });
             if (!f) return;
