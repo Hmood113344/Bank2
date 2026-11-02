@@ -140,10 +140,18 @@ const CardRequestSchema = new mongoose.Schema({
     discordTag: String,
     accountNumber: String,
     // بيانات مطلوبة
-    monthlyIncome: Number,
-    jobTitle: String,
-    employerName: String,
+    monthlyIncome: Number,   // قديم (ما عاد يُطلب)
+    jobTitle: String,        // قديم
+    employerName: String,    // قديم
     requestReason: String,
+    // بيانات البطاقة العسكرية (الرتبة/القطاع/اليونت تجي من فلاش وليست من إدخال المستخدم)
+    militaryCardNumber: String,  // الرقم اللي كتبه المستخدم
+    militaryRank: String,
+    militarySector: String,
+    militaryUnit: String,
+    flashRank: String, flashSector: String, flashUnit: String,  // اللي في فلاش فعلياً (للمقارنة)
+    cardType: { type: String, default: 'عادية' },
+    pledgeAccepted: { type: Boolean, default: false },
     // حالة الطلب
     status: { type: String, default: 'pending' }, // pending / approved / rejected / disabled / expired
     adminNote: String,
@@ -1078,17 +1086,55 @@ app.post('/api/account/card/request', checkMaintenance, async (req, res) => {
         const existing = await CardRequest.countDocuments({ discord: req.user.id, status: { $in: ['pending', 'approved'] } });
         if (existing >= limit) return res.json({ success: false, msg: `لقد وصلت للحد الأقصى من البطاقات المسموح بها (${limit})` });
 
-        const { monthlyIncome, jobTitle, employerName, requestReason } = req.body;
-        if (!monthlyIncome || !jobTitle || !employerName || !requestReason) 
-            return res.json({ success: false, msg: "يجب تعبئة جميع الحقول المطلوبة" });
+        const { militaryCardNumber, militaryRank, militarySector, militaryUnit, cardType, requestReason, pledge } = req.body;
+        const mRank = String(militaryRank || '').trim().slice(0, 60);
+        const mSector = String(militarySector || '').trim().slice(0, 60);
+        const mUnit = String(militaryUnit || '').trim().slice(0, 60);
+        const num = String(militaryCardNumber || '').trim().slice(0, 20);
+        const reason = String(requestReason || '').trim().slice(0, 500);
+        const type = ['عادية', 'ذهبية', 'بلاتينية'].includes(cardType) ? cardType : 'عادية';
+        if (!mSector || !mRank || !mUnit) return res.json({ success: false, msg: "يجب تعبئة القطاع والرتبة واليونت" });
+        if (!reason) return res.json({ success: false, msg: "اكتب سبب طلب البطاقة" });
+        if (!pledge) return res.json({ success: false, msg: "يجب الموافقة على التعهد" });
+
+        // التحقق من البطاقة العسكرية من موقع فلاش (الرتبة/القطاع/اليونت من فلاش مو من المستخدم)
+        let info;
+        try {
+            info = await flashGet('/api/bank/member-card?uid=' + encodeURIComponent(req.user.id));
+            if (!info.success) throw new Error(info.msg || 'فشل');
+        } catch (e) {
+            return res.json({ success: false, msg: "تعذر التحقق من بطاقتك العسكرية من فلاش، جرّب بعد شوي" });
+        }
+
+        let autoReject = null;
+        if (!info.found) autoReject = 'لا توجد بطاقة عسكرية لك في فلاش';
+        else if (!num) autoReject = 'لم تُدخل رقم بطاقتك العسكرية';
+        else if (!/^[0-9]{8}$/.test(num) || num !== String(info.cardNumber)) autoReject = 'رقم البطاقة العسكرية غير صحيح أو ليست بطاقتك';
+        else if (info.revoked) autoReject = 'بطاقتك العسكرية ملغاة';
+        else if (info.blocked) autoReject = 'حسابك العسكري موقوف';
 
         await CardRequest.create({
             discord: req.user.id,
             discordTag: req.user.username,
             accountNumber: acc.accountNumber,
-            monthlyIncome: parseFloat(monthlyIncome),
-            jobTitle, employerName, requestReason
+            requestReason: reason,
+            militaryCardNumber: num,
+            militaryRank: mRank,
+            militarySector: mSector,
+            militaryUnit: mUnit,
+            flashRank: info.rank || '',
+            flashSector: info.sector || '',
+            flashUnit: info.unit || '',
+            cardType: type,
+            pledgeAccepted: true,
+            ...(autoReject ? { status: 'rejected', reviewedAt: new Date(), adminNote: 'رفض تلقائي: ' + autoReject } : {})
         });
+
+        if (autoReject) {
+            await Notification.create({ discord: req.user.id, message: `❌ تم رفض طلب البطاقة تلقائياً: ${autoReject}.`, type: 'danger' });
+            bumpActivity();
+            return res.json({ success: false, msg: "تم رفض طلبك تلقائياً: " + autoReject });
+        }
 
         await Notification.create({
             discord: req.user.id,
@@ -1099,6 +1145,15 @@ app.post('/api/account/card/request', checkMaintenance, async (req, res) => {
         bumpActivity();
         res.json({ success: true, msg: "✅ تم إرسال طلب البطاقة للمراجعة من قِبل الإدارة" });
     } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+
+// قائمة الرتب من فلاش لعرضها في فورم الطلب
+app.get('/api/account/card/military-options', checkMaintenance, async (req, res) => {
+    if (!req.isAuthenticated()) return res.json({ success: false });
+    try {
+        const d = await flashGet('/api/bank/ranks');
+        res.json({ success: !!d.success, ranks: d.ranks || [] });
+    } catch (e) { res.json({ success: false, ranks: [] }); }
 });
 
 // عرض طلبات بطاقة المستخدم
@@ -1725,6 +1780,16 @@ app.use(async (req, res) => {
         
         input, select, textarea { width: 100%; background: rgba(255,255,255,0.06); border: 1px solid rgba(59,130,246,0.3); border-radius: 8px; color: #e2e8f0; padding: 0.65rem 1rem; font-size: 0.9rem; font-family: inherit; outline: none; margin-bottom: 0.9rem; }
         input:focus, select:focus { border-color: #3b82f6; }
+        /* قوائم الاختيار المخصصة (بدل قائمة الآيفون الأصلية) */
+        .cs-btn { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px; text-align: right; background: rgba(255,255,255,0.06); border: 1px solid rgba(59,130,246,0.3); border-radius: 8px; color: #e2e8f0; padding: 0.65rem 1rem; font-size: 0.9rem; font-family: inherit; outline: none; margin-bottom: 0.9rem; cursor: pointer; }
+        .cs-btn:focus, .cs-btn:hover { border-color: #3b82f6; }
+        .cs-btn .cs-arrow { color: #60a5fa; font-size: 0.8rem; }
+        .cs-ov { position: fixed; inset: 0; z-index: 100010; background: rgba(0,0,0,0.65); backdrop-filter: blur(4px); display: flex; align-items: flex-end; justify-content: center; }
+        .cs-box { width: 100%; max-width: 480px; max-height: 72vh; overflow-y: auto; background: #07162b; border: 1px solid rgba(59,130,246,0.35); border-radius: 18px 18px 0 0; padding: 14px 14px 22px; direction: rtl; -webkit-overflow-scrolling: touch; }
+        .cs-title { color: #60a5fa; font-weight: 800; font-size: 0.95rem; text-align: center; padding: 4px 0 12px; }
+        .cs-opt { display: block; width: 100%; text-align: right; background: rgba(255,255,255,0.05); border: 1px solid transparent; border-radius: 10px; color: #e2e8f0; padding: 13px 14px; margin-bottom: 7px; font-family: inherit; font-size: 0.95rem; cursor: pointer; }
+        .cs-opt:hover { background: rgba(59,130,246,0.18); }
+        .cs-opt.on { border-color: #3b82f6; background: rgba(59,130,246,0.25); font-weight: 800; }
         
         .btn { border: none; color: #fff; padding: 0.6rem 1.3rem; border-radius: 8px; cursor: pointer; font-family: inherit; font-weight: 700; font-size: 0.88rem; transition: all 0.2s; }
         .btn:hover { opacity: 0.85; transform: translateY(-1px); }
@@ -2105,14 +2170,33 @@ app.use(async (req, res) => {
                 <h2>📤 تقديم طلب بطاقة جديدة</h2>
                 <p style="color:#94a3b8; font-size:0.85rem; margin-bottom:1rem;">يُرسل الطلب لمراجعة الإدارة ولا يُفعَّل تلقائياً</p>
                 <div id="card-req-msg"></div>
-                <label>الراتب الشهري ($):</label>
-                <input id="card-income" type="number" placeholder="مثال: 15000" min="1" />
-                <label>المسمى الوظيفي:</label>
-                <input id="card-job" placeholder="مثال: محاسب" />
-                <label>اسم جهة العمل:</label>
-                <input id="card-employer" placeholder="مثال: شركة فلاش للتطوير" />
+                <label>🪪 بطاقتك العسكرية (رقم بطاقتك من فلاش):</label>
+                <input id="card-mil-number" inputmode="numeric" maxlength="8" autocomplete="off" placeholder="ضع رقم بطاقتك العسكرية (8 أرقام)" />
+                <label>🛡️ قطاعك العسكري:</label>
+                <select id="card-mil-sector">
+                    <option value="">— اختر القطاع —</option>
+                    <option value="الدوريات">الدوريات</option>
+                    <option value="أمن الطرق">أمن الطرق</option>
+                    <option value="مكافحة المخدرات">مكافحة المخدرات</option>
+                    <option value="الأمن السيبراني">الأمن السيبراني</option>
+                    <option value="الشرطة العسكرية">الشرطة العسكرية</option>
+                </select>
+                <label>🎖️ رتبتك العسكرية:</label>
+                <select id="card-mil-rank"><option value="">— اختر الرتبة —</option></select>
+                <label>🧩 يونتك العسكري:</label>
+                <input id="card-mil-unit" autocomplete="off" placeholder="اكتب اسم اليونت" />
+                <label>💳 نوع البطاقة المطلوبة:</label>
+                <select id="card-type">
+                    <option value="عادية">عادية</option>
+                    <option value="ذهبية">ذهبية</option>
+                    <option value="بلاتينية">بلاتينية</option>
+                </select>
                 <label>سبب طلب البطاقة:</label>
-                <input id="card-reason" placeholder="اشرح سبب حاجتك للبطاقة..." />
+                <textarea id="card-reason" rows="3" maxlength="500" placeholder="اشرح سبب حاجتك للبطاقة..."></textarea>
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:1rem;">
+                    <input type="checkbox" id="card-pledge" style="width:auto; margin:0;" />
+                    <span>أتعهد باستخدام البطاقة بالشكل الصحيح وعدم مشاركتها مع أحد</span>
+                </label>
                 <button class="btn btn-blue btn-full" onclick="submitCardRequest()">📤 إرسال الطلب للمراجعة</button>
             </div>
         </div>
@@ -2423,6 +2507,46 @@ app.use(async (req, res) => {
             document.body.appendChild(ov);
             return { ov: ov, box: box };
         }
+        // ── قوائم اختيار مخصصة: تخفي select الأصلي (قائمة الآيفون) وتفتح قائمة داخل الموقع ──
+        function csRefresh(el) {
+            const sel = typeof el === 'string' ? document.getElementById(el) : el;
+            if (!sel || !sel._cs) return;
+            const o = sel.options[sel.selectedIndex];
+            sel._cs.querySelector('.cs-lbl').textContent = o ? o.textContent : '';
+        }
+        function csOpen(sel) {
+            const ov = document.createElement('div'); ov.className = 'cs-ov';
+            const box = document.createElement('div'); box.className = 'cs-box';
+            const prev = sel.previousElementSibling;
+            const t = document.createElement('div'); t.className = 'cs-title';
+            t.textContent = (prev && prev.tagName === 'LABEL') ? prev.textContent.replace(/[:：]\\s*$/, '') : 'اختر';
+            box.appendChild(t);
+            function close() { ov.remove(); }
+            Array.from(sel.options).forEach(function (o) {
+                const b = document.createElement('button'); b.type = 'button';
+                b.className = 'cs-opt' + (o.value === sel.value ? ' on' : '');
+                b.textContent = o.textContent;
+                b.onclick = function () { sel.value = o.value; sel.dispatchEvent(new Event('change', { bubbles: true })); csRefresh(sel); close(); };
+                box.appendChild(b);
+            });
+            ov.appendChild(box);
+            ov.addEventListener('click', function (e) { if (e.target === ov) close(); });
+            document.body.appendChild(ov);
+        }
+        function csEnhance(sel) {
+            if (!sel || sel._cs) return;
+            const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'cs-btn';
+            const st = sel.getAttribute('style'); if (st) btn.style.cssText = st;
+            btn.innerHTML = '<span class="cs-lbl"></span><span class="cs-arrow">▾</span>';
+            btn.addEventListener('click', function () { csOpen(sel); });
+            sel.parentNode.insertBefore(btn, sel.nextSibling);
+            sel.style.display = 'none';
+            sel._cs = btn;
+            csRefresh(sel);
+        }
+        function csEnhanceAll() { document.querySelectorAll('select[id]').forEach(csEnhance); }
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', csEnhanceAll); else csEnhanceAll();
+
         function uiAlert(msg, type) {
             msg = String(msg === undefined || msg === null || msg === '' ? 'تمت العملية' : msg);
             if (!type) type = msg.indexOf('✅') === 0 ? 'success' : msg.indexOf('❌') === 0 ? 'danger' : msg.indexOf('⚠') === 0 ? 'warning' : 'info';
@@ -2496,6 +2620,7 @@ app.use(async (req, res) => {
                     wrap.appendChild(inp);
                     if (f.hint) wrap.appendChild(uiEl('div', 'ui-hint', f.hint));
                     s.box.appendChild(wrap);
+                    if (f.type === 'select') csEnhance(inp);
                 });
                 const err = uiEl('div', 'ui-err');
                 s.box.appendChild(err);
@@ -3313,6 +3438,7 @@ app.use(async (req, res) => {
         }
 
         async function loadMyCards() {
+            loadMilitaryOptions();
             const res = await fetch('/api/account/cards');
             const cards = await res.json();
             const container = document.getElementById('cards-list-container');
@@ -3371,7 +3497,7 @@ app.use(async (req, res) => {
                         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                             <div>
                                 <b style="color:\${colorMap[status]};">\${statusMap[status] || status}</b>
-                                <p style="color:#94a3b8; font-size:0.85rem; margin-top:4px;">المسمى: \${c.jobTitle} | جهة العمل: \${c.employerName}</p>
+                                <p style="color:#94a3b8; font-size:0.85rem; margin-top:4px;">\${c.militaryRank ? ('الرتبة: ' + c.militaryRank + ' | القطاع: ' + (c.militarySector || '—') + ' | اليونت: ' + (c.militaryUnit || '—') + ' | النوع: ' + (c.cardType || 'عادية')) : ('المسمى: ' + (c.jobTitle || '—') + ' | جهة العمل: ' + (c.employerName || '—'))}</p>
                                 \${c.adminNote ? \`<p style="color:#60a5fa; font-size:0.83rem; margin-top:4px;">ملاحظة الإدارة: \${c.adminNote}</p>\` : ''}
                                 \${c.cardExpiry && !isExpired && c.status === 'approved' ? \`<p style="color:#94a3b8; font-size:0.78rem; margin-top:3px;">⏳ تنتهي في: \${new Date(c.cardExpiry).toLocaleDateString('ar-SA')}</p>\` : ''}
                             </div>
@@ -3449,20 +3575,36 @@ app.use(async (req, res) => {
             if (data.success) loadMyCards();
         }
 
+        async function loadMilitaryOptions() {
+            const sel = document.getElementById('card-mil-rank');
+            if (!sel || sel.options.length > 1) return;
+            let ranks = [];
+            try { const r = await fetch('/api/account/card/military-options'); const d = await r.json(); ranks = d.ranks || []; } catch (e) {}
+            if (!ranks.length) ranks = ["جندي","جندي اول","عريف","وكيل رقيب","رقيب","رقيب اول","رئيس رقباء","ملازم","ملازم اول","نقيب","رائد","مقدم","عقيد","عميد","لواء","فريق","فريق اول"];
+            ranks.forEach(function(r) { const o = document.createElement('option'); o.value = r; o.textContent = r; sel.appendChild(o); });
+            csRefresh(sel);
+        }
+
         async function submitCardRequest() {
-            const income = document.getElementById('card-income').value;
-            const job = document.getElementById('card-job').value.trim();
-            const employer = document.getElementById('card-employer').value.trim();
+            const num = document.getElementById('card-mil-number').value.trim();
+            const sector = document.getElementById('card-mil-sector').value;
+            const rank = document.getElementById('card-mil-rank').value;
+            const unit = document.getElementById('card-mil-unit').value.trim();
+            const type = document.getElementById('card-type').value;
             const reason = document.getElementById('card-reason').value.trim();
-            if(!income||!job||!employer||!reason) return showMsg('card-req-msg','يجب تعبئة جميع الحقول','danger');
-            showMsg('card-req-msg','جاري الإرسال...','info');
+            const pledge = document.getElementById('card-pledge').checked;
+            if (!sector || !rank || !unit) return showMsg('card-req-msg', 'عبّي القطاع والرتبة واليونت', 'danger');
+            if (!reason) return showMsg('card-req-msg', 'اكتب سبب طلب البطاقة', 'danger');
+            if (!pledge) return showMsg('card-req-msg', 'يجب الموافقة على التعهد', 'danger');
+            showMsg('card-req-msg', 'جاري التحقق من بطاقتك العسكرية...', 'info');
             const res = await fetch('/api/account/card/request', {
-                method: 'POST', headers:{'Content-Type':'application/json'},
-                body: JSON.stringify({ monthlyIncome: income, jobTitle: job, employerName: employer, requestReason: reason })
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ militaryCardNumber: num, militarySector: sector, militaryRank: rank, militaryUnit: unit, cardType: type, requestReason: reason, pledge: pledge })
             });
             const data = await res.json();
-            showMsg('card-req-msg', (data.success?'✅ ':'❌ ')+data.msg, data.success?'success':'danger');
-            if(data.success) { loadMyCards(); document.getElementById('card-income').value=''; document.getElementById('card-job').value=''; document.getElementById('card-employer').value=''; document.getElementById('card-reason').value=''; }
+            showMsg('card-req-msg', (data.success ? '✅ ' : '❌ ') + data.msg, data.success ? 'success' : 'danger');
+            loadMyCards();
+            if (data.success) { ['card-mil-number','card-mil-unit','card-reason'].forEach(function(id){ document.getElementById(id).value = ''; }); document.getElementById('card-mil-sector').value = ''; document.getElementById('card-mil-rank').value = ''; csRefresh('card-mil-sector'); csRefresh('card-mil-rank'); document.getElementById('card-type').value = 'عادية'; csRefresh('card-type'); document.getElementById('card-pledge').checked = false; }
         }
 
         // ─── دوال أدمن البطاقات ────────────────────────────────────────────────
@@ -3496,8 +3638,9 @@ app.use(async (req, res) => {
                     <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:8px;">
                         <div>
                             <b>\${c.discordTag}</b> <span style="color:#64748b; font-size:0.8rem;">\${c.discord}</span>
-                            <p style="margin-top:5px; color:#94a3b8; font-size:0.85rem;">المسمى: \${c.jobTitle} | الجهة: \${c.employerName}</p>
-                            <p style="color:#4ade80; font-size:0.85rem;">الراتب: \${(c.monthlyIncome||0).toLocaleString()} $ / شهري</p>
+                            <p style="margin-top:5px; color:#94a3b8; font-size:0.85rem;">🎖️ الرتبة: \${c.militaryRank || '—'} | 🛡️ القطاع: \${c.militarySector || '—'} | 🧩 اليونت: \${c.militaryUnit || '—'}</p>
+                            \${(c.flashRank && (c.flashRank !== c.militaryRank || c.flashSector !== c.militarySector)) ? ('<p style="color:#fbbf24; font-size:0.8rem;">⚠️ المسجّل في فلاش: ' + c.flashRank + ' — ' + (c.flashSector || '—') + ' — ' + (c.flashUnit || '—') + '</p>') : ''}
+                            <p style="color:#4ade80; font-size:0.85rem;">🪪 البطاقة العسكرية: \${c.militaryCardNumber || '—'} | 💳 النوع: \${c.cardType || 'عادية'}</p>
                             <p style="color:#94a3b8; font-size:0.83rem;">السبب: \${c.requestReason}</p>
                             <p style="color:#64748b; font-size:0.78rem;">\${new Date(c.requestedAt).toLocaleString('ar-SA')}</p>
                         </div>
