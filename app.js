@@ -1678,6 +1678,7 @@ app.use(async (req, res) => {
         })();
     </script>
     <title>بنك فلاش — Flash Bank</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20100%20100%22%3E%3Crect%20width%3D%22100%22%20height%3D%22100%22%20rx%3D%2222%22%20fill%3D%22%230a1628%22/%3E%3Cpath%20fill%3D%22%2360a5fa%22%20transform%3D%22translate%2810%2010%29%20scale%280.8%29%22%20d%3D%22M50%206%20L92%2030%20H8%20Z%20M16%2038%20h14%20v38%20h-14%20Z%20M43%2038%20h14%20v38%20h-14%20Z%20M70%2038%20h14%20v38%20h-14%20Z%20M8%2082%20H92%20V94%20H8%20Z%22/%3E%3C/svg%3E">
     <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800;900&display=swap" rel="stylesheet">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1685,6 +1686,7 @@ app.use(async (req, res) => {
         
         nav { background: rgba(5,15,30,0.95); backdrop-filter: blur(15px); border-bottom: 1px solid rgba(59,130,246,0.3); padding: 0 1.5rem; display: flex; align-items: center; justify-content: space-between; height: 65px; position: sticky; top: 0; z-index: 100; }
         .logo { font-size: 1.5rem; font-weight: 900; background: linear-gradient(90deg, #3b82f6, #60a5fa, #93c5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; letter-spacing: 3px; }
+        .logo svg { width: 26px; height: 26px; vertical-align: -6px; margin-inline-end: 7px; }
         .logo-sub { font-size: 0.7rem; color: #64748b; display: block; letter-spacing: 1px; }
         .nav-links { display: flex; gap: 0.3rem; list-style: none; flex-wrap: wrap; }
         .nav-links button { background: transparent; border: 1px solid transparent; color: #94a3b8; padding: 0.35rem 0.75rem; border-radius: 8px; cursor: pointer; font-family: inherit; font-size: 0.82rem; transition: all 0.2s; }
@@ -1809,11 +1811,72 @@ app.use(async (req, res) => {
         }
         @media (max-width: 768px) {
             .nav-links { display: none !important; }
-            .hamburger-btn { display: inline-block; }
+            .hamburger-btn { display: inline-flex; }
+        }
+
+        /* ── ترتيب الهيدر ───────────────────────── */
+        nav { gap: 10px; }
+        nav > div:first-child { min-width: 0; line-height: 1.2; }
+        .logo { display: block; white-space: nowrap; }
+        .logo-sub { white-space: nowrap; }
+        #auth-section { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+        .nav-user { display: inline-flex; align-items: center; gap: 5px; max-width: 130px; height: 36px; background: rgba(59,130,246,0.12); border: 1px solid rgba(59,130,246,0.3); color: #93c5fd; padding: 0 0.8rem; border-radius: 999px; font-weight: 700; font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .nav-back { display: inline-flex; align-items: center; justify-content: center; gap: 4px; height: 36px; white-space: nowrap; background: #e5b73b; color: #1a1a1a; border: none; border-radius: 10px; padding: 0 0.85rem; font-family: inherit; font-weight: 800; font-size: 0.85rem; cursor: pointer; }
+        .nav-back:active { transform: scale(0.97); }
+        .hamburger-btn { height: 36px; align-items: center; justify-content: center; margin-left: 0; padding: 0 0.75rem; line-height: 1; }
+
+        /* ── شاشة التحميل (نفس فلاش بشعار البنك) ── */
+        html.bk-splash-on, html.bk-splash-on body { overflow: hidden; }
+        #bk-splash { position: fixed; inset: 0; z-index: 2147483000; background: radial-gradient(circle at 50% 42%, #12305e 0%, #0a1628 62%); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; transition: opacity .45s; }
+        #bk-splash.out { opacity: 0; pointer-events: none; }
+        #bk-splash svg { width: 120px; height: 120px; filter: drop-shadow(0 0 22px rgba(59,130,246,.55)); }
+        #bk-splash path { fill: url(#bkSplashG); fill-opacity: 0; stroke: #60a5fa; stroke-width: 1.6; stroke-linejoin: round; stroke-dasharray: 1; stroke-dashoffset: 1; animation: bkDraw 1s ease-out forwards, bkFill .4s .9s ease-out forwards; }
+        #bk-splash .bk-name { font-size: 34px; font-weight: 800; letter-spacing: .5px; color: #e2e8f0; opacity: 0; animation: bkFade .4s 1s forwards; }
+        @keyframes bkDraw { to { stroke-dashoffset: 0; } }
+        @keyframes bkFill { to { fill-opacity: 1; stroke-opacity: 0; } }
+        @keyframes bkFade { to { opacity: 1; } }
+        @media (prefers-reduced-motion: reduce) {
+            #bk-splash path { animation: none; stroke-dashoffset: 0; fill-opacity: 1; stroke-opacity: 0; }
+            #bk-splash .bk-name { animation: none; opacity: 1; }
+            #bk-splash { transition: none; }
+        }
+
+        /* ── قائمة الصفحات (نفس نظام فلاش) ──────── */
+        .mobile-menu { right: auto; left: 0; width: min(260px, 82vw); border-radius: 0 0 14px 0; box-shadow: 4px 8px 30px rgba(0,0,0,0.7); max-height: calc(100vh - 130px); max-height: calc(100dvh - 130px); overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+        #menu-backdrop { display: none; position: fixed; inset: 0; z-index: 9990; background: rgba(0,0,0,0.35); touch-action: none; }
+        html.menu-open, html.menu-open body { overflow: hidden; }
+        html.menu-open #menu-backdrop { display: block; }
+        @media (max-width: 768px) {
+            nav { padding: 0 12px; }
+            .logo { font-size: 1.1rem; letter-spacing: 2px; }
+            .logo-sub { font-size: 0.62rem; letter-spacing: 0.5px; }
+            .nav-user { max-width: 92px; padding: 0 0.6rem; }
+        }
+        @media (max-width: 400px) {
+            .logo { font-size: 1rem; letter-spacing: 1px; }
+            .nav-user { max-width: 66px; font-size: 0.8rem; }
+            .nav-back { padding: 0 0.65rem; font-size: 0.8rem; }
         }
     </style>
 </head>
 <body>
+
+    <div id="bk-splash">
+        <svg viewBox="0 0 100 100" aria-hidden="true"><defs><linearGradient id="bkSplashG" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs><path pathLength="1" d="M50 6 L92 30 H8 Z M16 38 h14 v38 h-14 Z M43 38 h14 v38 h-14 Z M70 38 h14 v38 h-14 Z M8 82 H92 V94 H8 Z"/></svg>
+        <div class="bk-name">بنك فلاش</div>
+    </div>
+    <script>
+    (function () {
+        var d = document.documentElement;
+        d.classList.add('bk-splash-on');
+        setTimeout(function () {
+            var s = document.getElementById('bk-splash');
+            if (!s) { d.classList.remove('bk-splash-on'); return; }
+            s.classList.add('out');
+            setTimeout(function () { s.remove(); d.classList.remove('bk-splash-on'); }, 450);
+        }, 2000);
+    })();
+    </script>
 
     <div id="sim-warning-banner" style="position:sticky; top:0; left:0; width:100%; z-index:100000; background:linear-gradient(180deg,#7f1d1d,#5f1414); color:#fef2f2; text-align:center; padding:10px 16px; font-weight:800; font-size:0.95rem; line-height:1.5; border-bottom:2px solid #991b1b; box-shadow:0 2px 12px rgba(0,0,0,0.5);">
         ⚠️ تنبيه: هذا الموقع مخصص للمحاكاة واللعب فقط، ولا يمت للواقع بصلة.
@@ -1826,7 +1889,8 @@ app.use(async (req, res) => {
                 var h = banner.offsetHeight;
                 document.querySelectorAll('nav').forEach(function(n){ n.style.top = h + 'px'; });
                 var menu = document.querySelector('.mobile-menu');
-                if(menu) menu.style.top = (h + 65) + 'px';
+                var nv = document.querySelector('nav');
+                if(menu) menu.style.top = (h + (nv ? nv.offsetHeight : 65)) + 'px';
             }
             window.addEventListener('load', adjustForSimBanner);
             window.addEventListener('resize', adjustForSimBanner);
@@ -1847,7 +1911,7 @@ app.use(async (req, res) => {
 
     <div id="login-screen" style="display:none;">
         <div style="text-align:center; padding: 8rem 2rem;">
-            <h1 style="font-size:3.5rem; font-weight:900; background: linear-gradient(90deg,#3b82f6,#60a5fa,#93c5fd); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:1rem;">🏦 بنك فلاش</h1>
+            <div style="width:84px;height:84px;margin:0 auto 14px;"><svg viewBox="0 0 100 100" aria-hidden="true"><defs><linearGradient id="bnkLogoLogin" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs><path fill="url(#bnkLogoLogin)" d="M50 6 L92 30 H8 Z M16 38 h14 v38 h-14 Z M43 38 h14 v38 h-14 Z M70 38 h14 v38 h-14 Z M8 82 H92 V94 H8 Z"/></svg></div><h1 style="font-size:3.5rem; font-weight:900; background: linear-gradient(90deg,#3b82f6,#60a5fa,#93c5fd); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:1rem;">بنك فلاش</h1>
             <p style="color:#64748b; margin-bottom:2rem; font-size:1.1rem;">Flash Bank — النظام المصرفي الرسمي</p>
             <p style="color:#94a3b8; margin-bottom:1.6rem; font-size:1rem; line-height:1.9;">الدخول للبنك يتم من داخل تطبيق فلاش.<br>افتح فلاش واضغط زر <b style="color:#fde047;">🏦 بنك فلاش</b> وبيفتح لك حسابك تلقائياً.</p>
             <button class="login-btn" style="padding:1rem 2.5rem; font-size:1.1rem; border-radius:12px;" onclick="location.href='${FLASH_HOME}'">
@@ -1859,7 +1923,7 @@ app.use(async (req, res) => {
     <div id="main-site" style="display:none;">
         <nav>
             <div>
-                <span class="logo">FLASH BANK</span>
+                <span class="logo"><svg viewBox="0 0 100 100" aria-hidden="true"><defs><linearGradient id="bnkLogoNav" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs><path fill="url(#bnkLogoNav)" d="M50 6 L92 30 H8 Z M16 38 h14 v38 h-14 Z M43 38 h14 v38 h-14 Z M70 38 h14 v38 h-14 Z M8 82 H92 V94 H8 Z"/></svg>FLASH BANK</span>
                 <span class="logo-sub">النظام المصرفي الرسمي</span>
             </div>
             <ul class="nav-links">
@@ -1876,6 +1940,7 @@ app.use(async (req, res) => {
         </nav>
 
         <!-- قائمة الموبايل المنسدلة -->
+        <div id="menu-backdrop" onclick="closeMobileMenu()"></div>
         <div class="mobile-menu" id="mobile-menu">
             <button onclick="mobileGoPage('dashboard')" id="mnav-dashboard">🏠 الرئيسية</button>
             <button onclick="mobileGoPage('transfer')" id="mnav-transfer">💸 تحويل</button>
@@ -2312,9 +2377,9 @@ app.use(async (req, res) => {
         async function showMainSite() {
             document.getElementById('main-site').style.display = 'block';
             document.getElementById('auth-section').innerHTML = \`
-                <span style="margin-left:10px; color:#60a5fa; font-weight:bold;">\${currentUser.username}</span>
+                <span class="nav-user">👤 \${currentUser.username}</span>
+                <button class="nav-back" onclick="location.href=(window.BANK_BASE||'')+'/logout'">↩️ فلاش</button>
                 <button class="hamburger-btn" id="hamburger-btn" onclick="toggleMobileMenu()">☰</button>
-                <button class="btn btn-yellow" style="padding:0.4rem 0.8rem; font-size:0.8rem;" onclick="location.href=(window.BANK_BASE||'')+'/logout'">↩️ فلاش</button>
             \`;
             if(['staff','management','admin','super_admin'].includes(currentRole)) {
                 document.getElementById('admin-fab-btn').style.display = 'block';
@@ -3563,12 +3628,25 @@ app.use(async (req, res) => {
 
         // ─── دوال قائمة الموبايل ──────────────────────────────────────────────
         function toggleMobileMenu() {
-            document.getElementById('mobile-menu').classList.toggle('open');
+            const m = document.getElementById('mobile-menu');
+            if(!m) return;
+            if(m.classList.contains('open')) { closeMobileMenu(); return; }
+            m.classList.add('open');
+            m.scrollTop = 0;
+            document.documentElement.classList.add('menu-open');
         }
         function closeMobileMenu() {
             const m = document.getElementById('mobile-menu');
             if(m) m.classList.remove('open');
+            document.documentElement.classList.remove('menu-open');
         }
+        document.addEventListener('touchmove', function(e) {
+            if(!document.documentElement.classList.contains('menu-open')) return;
+            const m = document.getElementById('mobile-menu');
+            if(m && m.contains(e.target) && m.scrollHeight > m.clientHeight + 1) return;
+            e.preventDefault();
+        }, { passive: false });
+        window.addEventListener('resize', function() { if(window.innerWidth > 768) closeMobileMenu(); });
         function mobileGoPage(page) {
             goPage(page);
             closeMobileMenu();
