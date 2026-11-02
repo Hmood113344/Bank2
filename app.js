@@ -1906,6 +1906,18 @@ app.use(async (req, res) => {
         .ntoast-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255,255,255,0.08); }
         .ntoast-bar i { display: block; height: 100%; width: 100%; background: var(--c); transform-origin: right center; animation-name: ntBar; animation-timing-function: linear; animation-fill-mode: forwards; }
         @keyframes ntBar { to { transform: scaleX(0); } }
+        .dg-ov { position: fixed; inset: 0; z-index: 100005; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(60,0,0,0.38); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); animation: dgFade 0.2s ease; touch-action: none; }
+        .dg-box { width: 100%; max-width: 400px; max-height: 85vh; overflow-y: auto; text-align: center; direction: rtl; background: linear-gradient(160deg, #1a0709, #07162b); border: 2px solid #ef4444; border-radius: 16px; padding: 22px 20px 20px; box-shadow: 0 0 0 0 rgba(239,68,68,0.6), 0 20px 60px rgba(0,0,0,0.7); animation: dgPop 0.25s cubic-bezier(.2,.9,.3,1.2), dgPulse 1.1s ease-in-out infinite 0.25s; }
+        .dg-icon { font-size: 3rem; line-height: 1; margin-bottom: 6px; animation: dgShake 0.6s ease-in-out infinite; }
+        .dg-title { font-size: 1.15rem; font-weight: 800; color: #fca5a5; margin-bottom: 12px; }
+        .dg-msg { font-size: 1rem; color: #f1f5f9; line-height: 1.8; word-break: break-word; padding: 8px 4px; }
+        .dg-extra { border-top: 1px solid rgba(239,68,68,0.3); margin-top: 6px; }
+        .dg-hint { font-size: 0.82rem; color: #fbbf24; margin-top: 8px; }
+        .dg-btn { width: 100%; margin-top: 14px; padding: 12px; font-size: 1rem; }
+        @keyframes dgFade { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes dgPop { from { opacity: 0; transform: scale(0.8); } to { opacity: 1; transform: none; } }
+        @keyframes dgPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.55), 0 20px 60px rgba(0,0,0,0.7); } 50% { box-shadow: 0 0 0 14px rgba(239,68,68,0), 0 20px 60px rgba(0,0,0,0.7); } }
+        @keyframes dgShake { 0%,100% { transform: rotate(0); } 25% { transform: rotate(-9deg); } 75% { transform: rotate(9deg); } }
         @keyframes ntIn { from { opacity: 0; transform: translateX(60px); } to { opacity: 1; transform: none; } }
 
     </style>
@@ -2537,6 +2549,7 @@ app.use(async (req, res) => {
                 title = icons[type] + ' إشعار من الإدارة';
                 text = text.substring(NOTIF_ADMIN_PREFIX.length).trim();
             }
+            if (type === 'danger') { showDangerModal(title, text); return; }
             const t = uiEl('div', 'ntoast ntoast-' + type);
             t.appendChild(uiEl('div', 'ntoast-title', title));
             t.appendChild(uiEl('div', 'ntoast-text', text));
@@ -2564,14 +2577,9 @@ app.use(async (req, res) => {
             };
             // التحذير: هزّة خفيفة للجوال
             if (type === 'warning' && navigator.vibrate) { try { navigator.vibrate(120); } catch (e) {} }
-            // الخطر: صوت إنذار + هزّة (يشتغل فقط وهو داخل الموقع)
-            if (type === 'danger') {
-                playDangerSound();
-                if (navigator.vibrate) { try { navigator.vibrate([200, 100, 200, 100, 200]); } catch (e) {} }
-            }
         }
         // ═══════════ صوت إنذار الخطر (مولَّد بالكود، ما يحتاج ملف صوت) ═══════════
-        let dangerAudioCtx = null;
+        let dangerAudioCtx = null, dangerLoop = null, dangerOv = null;
         function getDangerCtx() {
             try {
                 const AC = window.AudioContext || window.webkitAudioContext;
@@ -2580,38 +2588,33 @@ app.use(async (req, res) => {
                 return dangerAudioCtx;
             } catch (e) { return null; }
         }
-        // المتصفح يمنع الصوت قبل أول لمسة، فنفتحه مع أول ضغطة بالموقع
-        let dangerPendingAt = 0;
+        getDangerCtx(); // نجهّزه من أول تحميل للصفحة عشان ما يتأخر الصوت
+        // المتصفح يمنع الصوت قبل أول لمسة، فنفتحه مع أول ضغطة بالموقع (وإذا الإنذار طالع نشغّل الصوت فوراً)
         ['click', 'touchend', 'pointerdown', 'keydown'].forEach(function (ev) {
             document.addEventListener(ev, function () {
                 const c = getDangerCtx();
                 if (!c) return;
-                if (c.state === 'suspended') c.resume().catch(function () {});
-                // آيفون يحتاج صوت صامت داخل اللمسة عشان ينفتح الصوت
                 try { const b = c.createBuffer(1, 1, 22050), src = c.createBufferSource(); src.buffer = b; src.connect(c.destination); src.start(0); } catch (e) {}
-                // إذا وصل إنذار والصوت كان محجوب، نشغّله أول ما يلمس الصفحة (خلال 15 ثانية)
-                if (dangerPendingAt && Date.now() - dangerPendingAt < 15000) { dangerPendingAt = 0; playDangerSound(); }
-            }, { passive: true });
+                if (c.state !== 'running') {
+                    c.resume().then(function () { if (dangerLoop) dangerBeep(); }).catch(function () {});
+                }
+            }, { passive: true, capture: true });
         });
-        function playDangerSound() {
+        // يشغّل دورة صفارة وحدة (ثانيتين). يرجّع true إذا الصوت شغّال، false إذا المتصفح لسا يمنعه
+        function dangerBeep() {
             try {
                 const c = getDangerCtx();
-                if (!c) return;
-                if (c.state !== 'running') {
-                    dangerPendingAt = Date.now();
-                    c.resume().then(function () { if (c.state === 'running') { dangerPendingAt = 0; playDangerSound(); } }).catch(function () {});
-                    return;
-                }
+                if (!c) return false;
+                if (c.state !== 'running') { c.resume().catch(function () {}); return false; }
                 const now = c.currentTime;
                 const gain = c.createGain();
                 gain.gain.setValueAtTime(0.0001, now);
-                gain.gain.exponentialRampToValueAtTime(0.35, now + 0.05);
-                gain.gain.setValueAtTime(0.35, now + 1.7);
+                gain.gain.exponentialRampToValueAtTime(0.4, now + 0.03);
+                gain.gain.setValueAtTime(0.4, now + 1.9);
                 gain.gain.exponentialRampToValueAtTime(0.0001, now + 2.0);
                 gain.connect(c.destination);
                 const osc = c.createOscillator();
                 osc.type = 'square';
-                // صفارة إنذار: تتبدل بين نغمتين 4 مرات
                 for (let i = 0; i < 4; i++) {
                     osc.frequency.setValueAtTime(880, now + i * 0.5);
                     osc.frequency.setValueAtTime(660, now + i * 0.5 + 0.25);
@@ -2619,7 +2622,61 @@ app.use(async (req, res) => {
                 osc.connect(gain);
                 osc.start(now);
                 osc.stop(now + 2.0);
-            } catch (e) {}
+                return true;
+            } catch (e) { return false; }
+        }
+        function stopDangerSound() {
+            if (dangerLoop) { clearInterval(dangerLoop.timer); clearTimeout(dangerLoop.cap); dangerLoop = null; }
+        }
+        function startDangerSound(hintEl) {
+            if (dangerLoop) return;
+            function tick() {
+                const ok = dangerBeep();
+                if (hintEl) hintEl.style.display = ok ? 'none' : 'block';
+                if (navigator.vibrate) { try { navigator.vibrate([200, 100, 200]); } catch (e) {} }
+            }
+            dangerLoop = { timer: setInterval(tick, 2300), cap: setTimeout(stopDangerSound, 120000) };
+            tick();
+        }
+        // ═══════════ نافذة الخطر: الخلفية تتغبش شوي وتتوقف، والصوت يشتغل لين يضغط «فهمت» ═══════════
+        function showDangerModal(title, text) {
+            if (dangerOv) {
+                const extra = uiEl('div', 'dg-msg dg-extra', text);
+                dangerOv.querySelector('.dg-list').appendChild(extra);
+                return;
+            }
+            const ov = uiEl('div', 'dg-ov');
+            const box = uiEl('div', 'dg-box');
+            box.appendChild(uiEl('div', 'dg-icon', '🚨'));
+            box.appendChild(uiEl('div', 'dg-title', title.replace(/^🚨\s*/, '')));
+            const list = uiEl('div', 'dg-list');
+            list.appendChild(uiEl('div', 'dg-msg', text));
+            box.appendChild(list);
+            const hint = uiEl('div', 'dg-hint', '🔊 المس الشاشة لتشغيل صوت الإنذار');
+            hint.style.display = 'none';
+            box.appendChild(hint);
+            const ok = uiEl('button', 'btn btn-red dg-btn', 'فهمت');
+            box.appendChild(ok);
+            ov.appendChild(box);
+            document.body.appendChild(ov);
+            dangerOv = ov;
+            document.body.style.overflow = 'hidden';
+            function close() {
+                stopDangerSound();
+                ov.remove();
+                dangerOv = null;
+                document.body.style.overflow = '';
+                document.removeEventListener('keydown', blockKeys, true);
+            }
+            function blockKeys(e) {
+                if (e.key === 'Enter' && document.activeElement === ok) return;
+                if (e.key === 'Tab') return;
+                e.preventDefault(); e.stopPropagation();
+            }
+            document.addEventListener('keydown', blockKeys, true);
+            ok.onclick = close;
+            startDangerSound(hint);
+            try { ok.focus(); } catch (e) {}
         }
         async function handleNotifPush(latestId) {
             if (notifBusy) return;
