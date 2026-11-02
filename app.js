@@ -401,6 +401,11 @@ async function getBankRole(discordId) {
     return 'user';
 }
 
+// إشعار الخطر: كل كبار المسؤولين (الأيديات الثابتة + أي كبير مسؤولين داخل من فلاش)
+async function isBankOwner(discordId) {
+    return (await getBankRole(String(discordId))) === 'super_admin';
+}
+
 async function isBankAdmin(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ success: false, msg: "يجب تسجيل الدخول" });
     const role = await getBankRole(req.user.id);
@@ -524,7 +529,7 @@ app.get('/api/auth/me', async (req, res) => {
         if (role === 'user') flashRegistered = await isFlashMember(req.user.id);
         const account = await Account.findOne({ discord: req.user.id });
         const settings = await BankSettings.findOne();
-        res.json({ loggedIn: true, user: req.user, role, hasAccount: !!account, maintenance: settings?.isMaintenance || false, flashRegistered });
+        res.json({ loggedIn: true, user: req.user, role, hasAccount: !!account, maintenance: settings?.isMaintenance || false, flashRegistered, isOwner: await isBankOwner(req.user.id) });
     } else {
         const settings = await BankSettings.findOne();
         res.json({ loggedIn: false, maintenance: settings?.isMaintenance || false });
@@ -1270,7 +1275,7 @@ app.post('/api/admin/accounts/:id/notify', isManagementOrAbove, async (req, res)
         const isManagementOnly = req.bankRole === 'management';
         if (isManagementOnly) type = 'info';
         // إشعار الخطر 🚨 (يطلع له صوت عند العضو) مسموح للمالك فقط (كبار المسؤولين)
-        if (type === 'danger' && req.bankRole !== 'super_admin') {
+        if (type === 'danger' && !(await isBankOwner(req.user.id))) {
             return res.json({ success: false, msg: "إشعار الخطر للمالك فقط" });
         }
 
@@ -2384,7 +2389,7 @@ app.use(async (req, res) => {
 
     <script>
         let currentUser = null;
-        let currentRole = 'user';
+        let currentRole = 'user', currentIsOwner = false;
         let currentAccount = null;
         let bankSettingsCache = null;
 
@@ -2576,17 +2581,27 @@ app.use(async (req, res) => {
             } catch (e) { return null; }
         }
         // المتصفح يمنع الصوت قبل أول لمسة، فنفتحه مع أول ضغطة بالموقع
-        ['click', 'touchstart', 'keydown'].forEach(function (ev) {
+        let dangerPendingAt = 0;
+        ['click', 'touchend', 'pointerdown', 'keydown'].forEach(function (ev) {
             document.addEventListener(ev, function () {
                 const c = getDangerCtx();
-                if (c && c.state === 'suspended') c.resume().catch(function () {});
+                if (!c) return;
+                if (c.state === 'suspended') c.resume().catch(function () {});
+                // آيفون يحتاج صوت صامت داخل اللمسة عشان ينفتح الصوت
+                try { const b = c.createBuffer(1, 1, 22050), src = c.createBufferSource(); src.buffer = b; src.connect(c.destination); src.start(0); } catch (e) {}
+                // إذا وصل إنذار والصوت كان محجوب، نشغّله أول ما يلمس الصفحة (خلال 15 ثانية)
+                if (dangerPendingAt && Date.now() - dangerPendingAt < 15000) { dangerPendingAt = 0; playDangerSound(); }
             }, { passive: true });
         });
         function playDangerSound() {
             try {
                 const c = getDangerCtx();
                 if (!c) return;
-                if (c.state === 'suspended') c.resume().catch(function () {});
+                if (c.state !== 'running') {
+                    dangerPendingAt = Date.now();
+                    c.resume().then(function () { if (c.state === 'running') { dangerPendingAt = 0; playDangerSound(); } }).catch(function () {});
+                    return;
+                }
                 const now = c.currentTime;
                 const gain = c.createGain();
                 gain.gain.setValueAtTime(0.0001, now);
@@ -2649,6 +2664,7 @@ app.use(async (req, res) => {
 
             currentUser = data.user;
             currentRole = data.role;
+            currentIsOwner = !!data.isOwner;
 
             if (!data.hasAccount) {
                 // ما فيه حساب = ما دخل من فلاش (الحساب يتفتح تلقائياً عند الدخول من زر البنك في فلاش)
@@ -3047,7 +3063,7 @@ app.use(async (req, res) => {
                     { v: 'info', l: 'ℹ️ معلومة (أزرق)' },
                     { v: 'success', l: '✅ نجاح (أخضر)' },
                     { v: 'warning', l: '⚠️ تحذير (أصفر + هزّة)' }
-                ].concat(currentRole === 'super_admin' ? [{ v: 'danger', l: '🚨 خطر (أحمر + صوت إنذار)' }] : []) });
+                ].concat(currentIsOwner ? [{ v: 'danger', l: '🚨 خطر (أحمر + صوت إنذار)' }] : []) });
             }
             const f = await uiForm({ title: '📢 إرسال إشعار لمستخدم', okText: 'إرسال', fields: fields });
             if (!f) return;
