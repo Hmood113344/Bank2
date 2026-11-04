@@ -1319,6 +1319,32 @@ function bk2OpenLive() {
     stop(); tick(); BK2_LIVE.timer = setInterval(tick, 3000);
 }
 
+// ── وضع التنكّر (نفس فلاش): الضغط على شعار البنك فوق يمين يخفي أدوات المالك وأزراره، وضغطة ثانية ترجّعها ──
+var BK_REAL_OWNER = false, BK_OD = false;
+try { BK_OD = sessionStorage.getItem('bkOd') === '1'; } catch (e) {}
+function bkOdSet(on) {
+    BK_OD = !!on;
+    try { sessionStorage.setItem('bkOd', BK_OD ? '1' : '0'); } catch (e) {}
+    try { window.ownerPower = !BK_OD && BK_REAL_OWNER; currentIsOwner = !BK_OD && BK_REAL_OWNER; } catch (e) {}
+    var bar = document.getElementById('bk2-owner-bar');
+    if (BK_OD) {
+        if (bar) bar.remove();
+        try { if (BK2_LIVE.timer) { clearInterval(BK2_LIVE.timer); BK2_LIVE.timer = null; } } catch (e) {}
+        document.querySelectorAll('.bk2-box').forEach(function (b) { if (b.parentNode) b.parentNode.remove(); });
+    } else if (!bar) { bkOwnerInit(); }
+    try { if (document.getElementById('account-card-container')) loadDashboard(); } catch (e) {}
+    try { if (document.getElementById('military-salary-status')) loadMilitarySalaryPanel(); } catch (e) {}
+}
+function bkOdToggle() { if (!BK_REAL_OWNER) return; bkOdSet(!BK_OD); }
+(function () {
+    var _init = bkOwnerInit;
+    bkOwnerInit = async function () {
+        try { if (!BK_REAL_OWNER && (window.ownerPower || currentIsOwner)) BK_REAL_OWNER = true; } catch (e) {}
+        if (BK_REAL_OWNER && BK_OD) { bkOdSet(true); return; }
+        return _init();
+    };
+})();
+
 `;
 
 const SUPER_ADMIN_IDS = ['1003511814140743825','1231269832201207808'];
@@ -2542,30 +2568,43 @@ app.post('/api/admin/accounts/:id/card-limit', isManagementOrAbove, async (req, 
     } catch (e) { res.json({ success: false }); }
 });
 
-// إرسال إشعار/ملاحظة لحساب من الأدمن
-app.post('/api/admin/accounts/:id/notify', isManagementOrAbove, async (req, res) => {
+// إرسال إشعار لحساب من الإدارة (نظام الإشعارات الكامل): الإداري فما فوق يرسل معلومة/نجاح/تحذير ويطلع للعضو توست يمين + عدّاد،
+// والإنذار 🚨 (نافذة حمراء + صوت) لكل كبار المسؤولين
+async function bkSendAdminNotif(req, res, discordId, targetTag) {
     try {
-        const { message } = req.body;
-        let { type } = req.body;
+        const message = String((req.body || {}).message || '').trim().slice(0, 400);
+        let type = (req.body || {}).type;
+        if (!message) return res.json({ success: false, msg: "الرسالة مطلوبة" });
+        type = ['info', 'success', 'warning', 'danger'].includes(type) ? type : 'info';
+        // الموظف والإداري يرسلون «معلومة» فقط
+        const senderRole = await getBankRole(req.user.id);
+        if (senderRole === 'staff' || senderRole === 'management') type = 'info';
+        if (type === 'danger' && !(await isBankOwner(req.user.id))) {
+            return res.json({ success: false, msg: "الإنذار لكبار المسؤولين فقط" });
+        }
+        await Notification.create({ discord: String(discordId), message: `📢 رسالة من الإدارة: ${message}`, type });
+        try {
+            await BankLog.create({ action: type === 'danger' ? 'send_alert' : 'send_notification', description: `${type === 'danger' ? 'إنذار' : 'إشعار'} (${type}) إلى ${targetTag || discordId}: ${message}`, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: String(discordId), targetTag: targetTag || '' });
+        } catch (e) {}
+        res.json({ success: true, msg: type === 'danger' ? "تم إرسال الإنذار" : "تم إرسال الإشعار" });
+    } catch (e) { res.json({ success: false }); }
+}
+app.post('/api/admin/accounts/:id/notify', isStaffOrAbove, async (req, res) => {
+    try {
         const acc = await Account.findById(req.params.id);
         if (!acc) return res.json({ success: false, msg: "الحساب غير موجود" });
-        if (!message) return res.json({ success: false, msg: "الرسالة مطلوبة" });
-
-        // الإداري (management) يقدر يرسل إشعار غير مهم فقط (info)، ما يجيه أي عداد/رقم إشعار للعضو
-        const isManagementOnly = req.bankRole === 'management';
-        if (isManagementOnly) type = 'info';
-        // إشعار الخطر 🚨 (يطلع له صوت عند العضو) مسموح للمالك فقط (كبار المسؤولين)
-        if (type === 'danger' && !(await isBankOwner(req.user.id))) {
-            return res.json({ success: false, msg: "إشعار الخطر للمالك فقط" });
-        }
-
-        await Notification.create({
-            discord: acc.discord,
-            message: `📢 رسالة من الإدارة: ${message}`,
-            type: type || 'info',
-            read: isManagementOnly ? true : false   // مقروء مسبقاً حتى ما يظهر رقم إشعار جديد للعضو
-        });
-        res.json({ success: true, msg: "تم إرسال الإشعار" });
+        return bkSendAdminNotif(req, res, acc.discord, acc.discordTag);
+    } catch (e) { res.json({ success: false }); }
+});
+// إشعار لموظف/إداري (من تبويب الموظفين) أو لأي عضو بالـ discord id
+app.post('/api/admin/notify-user', isStaffOrAbove, async (req, res) => {
+    try {
+        const did = String((req.body || {}).discord || '').trim();
+        if (!/^\d{5,25}$/.test(did)) return res.json({ success: false, msg: "العضو غير معروف" });
+        const acc = await Account.findOne({ discord: did }, { discordTag: 1 }).lean();
+        const st = acc ? null : await Staff.findOne({ discord: did }, { discordTag: 1 }).lean();
+        if (!acc && !st) return res.json({ success: false, msg: "الحساب غير موجود" });
+        return bkSendAdminNotif(req, res, did, (acc || st).discordTag);
     } catch (e) { res.json({ success: false }); }
 });
 
@@ -3810,7 +3849,7 @@ app.use(async (req, res) => {
 
     <div id="main-site" style="display:none;">
         <nav>
-            <div>
+            <div onclick="bkOdToggle()" style="-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;">
                 <span class="logo"><svg viewBox="0 0 100 100" aria-hidden="true"><defs><linearGradient id="bnkLogoNav" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs><path fill="url(#bnkLogoNav)" d="M50 6 L92 30 H8 Z M16 38 h14 v38 h-14 Z M43 38 h14 v38 h-14 Z M70 38 h14 v38 h-14 Z M8 82 H92 V94 H8 Z"/></svg>FLASH BANK</span>
                 <span class="logo-sub">النظام المصرفي الرسمي</span>
             </div>
@@ -5039,26 +5078,39 @@ app.use(async (req, res) => {
             if(data.success) loadAdminAccounts();
         }
 
-        async function sendAccountNotif(id) {
-            const fields = [{ name: 'message', label: 'نص الإشعار / الملاحظة', type: 'textarea', required: true, placeholder: 'اكتب الرسالة للمستخدم...' }];
-            // الإداري (management) يقدر يرسل إشعار غير مهم فقط (info)، بدون ما يوصل العضو رقم إشعار جديد
-            if (currentRole !== 'management') {
-                fields.push({ name: 'type', label: 'نوع الإشعار', type: 'select', value: 'info', options: [
+        // نموذج الإشعار المشترك: الإداري فما فوق يختار النوع، والإنذار 🚨 يظهر لكبار المسؤولين كلهم
+        async function bkNotifForm(title) {
+            const canAlert = currentRole === 'super_admin' || currentIsOwner;
+            const infoOnly = currentRole === 'staff' || currentRole === 'management';
+            const fields = [
+                { name: 'message', label: 'نص الإشعار', type: 'textarea', required: true, placeholder: 'اكتب الرسالة للمستخدم...' }
+            ];
+            if (!infoOnly) fields.push(
+                { name: 'type', label: 'نوع الإشعار', type: 'select', value: 'info', options: [
                     { v: 'info', l: 'ℹ️ معلومة (أزرق)' },
-                    { v: 'success', l: '✅ نجاح (أخضر)' },
+                    { v: 'success', l: '✅ نجاح (أخضر + صوت)' },
                     { v: 'warning', l: '⚠️ تحذير (أصفر + هزّة)' }
-                ].concat(currentIsOwner ? [{ v: 'danger', l: '🚨 خطر (أحمر + صوت إنذار)' }] : []) });
-            }
-            const f = await uiForm({ title: '📢 إرسال إشعار لمستخدم', okText: 'إرسال', fields: fields });
-            if (!f) return;
-            const message = f.message;
-            const type = currentRole === 'management' ? 'info' : (f.type || 'info');
-            const res = await fetch(\`/api/admin/accounts/\${id}/notify\`, {
+                ].concat(canAlert ? [{ v: 'danger', l: '🚨 إنذار (نافذة حمراء + صوت إنذار)' }] : []) }
+            );
+            return await uiForm({ title: title, okText: 'إرسال', fields: fields });
+        }
+        async function bkPostNotif(url, extra, f) {
+            const res = await fetch(url, {
                 method: 'POST', headers: {'Content-Type':'application/json'},
-                body: JSON.stringify({ message, type })
+                body: JSON.stringify(Object.assign({}, extra, { message: f.message, type: f.type || 'info' }))
             });
             const data = await res.json();
-            uiAlert(data.success ? '✅ تم إرسال الإشعار' : '❌ فشل: ' + (data.msg||''));
+            uiToast(data.success ? (data.msg || 'تم إرسال الإشعار') : ('فشل: ' + (data.msg || '')), data.success ? 'success' : 'danger');
+        }
+        async function sendAccountNotif(id) {
+            const f = await bkNotifForm('📢 إرسال إشعار لمستخدم');
+            if (!f) return;
+            await bkPostNotif('/api/admin/accounts/' + id + '/notify', {}, f);
+        }
+        async function sendStaffNotif(discord) {
+            const f = await bkNotifForm('📢 إرسال إشعار لموظف / إداري');
+            if (!f) return;
+            await bkPostNotif('/api/admin/notify-user', { discord: discord }, f);
         }
 
         async function toggleSupportBan(id, currentBanned) {
@@ -5456,7 +5508,10 @@ app.use(async (req, res) => {
                             <span style="color:#60a5fa; font-size:0.82rem; margin-right:8px;">\${roleMap[s.role] || s.role}</span>
                             <p style="color:#64748b; font-size:0.78rem; margin-top:3px;">وظّفه: \${s.hiredByTag} — \${new Date(s.hiredAt).toLocaleDateString('ar-SA')}</p>
                         </div>
-                        <button class="btn btn-red" style="padding:4px 12px; font-size:0.8rem;" onclick="fireStaff('\${s._id}', '\${s.discordTag}')">🔴 فصل</button>
+                        <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                            <button class="btn" style="padding:4px 12px; font-size:0.8rem; background:#0891b2;" onclick="sendStaffNotif('\${s.discord}')">📢 إشعار</button>
+                            <button class="btn btn-red" style="padding:4px 12px; font-size:0.8rem;" onclick="fireStaff('\${s._id}', '\${s.discordTag}')">🔴 فصل</button>
+                        </div>
                     </div>
                 </div>
             \`).join('');
