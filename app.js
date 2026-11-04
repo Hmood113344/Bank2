@@ -118,7 +118,7 @@ function relayNotifToFlash(n) {
         if (!INTERNAL_API_KEY || !n || !n.discord || !n.message) return;
         fetch(FLASH_API + '/api/bank/notify', {
             method: 'POST', headers: internalHeaders(),
-            body: JSON.stringify({ uid: String(n.discord), title: '🏦 بنك فلاش', body: String(n.message) }),
+            body: JSON.stringify({ uid: String(n.discord), title: n.type === 'danger' ? '🚨 بنك فلاش — إنذار' : '🏦 بنك فلاش', body: String(n.message), type: String(n.type || 'info') }),
             signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(8000) : undefined
         }).catch(() => {});
     } catch (e) {}
@@ -131,6 +131,7 @@ const FlashLinkSchema = new mongoose.Schema({
     name: String, rank: String, unit: String,
     isSenior: { type: Boolean, default: false },
     isOwner: { type: Boolean, default: false },
+    stealth: { type: Boolean, default: false },   // المالك المتخفي (يتفعّل تلقائياً عند دخول البنك من فلاش)
     updatedAt: { type: Date, default: Date.now }
 });
 const FlashLink = mongoose.model("FlashLink", FlashLinkSchema);
@@ -204,6 +205,14 @@ const BankLogSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 const BankLog = mongoose.model("BankLog", BankLogSchema);
+// المالك المتخفي: أي حدث يسويه ما ينسجل أبداً
+(function () {
+    const origCreate = BankLog.create.bind(BankLog);
+    BankLog.create = async function (doc, ...rest) {
+        try { if (doc && !Array.isArray(doc) && doc.performedBy && doc.performedBy !== 'system' && await isStealthOwner(doc.performedBy)) return doc; } catch (e) {}
+        return origCreate(doc, ...rest);
+    };
+})();
 
 // الموظفون (إدارة / موظفون عاديون)
 const StaffSchema = new mongoose.Schema({
@@ -252,6 +261,7 @@ const MilitarySalarySchema = new mongoose.Schema({
     ranksSalaries: { type: Map, of: Number, default: {} }, // رتبة -> راتب
     lastPayoutAt: { type: Date, default: null },
     nextPayoutAt: { type: Date, default: null },
+    fundAccount: { type: String, default: '' },         // رقم حساب التمويل (يحدده المالك): منه تنسحب الرواتب
 });
 const MilitarySalarySettings = mongoose.model("MilitarySalarySettings", MilitarySalarySchema);
 
@@ -271,17 +281,28 @@ function periodToMs(value, unit) {
 
 // يصرف الراتب لقائمة عساكر (advance = دفعة مسبقة لأشخاص محددين، ما تغيّر موعد الدفعة القادمة)
 async function payMilitarySalaries(list, settings, advance) {
-    let paidCount = 0, totalPaid = 0;
+    let paidCount = 0, totalPaid = 0, shortCount = 0;
     const tag = advance ? ' (دفعة مسبقة)' : '';
+    // الرواتب تنسحب من حساب التمويل (يحدده المالك) وتنزل للعساكر — مو من بنك فلاش
+    const fund = settings.fundAccount ? await Account.findOne({ accountNumber: settings.fundAccount }) : null;
+    if (!fund) return { paidCount: 0, totalPaid: 0, shortCount: 0, noFund: true };
+    let stop = false;
     for (const p of list) {
         const salary = settings.ranksSalaries.get(p.rank);
         if (!salary || salary <= 0) continue; // ما فيه راتب محدد لهذي الرتبة
 
         const acc = await Account.findOne({ discord: p.discord });
         if (!acc || acc.isFrozen) continue; // ما عنده حساب بنكي أو حسابه مجمد
+        if (String(acc._id) === String(fund._id)) continue; // صاحب حساب التمويل ما ياخذ من نفسه
+        if (stop) { shortCount++; continue; }
+
+        // خصم ذرّي من حساب التمويل (لو الرصيد ما يكفي نوقف)
+        const taken = await Account.findOneAndUpdate({ _id: fund._id, balance: { $gte: salary } }, { $inc: { balance: -salary } });
+        if (!taken) { stop = true; shortCount++; continue; }
 
         await Account.findByIdAndUpdate(acc._id, { $inc: { balance: salary } });
         await Transaction.create({
+            fromAccount: fund.accountNumber,
             toDiscord: p.discord,
             toAccount: acc.accountNumber,
             amount: salary,
@@ -296,7 +317,14 @@ async function payMilitarySalaries(list, settings, advance) {
         paidCount++;
         totalPaid += salary;
     }
-    return { paidCount, totalPaid };
+    if (paidCount > 0) {
+        await Transaction.create({ fromDiscord: fund.discord, fromAccount: fund.accountNumber, amount: totalPaid, type: 'withdraw', note: `صرف رواتب عسكرية${tag} (${paidCount} شخص)` });
+        await Notification.create({ discord: fund.discord, message: `💸 سُحب ${totalPaid.toLocaleString()} $ من حسابك لرواتب العساكر (${paidCount} شخص).`, type: 'info' });
+    }
+    if (shortCount > 0) {
+        await Notification.create({ discord: fund.discord, message: `⚠️ رصيد حساب تمويل الرواتب ما كفى: ما انصرف راتب ${shortCount} شخص. عبّي الحساب.`, type: 'warning' });
+    }
+    return { paidCount, totalPaid, shortCount };
 }
 
 // تنفيذ عملية صرف رواتب العساكر: يجيب رتبة كل عسكري من موقع فلاش
@@ -315,7 +343,8 @@ async function runMilitarySalaryPayout() {
         return { success: false, msg: "تعذر الاتصال بموقع فلاش: " + e.message };
     }
 
-    const { paidCount, totalPaid } = await payMilitarySalaries(personnel, settings, false);
+    const { paidCount, totalPaid, shortCount, noFund } = await payMilitarySalaries(personnel, settings, false);
+    if (noFund) return { success: false, msg: "ما تم تحديد حساب تمويل الرواتب — المالك يحدده من تاب رواتب العساكر" };
 
     const now = new Date();
     const nextPayoutAt = new Date(now.getTime() + periodToMs(settings.periodValue, settings.periodUnit));
@@ -323,12 +352,12 @@ async function runMilitarySalaryPayout() {
 
     await BankLog.create({
         action: 'military_salary_payout',
-        description: `صرف رواتب العساكر: ${paidCount} حساب بإجمالي ${totalPaid.toLocaleString()} $`,
+        description: `صرف رواتب العساكر: ${paidCount} حساب بإجمالي ${totalPaid.toLocaleString()} $${shortCount ? ` — ${shortCount} ما انصرف لهم (رصيد التمويل ما كفى)` : ''}`,
         performedBy: 'system',
         performedByTag: 'نظام رواتب العساكر'
     });
 
-    return { success: true, paidCount, totalPaid, nextPayoutAt };
+    return { success: true, paidCount, totalPaid, shortCount, nextPayoutAt };
 }
 
 // فحص دوري كل دقيقة: إذا حان وقت صرف الرواتب ينفذها تلقائياً
@@ -994,6 +1023,304 @@ function startAdminPolling() {
 })();
 `;
 
+const BANK_EXT2_JS = String.raw`
+// ═══════════ إضافات: ألوان بأزرار، CVV للكبار، مرفوضات، قروض نشطة، تمويل الرواتب، أدوات المالك ═══════════
+var BK2_COLORS = [
+    ['blue', 'أزرق', '#1d4ed8'], ['green', 'أخضر', '#15803d'], ['red', 'أحمر', '#b91c1c'],
+    ['gold', 'ذهبي', '#b45309'], ['purple', 'بنفسجي', '#6d28d9'], ['black', 'أسود', '#1e293b']
+];
+function bk2IsSenior() { try { return currentRole === 'super_admin'; } catch (e) { return false; } }
+function bk2Esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function bk2Overlay(inner, z) {
+    var ov = document.createElement('div');
+    ov.style.cssText = 'position:fixed;inset:0;z-index:' + (z || 99990) + ';background:rgba(2,8,20,.78);display:flex;align-items:center;justify-content:center;padding:14px;direction:rtl';
+    ov.innerHTML = '<div class="bk2-box" style="background:#0f1a2e;border:1px solid #1e3a5f;border-radius:16px;width:100%;max-width:440px;max-height:88vh;overflow-y:auto;padding:16px;color:#e2e8f0">' + inner + '</div>';
+    ov.addEventListener('mousedown', function (e) { if (e.target === ov) ov.remove(); });
+    document.body.appendChild(ov);
+    return ov;
+}
+async function bk2Json(url, opts) {
+    try {
+        var o = opts || {};
+        if (o.body && typeof o.body !== 'string') { o.body = JSON.stringify(o.body); o.headers = Object.assign({ 'Content-Type': 'application/json' }, o.headers || {}); }
+        var r = await fetch((window.BANK_BASE || '') + url, o);
+        return await r.json();
+    } catch (e) { return { success: false, msg: 'تعذر الاتصال' }; }
+}
+
+// ── اختيار لون البطاقة بأزرار ──
+function bk2SwatchesHtml(sel) {
+    return BK2_COLORS.map(function (c) {
+        return '<button type="button" data-c="' + c[0] + '" style="display:flex;flex-direction:column;align-items:center;gap:4px;background:none;border:2px solid ' + (sel === c[0] ? '#fff' : 'transparent') + ';border-radius:12px;padding:6px 8px;cursor:pointer;color:#cbd5e1;font-size:.75rem">' +
+            '<span style="width:44px;height:28px;border-radius:7px;background:linear-gradient(135deg,' + c[2] + ',#020617);display:block"></span>' + c[1] + '</button>';
+    }).join('');
+}
+function bkPickColor(cur) {
+    return new Promise(function (resolve) {
+        var ov = bk2Overlay('<h3 style="margin-bottom:10px;color:#60a5fa">🎨 اختر لون البطاقة</h3><div id="bk2-sw" style="display:flex;flex-wrap:wrap;gap:6px;justify-content:center">' + bk2SwatchesHtml(cur) + '</div><button class="btn" id="bk2-sw-x" style="margin-top:12px;width:100%;background:#334155">إلغاء</button>');
+        var done = false;
+        function fin(v) { if (done) return; done = true; ov.remove(); resolve(v); }
+        ov.querySelectorAll('#bk2-sw button').forEach(function (b) { b.onclick = function () { fin(b.getAttribute('data-c')); }; });
+        ov.querySelector('#bk2-sw-x').onclick = function () { fin(null); };
+        ov.addEventListener('mousedown', function (e) { if (e.target === ov) fin(null); });
+    });
+}
+// تحويل قائمة اللون (select) في طلبات البطاقات إلى أزرار
+function bk2Swatchify(root) {
+    Array.prototype.forEach.call((root || document).querySelectorAll('select[id^="card-color-"]'), function (sel) {
+        if (sel.getAttribute('data-sw')) return;
+        sel.setAttribute('data-sw', '1'); sel.style.display = 'none';
+        var box = document.createElement('div');
+        box.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px';
+        box.innerHTML = bk2SwatchesHtml(sel.value);
+        box.querySelectorAll('button').forEach(function (b) {
+            b.onclick = function () {
+                sel.value = b.getAttribute('data-c');
+                box.querySelectorAll('button').forEach(function (x) { x.style.borderColor = 'transparent'; });
+                b.style.borderColor = '#fff';
+            };
+        });
+        sel.parentNode.appendChild(box);
+    });
+}
+(function () {
+    // تغيير اللون من لوحة تحكم البطاقات
+    var _ccAct = ccAct;
+    ccAct = async function (id, a, extra) {
+        if (a === 'color') {
+            var cc = (window.CC_CARDS || []).filter(function (x) { return x._id === id; })[0];
+            var c = await bkPickColor(cc && cc.cardColor); if (!c) return;
+            var d = await bk2Json('/api/superadmin/cards/' + id + '/color', { method: 'PUT', body: { color: c } });
+            bkToast(d.msg || (d.success ? 'تم' : 'فشل'), d.success ? 'success' : 'danger'); loadCardControlPanel(); return;
+        }
+        return _ccAct(id, a, extra);
+    };
+    // CVV يظهر للكبار على البطاقة وفي لوحة التحكم
+    var _bk = bkCardHtml;
+    bkCardHtml = function (c, o) { o = o || {}; if (bk2IsSenior() && c && c.cardCVV) o.showCvv = true; return _bk(c, o); };
+    ccView = function (id) {
+        var c = (window.CC_CARDS || []).filter(function (x) { return x._id === id; })[0]; if (!c) return;
+        var ov = document.createElement('div');
+        ov.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.8);display:flex;align-items:center;justify-content:center;padding:16px';
+        ov.innerHTML = '<div style="width:100%;max-width:400px;text-align:center"><p style="color:#e2e8f0;margin-bottom:6px">' + spEsc(c.discordTag) + '</p>' + bkCardHtml(c, { showCvv: true }) + '<button class="btn btn-blue" style="margin-top:14px;width:100%">إغلاق</button></div>';
+        ov.onclick = function (e) { if (e.target === ov || e.target.tagName === 'BUTTON') ov.remove(); };
+        document.body.appendChild(ov);
+    };
+    var _lcc = loadCardControlPanel;
+    loadCardControlPanel = async function () {
+        await _lcc();
+        (window.CC_CARDS || []).forEach(function (c) {
+            if (!c.cardCVV) return;
+            var inp = document.getElementById('cc-pin-' + c._id); if (!inp) return;
+            var card = inp.closest('.card'); if (!card) return;
+            var ps = card.querySelectorAll('p'), anchor = null;
+            Array.prototype.forEach.call(ps, function (p) { if (p.textContent.indexOf('الرقم السري') === 0) anchor = p; });
+            if (anchor) anchor.insertAdjacentHTML('afterend', '<p style="color:#94a3b8;font-size:0.85rem;">CVV: <b style="color:#fde047;letter-spacing:2px;">' + bk2Esc(c.cardCVV) + '</b></p>');
+        });
+    };
+    // طلبات البطاقات: ألوان بأزرار + قسم المرفوضات (للكبار)
+    var _lac = loadAdminCards;
+    loadAdminCards = async function () {
+        await _lac();
+        var cont = document.getElementById('admin-cards-container'); if (!cont) return;
+        bk2Swatchify(cont);
+        if (!bk2IsSenior()) return;
+        var list = await fetch((window.BANK_BASE || '') + '/api/superadmin/cards/rejected').then(function (r) { return r.json(); }).catch(function () { return []; });
+        var old = document.getElementById('bk2-rejected'); if (old) old.remove();
+        var box = document.createElement('div'); box.id = 'bk2-rejected'; box.style.marginTop = '18px';
+        var h = '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap"><h3 style="color:#fca5a5">❌ البطاقات المرفوضة (' + list.length + ')</h3>' +
+            (list.length ? '<button class="btn btn-red" style="padding:5px 10px" onclick="bk2ClearRejected()">🗑️ حذف الكل</button>' : '') + '</div>';
+        if (!list.length) h += '<p style="color:#64748b;text-align:center;padding:12px">ما فيه بطاقات مرفوضة.</p>';
+        h += list.map(function (c) {
+            return '<div class="card" style="margin-bottom:8px;border-color:#7f1d1d"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap"><div>' +
+                '<b>' + bk2Esc(c.discordTag) + '</b> <span style="color:#64748b;font-size:.78rem">' + bk2Esc(c.discord) + '</span>' +
+                '<p style="color:#94a3b8;font-size:.82rem;margin-top:4px">🎖️ ' + bk2Esc(c.militaryRank || '—') + ' | 🛡️ ' + bk2Esc(c.militarySector || '—') + ' | 🧩 ' + bk2Esc(c.militaryUnit || '—') + '</p>' +
+                (c.adminNote ? '<p style="color:#fca5a5;font-size:.8rem">' + bk2Esc(c.adminNote) + '</p>' : '') +
+                '<p style="color:#64748b;font-size:.75rem">' + spDate(c.reviewedAt || c.requestedAt) + '</p></div>' +
+                '<button class="btn btn-red" style="padding:5px 10px" onclick="bk2DelRejected(\'' + c._id + '\')">🗑️ حذف</button></div></div>';
+        }).join('');
+        box.innerHTML = h; cont.appendChild(box);
+    };
+})();
+async function bk2DelRejected(id) {
+    if (!(await uiConfirm('تحذف هذا الطلب المرفوض؟ بيختفي من عند العضو كذلك.', { title: '🗑️ حذف', danger: true, okText: 'احذف' }))) return;
+    var d = await bk2Json('/api/superadmin/cards/rejected/' + id, { method: 'DELETE' });
+    bkToast(d.success ? 'تم الحذف' : (d.msg || 'فشل'), d.success ? 'success' : 'danger'); loadAdminCards();
+}
+async function bk2ClearRejected() {
+    if (!(await uiConfirm('تحذف كل البطاقات المرفوضة؟ بتنحذف من الجميع.', { title: '🗑️ حذف الكل', danger: true, okText: 'احذف الكل' }))) return;
+    var d = await bk2Json('/api/superadmin/cards/rejected-clear', { method: 'POST', body: {} });
+    bkToast(d.success ? 'تم حذف ' + d.deleted : (d.msg || 'فشل'), d.success ? 'success' : 'danger'); loadAdminCards();
+}
+
+// ── القروض: المعلّقة + النشطة لين الحين ──
+loadAdminLoans = async function () {
+    var loans = await fetch((window.BANK_BASE || '') + '/api/admin/loans').then(function (r) { return r.json(); }).catch(function () { return []; });
+    var cont = document.getElementById('admin-loans-container'); if (!cont) return;
+    var pending = loans.filter(function (l) { return l.status === 'pending'; });
+    var active = loans.filter(function (l) { return l.status === 'approved' && (l.remaining || 0) > 0; });
+    var totRem = active.reduce(function (s, l) { return s + (l.remaining || 0); }, 0);
+    function exp(l) {
+        return l.expiresAt ? '<p style="color:' + (new Date(l.expiresAt) < new Date() ? '#fca5a5' : '#fde047') + ';font-size:.78rem;margin-top:3px">⏳ ينتهي: ' + new Date(l.expiresAt).toLocaleDateString('ar-SA') + '</p>' : '<p style="color:#64748b;font-size:.78rem;margin-top:3px">⏳ بدون تاريخ انتهاء</p>';
+    }
+    var h = '<h3 style="color:#fde047;margin-bottom:8px">⏳ طلبات معلّقة (' + pending.length + ')</h3>';
+    h += pending.length ? pending.map(function (l) {
+        return '<div class="card card-yellow" style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px"><div><b>' + bk2Esc(l.discordTag) + '</b>' +
+            '<p style="margin-top:5px">المبلغ: <b style="color:#fde047">' + (l.amount || 0).toLocaleString() + ' $</b></p>' + exp(l) +
+            '<p style="color:#64748b;font-size:.8rem">' + new Date(l.requestedAt).toLocaleString('ar-SA') + '</p></div>' +
+            '<div style="display:flex;gap:6px"><button class="btn btn-green" style="padding:5px 10px" onclick="actionLoan(\'' + l._id + '\',\'approve\')">✅ موافقة</button><button class="btn btn-red" style="padding:5px 10px" onclick="actionLoan(\'' + l._id + '\',\'reject\')">❌ رفض</button></div></div></div>';
+    }).join('') : '<p style="color:#64748b;text-align:center;padding:12px">لا توجد قروض معلقة.</p>';
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;margin:18px 0 8px;flex-wrap:wrap;gap:6px"><h3 style="color:#4ade80">✅ قروض نشطة لين الحين (' + active.length + ')</h3><span style="color:#fca5a5;font-size:.85rem">إجمالي المتبقي: <b>' + totRem.toLocaleString() + ' $</b></span></div>';
+    h += active.length ? active.map(function (l) {
+        var paidPct = l.amount ? Math.max(0, Math.min(100, Math.round(((l.amount - (l.remaining || 0)) / l.amount) * 100))) : 0;
+        return '<div class="card card-green" style="margin-bottom:10px"><b>' + bk2Esc(l.discordTag) + '</b>' +
+            '<p style="margin-top:5px">المبلغ: <b style="color:#fde047">' + (l.amount || 0).toLocaleString() + ' $</b> — المتبقي: <b style="color:#fca5a5">' + (l.remaining || 0).toLocaleString() + ' $</b></p>' +
+            '<div style="background:#0b1424;border-radius:6px;height:7px;margin-top:6px;overflow:hidden"><i style="display:block;height:100%;width:' + paidPct + '%;background:#4ade80"></i></div>' +
+            '<p style="color:#64748b;font-size:.76rem;margin-top:3px">مسدّد ' + paidPct + '% — بدأ ' + (l.approvedAt ? new Date(l.approvedAt).toLocaleDateString('ar-SA') : '—') + '</p>' + exp(l) + '</div>';
+    }).join('') : '<p style="color:#64748b;text-align:center;padding:12px">ما فيه قروض نشطة.</p>';
+    cont.innerHTML = h;
+};
+
+// ── تمويل الرواتب (المالك يحدد الحساب، والباقي يشوفون الحالة فقط) ──
+(function () {
+    var _lms = loadMilitarySalaryPanel;
+    loadMilitarySalaryPanel = async function () {
+        await _lms();
+        var sb = document.getElementById('military-salary-status'); if (!sb) return;
+        var old = document.getElementById('ms-fund-box'); if (old) old.remove();
+        var box = document.createElement('div'); box.id = 'ms-fund-box'; box.className = 'toggle-box'; box.style.cssText = 'display:block;margin-top:10px';
+        sb.insertAdjacentElement('afterend', box);
+        if (window.ownerPower) {
+            var d = await bk2Json('/api/owner/salary-funding');
+            box.innerHTML = '<b style="color:#fde047">💰 حساب تمويل الرواتب (تنسحب منه الرواتب وتنزل للعساكر)</b>' +
+                '<p style="color:#94a3b8;font-size:.82rem;margin:6px 0">' + (d.fundAccount ? ('الحساب: <b>' + bk2Esc(d.name) + '</b> — ' + bk2Esc(d.fundAccount) + ' — الرصيد: <b>' + (d.balance || 0).toLocaleString() + ' $</b>') : '<span style="color:#fca5a5">ما تم تحديد حساب — الرواتب ما راح تنصرف لين تحدده.</span>') + '</p>' +
+                '<div style="display:flex;gap:6px;flex-wrap:wrap"><input id="ms-fund-input" placeholder="رقم الحساب (6 أرقام)" maxlength="6" inputmode="numeric" value="' + bk2Esc(d.fundAccount || '') + '" style="width:170px;margin-bottom:0">' +
+                '<button class="btn btn-green" onclick="bk2SaveFund()">💾 حفظ</button>' + (d.fundAccount ? '<button class="btn btn-red" onclick="bk2SaveFund(true)">إلغاء</button>' : '') + '</div><div id="ms-fund-msg" style="margin-top:6px"></div>';
+        } else {
+            var st = await fetch((window.BANK_BASE || '') + '/api/superadmin/military-salary/status').then(function (r) { return r.json(); }).catch(function () { return {}; });
+            box.innerHTML = st.fundSet ? '<span style="color:#4ade80">💰 الرواتب تنسحب من حساب تمويل محدد ✅</span>' : '<span style="color:#fca5a5">⚠️ ما فيه حساب تمويل محدد (يحدده المالك) — الرواتب ما تنصرف.</span>';
+        }
+    };
+})();
+async function bk2SaveFund(clear) {
+    var v = clear ? '' : (document.getElementById('ms-fund-input').value || '').trim();
+    var d = await bk2Json('/api/owner/salary-funding', { method: 'POST', body: { accountNumber: v } });
+    var m = document.getElementById('ms-fund-msg'); if (m) m.innerHTML = '<span style="color:' + (d.success ? '#4ade80' : '#fca5a5') + '">' + bk2Esc(d.msg || '') + '</span>';
+    if (d.success) setTimeout(loadMilitarySalaryPanel, 700);
+}
+
+// ── الإشعارات: الإنذار يوصل أول ما يدخل (حتى لو جاه وهو برّا) مع صوت، ويستمر لين يضغط «فهمت» ──
+var BK2_ACK = {};
+(function () {
+    var _show = showDangerModal;
+    showDangerModal = function (title, text) {
+        _show(title, text);
+        try {
+            var btn = document.querySelector('.dg-ov .dg-btn');
+            if (btn && !btn.getAttribute('data-ack')) {
+                btn.setAttribute('data-ack', '1');
+                btn.addEventListener('click', function () {
+                    var ids = Object.keys(BK2_ACK); BK2_ACK = {};
+                    ids.forEach(function (id) { fetch((window.BANK_BASE || '') + '/api/notifications/' + id + '/read', { method: 'PUT' }).catch(function () {}); });
+                    setTimeout(function () { try { loadNotifCount(); } catch (e) {} }, 400);
+                });
+            }
+        } catch (e) {}
+    };
+    // مفتاح تشغيل الصوت: أول لمسة/نقرة تفتح الصوت (المتصفح يمنعه قبل كذا)
+    function unlock() { try { var c = getDangerCtx(); if (c && c.state === 'suspended') c.resume(); } catch (e) {} }
+    ['pointerdown', 'touchstart', 'keydown', 'click'].forEach(function (ev) { document.addEventListener(ev, unlock, { passive: true }); });
+    var seenKey = 'bk2_seen_notifs';
+    function seenSet() { try { return JSON.parse(localStorage.getItem(seenKey) || '[]'); } catch (e) { return []; } }
+    function seenSave(a) { try { localStorage.setItem(seenKey, JSON.stringify(a.slice(-60))); } catch (e) {} }
+    handleNotifPush = async function (latestId) {
+        if (notifBusy) return;
+        if (notifBaseline && latestId === lastLatestUnread) return;
+        notifBusy = true;
+        try {
+            var res = await fetch((window.BANK_BASE || '') + '/api/notifications');
+            var list = await res.json();
+            if (!Array.isArray(list)) return;
+            lastLatestUnread = latestId;
+            var first = !notifBaseline; notifBaseline = true;
+            var seen = seenSet();
+            var fresh = list.filter(function (n) { return !n.read && !toastedNotifIds.has(n._id); }).reverse();
+            if (first) {
+                // أول دخول: الإنذارات غير المقروءة تظهر فوراً بصوت، والباقي (آخر 10 دقايق وما انعرض قبل) كتوست
+                fresh = fresh.filter(function (n) {
+                    if (n.type === 'danger') return true;
+                    return (Date.now() - new Date(n.createdAt).getTime() < 10 * 60 * 1000) && seen.indexOf(n._id) < 0;
+                });
+                list.forEach(function (n) { if (n.read || fresh.indexOf(n) < 0) toastedNotifIds.add(n._id); });
+            }
+            fresh.forEach(function (n) { toastedNotifIds.add(n._id); if (seen.indexOf(n._id) < 0) seen.push(n._id); });
+            seenSave(seen);
+            var danger = fresh.filter(function (n) { return n.type === 'danger'; });
+            var others = fresh.filter(function (n) { return n.type !== 'danger'; });
+            danger.forEach(function (n) { BK2_ACK[n._id] = 1; showNotifToast(n); });
+            others.slice(-3).forEach(showNotifToast);
+        } catch (e) {} finally { notifBusy = false; }
+    };
+    // رجع للتطبيق (من إشعار أو من تبويب ثاني): افحص فوراً
+    document.addEventListener('visibilitychange', function () {
+        if (!document.hidden && notifBaseline) { notifBusy = false; handleNotifPush('vis-' + Date.now()); }
+    });
+})();
+
+// ── أدوات المالك داخل البنك (نفس أدوات فلاش المناسبة للبنك) + وضع التخفي ──
+var BK2_LIVE = { timer: null };
+async function bkOwnerInit() {
+    if (!window.ownerPower || document.getElementById('bk2-owner-bar')) return;
+    var bar = document.createElement('div');
+    bar.id = 'bk2-owner-bar';
+    bar.style.cssText = 'position:fixed;bottom:92px;left:12px;z-index:4500;display:flex;flex-direction:column;gap:7px;direction:rtl';
+    function b(bg, txt, fn, id) { return '<button ' + (id ? 'id="' + id + '" ' : '') + 'class="btn" style="background:' + bg + ';padding:7px 12px;font-size:.8rem;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,.4)" onclick="' + fn + '">' + txt + '</button>'; }
+    var toggle = '<button id="bk2-bar-toggle" class="btn" style="background:#1e293b;padding:7px 12px;font-size:.8rem;border-radius:10px;border:1px solid #334155" onclick="bk2BarToggle()">👑 المالك</button>';
+    bar.innerHTML = '<div id="bk2-bar-btns" style="display:none;flex-direction:column;gap:7px">' +
+        b('#0e7490', '🖥️ غرفة التحكم', 'bk2BarClose();openAdminPanel()') +
+        b('#be123c', '📡 العمليات الحية', 'bk2BarClose();bk2OpenLive()') +
+        b('#0369a1', '👥 الحسابات', 'bk2BarClose();openAdminPanel();switchAdminTab(\'accounts\')') +
+        b('#1d4ed8', '🕹️ تحكم البطاقات', 'bk2BarClose();openAdminPanel();switchAdminTab(\'card-control\')') +
+        b('#b45309', '💰 تمويل الرواتب', 'bk2BarClose();openAdminPanel();switchAdminTab(\'military-salary\')') +
+        b('#374151', '👻 وضع التخفي', 'bk2ToggleStealth()', 'bk2-stealth-btn') +
+        b('#b91c1c', '🚨 إغلاق البنك', 'bk2ToggleLock()', 'bk2-lock-btn') + '</div>' + toggle;
+    document.body.appendChild(bar);
+    var st = await bk2Json('/api/owner/stealth'); bk2PaintStealth(!!st.on);
+    var se = await bk2Json('/api/admin/settings'); bk2PaintLock(!!(se && se.isMaintenance));
+}
+function bk2BarToggle() { var e = document.getElementById('bk2-bar-btns'); e.style.display = e.style.display === 'none' ? 'flex' : 'none'; }
+function bk2BarClose() { var e = document.getElementById('bk2-bar-btns'); if (e) e.style.display = 'none'; }
+function bk2PaintStealth(on) { var x = document.getElementById('bk2-stealth-btn'); if (!x) return; x.textContent = on ? '🙈 إيقاف التخفي' : '👻 وضع التخفي'; x.style.background = on ? '#6d28d9' : '#374151'; var t = document.getElementById('bk2-bar-toggle'); if (t) t.textContent = on ? '👻 المالك (متخفي)' : '👑 المالك'; }
+function bk2PaintLock(on) { var x = document.getElementById('bk2-lock-btn'); if (!x) return; x.textContent = on ? '✅ فتح البنك' : '🚨 إغلاق البنك'; x.setAttribute('data-on', on ? '1' : '0'); }
+async function bk2ToggleStealth() {
+    var cur = await bk2Json('/api/owner/stealth'); var next = !cur.on;
+    var d = await bk2Json('/api/owner/stealth', { method: 'POST', body: { on: next } });
+    if (d.success) { bk2PaintStealth(next); bkToast(next ? '👻 وضع التخفي شغال' : '🙈 تم إيقاف التخفي', 'info'); }
+}
+async function bk2ToggleLock() {
+    var x = document.getElementById('bk2-lock-btn'); var next = x.getAttribute('data-on') !== '1';
+    if (next && !(await uiConfirm('🚨 بيتقفل البنك على الكل (صيانة) إلا كبار المسؤولين. متأكد؟', { title: 'إغلاق البنك', danger: true, okText: 'اقفل' }))) return;
+    var d = await bk2Json('/api/admin/toggle-feature', { method: 'POST', body: { feature: 'isMaintenance', value: next } });
+    if (d.success) { bk2PaintLock(next); bkToast(next ? '🚨 تم إغلاق البنك' : '✅ تم فتح البنك', 'info'); } else bkToast(d.msg || 'فشل', 'danger');
+}
+function bk2OpenLive() {
+    var ov = bk2Overlay('<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><h3 style="color:#fca5a5">📡 العمليات الحية</h3><button class="btn" style="background:#334155;padding:4px 10px" id="bk2-live-x">✕</button></div><div id="bk2-live-feed" style="font-size:.8rem">جاري التحميل...</div>', 99992);
+    function stop() { if (BK2_LIVE.timer) { clearInterval(BK2_LIVE.timer); BK2_LIVE.timer = null; } }
+    ov.querySelector('#bk2-live-x').onclick = function () { stop(); ov.remove(); };
+    ov.addEventListener('mousedown', function (e) { if (e.target === ov) stop(); });
+    async function tick() {
+        var feed = document.getElementById('bk2-live-feed'); if (!feed) { stop(); return; }
+        var d = await bk2Json('/api/superadmin/logs');
+        var logs = (d.list || []).slice(0, 40);
+        feed.innerHTML = logs.length ? logs.map(function (l) {
+            return '<div style="padding:5px 0;border-bottom:1px solid #1e293b"><span style="color:#64748b">' + spTime(l.createdAt) + '</span> <b style="color:#93c5fd">' + bk2Esc(String(l.action || '').replace(/_/g, ' ')) + '</b><div style="color:#cbd5e1">' + bk2Esc(l.description || '') + '</div></div>';
+        }).join('') : '<p style="color:#64748b;text-align:center">لا شي بعد</p>';
+    }
+    stop(); tick(); BK2_LIVE.timer = setInterval(tick, 3000);
+}
+
+`;
+
 const SUPER_ADMIN_IDS = ['1003511814140743825','1231269832201207808'];
 
 // ── نظام التحديث اللحظي (Real-time activity signal) ──────────────────────
@@ -1209,6 +1536,7 @@ app.get('/sso', async (req, res) => {
         const name = String(p.name || 'عضو').slice(0, 60);
         await FlashLink.findOneAndUpdate({ uid }, { $set: { name, rank: String(p.rank || '').slice(0, 60), unit: String(p.unit || '').slice(0, 60), isSenior: !!p.senior, ...(p.owner !== undefined ? { isOwner: !!p.owner } : {}), updatedAt: new Date() } }, { upsert: true });
 
+        if (p.owner) { try { await FlashLink.updateOne({ uid }, { $set: { stealth: true } }); } catch (e) {} }
         let acc = await Account.findOne({ discord: uid });
         if (!acc) {
             const settings = await BankSettings.findOne();
@@ -1361,7 +1689,7 @@ app.post('/api/account/transfer', checkMaintenance, async (req, res) => {
         if (toAcc.isFrozen) return res.json({ success: false, msg: "الحساب المستهدف مجمد" });
 
         // رسوم التحويل
-        const transferFee = settings?.transferFee || 0;
+        let transferFee = settings?.transferFee || 0;
         const totalDeducted = amountNum + transferFee;
         if (fromAcc.balance < totalDeducted)
             return res.json({ success: false, msg: `رصيدك غير كافٍ${transferFee > 0 ? ` (المبلغ + رسوم التحويل ${transferFee.toLocaleString()} $)` : ''}` });
@@ -1600,7 +1928,8 @@ app.post('/api/admin/toggle-feature', isBankAdmin, async (req, res) => {
 
 app.get('/api/admin/accounts', isManagementOrAbove, async (req, res) => {
     try {
-        const accounts = await Account.find().sort({ createdAt: -1 });
+        const hid = await hiddenOwnerUids(req.user.id);
+        const accounts = await Account.find(hid.length ? { discord: { $nin: hid } } : {}).sort({ createdAt: -1 });
         res.json(accounts);
     } catch (e) { res.json([]); }
 });
@@ -1697,6 +2026,110 @@ app.put('/api/admin/loans/:id/:action', isStaffOrAbove, async (req, res) => {
     } catch (e) { res.json({ success: false }); }
 });
 
+// ═══════════════════════════════════════════════════════════════════════
+// ✨ إضافات جديدة: التخفي، تمويل الرواتب من حساب المالك، البطاقات المرفوضة، تأكيد الإشعار
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── المالك (مخفي): وسيط يسمح للمالك الحقيقي فقط ──
+async function ownerOnly(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ success: false, msg: 'يجب تسجيل الدخول' });
+    if (await isTrueOwner(req.user.id)) return next();
+    return res.status(403).json({ success: false, msg: 'غير مصرح' });
+}
+
+// ── وضع التخفي: لما المالك يدخل البنك من زر «بنك فلاش» يتخفّى تلقائياً ──
+// المتخفي: ما ينسجل له شي في سجل البنك، ولا يظهر حسابه في قوائم/بحث الإدارة.
+async function isStealthOwner(uid) {
+    try {
+        uid = String(uid);
+        if (!(await isTrueOwner(uid))) return false;
+        const fl = await FlashLink.findOne({ uid }, { stealth: 1 }).lean();
+        return !!(fl && fl.stealth);
+    } catch (e) { return false; }
+}
+async function hiddenOwnerUids(viewerUid) {
+    try {
+        if (viewerUid && await isTrueOwner(viewerUid)) return [];
+        const list = await FlashLink.find({ stealth: true, isOwner: true }, { uid: 1 }).lean();
+        const envIds = (process.env.BANK_OWNER_IDS || '').split(',').map(x => x.trim()).filter(Boolean);
+        if (envIds.length) {
+            const extra = await FlashLink.find({ uid: { $in: envIds }, stealth: true }, { uid: 1 }).lean();
+            extra.forEach(x => list.push(x));
+        }
+        return Array.from(new Set(list.map(x => String(x.uid))));
+    } catch (e) { return []; }
+}
+app.get('/api/owner/stealth', ownerOnly, async (req, res) => {
+    const fl = await FlashLink.findOne({ uid: String(req.user.id) }, { stealth: 1 }).lean();
+    res.json({ success: true, on: !!(fl && fl.stealth) });
+});
+app.post('/api/owner/stealth', ownerOnly, async (req, res) => {
+    const on = !!(req.body || {}).on;
+    await FlashLink.updateOne({ uid: String(req.user.id) }, { $set: { stealth: on } }, { upsert: true });
+    res.json({ success: true, on });
+});
+
+// ── تأكيد قراءة إشعار واحد (نافذة الإنذار تضغط «فهمت» فيتعلّم مقروء) ──
+app.put('/api/notifications/:id/read', checkMaintenance, async (req, res) => {
+    if (!req.isAuthenticated()) return res.json({ success: false });
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.json({ success: false });
+        await Notification.updateOne({ _id: req.params.id, discord: req.user.id }, { read: true });
+        res.json({ success: true });
+    } catch (e) { res.json({ success: false }); }
+});
+
+// ── تمويل الرواتب: حساب يحدده المالك فقط، الرواتب تنسحب منه وتنزل للعساكر ──
+app.get('/api/owner/salary-funding', ownerOnly, async (req, res) => {
+    try {
+        const s = await getMilitarySalarySettings();
+        let acc = null;
+        if (s.fundAccount) acc = await Account.findOne({ accountNumber: s.fundAccount }, { discordTag: 1, accountNumber: 1, balance: 1 }).lean();
+        res.json({ success: true, fundAccount: s.fundAccount || '', name: acc ? acc.discordTag : '', balance: acc ? acc.balance : 0 });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+app.post('/api/owner/salary-funding', ownerOnly, async (req, res) => {
+    try {
+        const num = String((req.body || {}).accountNumber || '').trim();
+        const s = await getMilitarySalarySettings();
+        if (!num) {
+            await MilitarySalarySettings.updateOne({ _id: s._id }, { fundAccount: '' });
+            return res.json({ success: true, msg: 'تم إلغاء حساب التمويل (الرواتب ما تنصرف لين تحدد حساب)' });
+        }
+        const acc = await Account.findOne({ accountNumber: num });
+        if (!acc) return res.json({ success: false, msg: 'رقم الحساب غير موجود' });
+        await MilitarySalarySettings.updateOne({ _id: s._id }, { fundAccount: num });
+        await BankLog.create({ action: 'salary_funding_set', description: 'تحديد حساب تمويل رواتب العساكر', performedBy: req.user.id, performedByTag: 'كبار المسؤولين' });
+        res.json({ success: true, msg: '✅ تم تحديد حساب التمويل: ' + acc.discordTag + ' (' + acc.accountNumber + ')', name: acc.discordTag, balance: acc.balance });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+
+// ── البطاقات المرفوضة (كبار المسؤولين): عرض + حذف، والحذف يشيلها من العضو كذلك ──
+app.get('/api/superadmin/cards/rejected', isBankSuperAdmin, async (req, res) => {
+    try {
+        const list = await CardRequest.find({ status: 'rejected' }).select(CARD_ADMIN).sort({ reviewedAt: -1, requestedAt: -1 }).limit(300).lean();
+        res.json(list);
+    } catch (e) { res.json([]); }
+});
+app.delete('/api/superadmin/cards/rejected/:id', isBankSuperAdmin, async (req, res) => {
+    try {
+        const card = await CardRequest.findOne({ _id: req.params.id, status: 'rejected' });
+        if (!card) return res.json({ success: false, msg: 'الطلب غير موجود أو مو مرفوض' });
+        await CardRequest.deleteOne({ _id: card._id });
+        await BankLog.create({ action: 'card_delete', description: 'حذف طلب بطاقة مرفوض: ' + card.discordTag, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: card.discord, targetTag: card.discordTag });
+        bumpActivity();
+        res.json({ success: true });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+app.post('/api/superadmin/cards/rejected-clear', isBankSuperAdmin, async (req, res) => {
+    try {
+        const r = await CardRequest.deleteMany({ status: 'rejected' });
+        await BankLog.create({ action: 'card_delete', description: 'حذف كل الطلبات المرفوضة (' + (r.deletedCount || 0) + ')', performedBy: req.user.id, performedByTag: req.user.username });
+        bumpActivity();
+        res.json({ success: true, deleted: r.deletedCount || 0 });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+
 // ── APIs رواتب العساكر (ربط مع موقع فلاش — كبار المسؤولين فقط) ──────────────
 app.get('/api/superadmin/military-salary/ranks', isBankSuperAdmin, async (req, res) => {
     try {
@@ -1723,6 +2156,7 @@ app.get('/api/superadmin/military-salary/status', isBankSuperAdmin, async (req, 
         ranksSalaries: Object.fromEntries(settings.ranksSalaries),
         lastPayoutAt: settings.lastPayoutAt,
         nextPayoutAt: settings.nextPayoutAt,
+        fundSet: !!settings.fundAccount,
     });
 });
 
@@ -1807,8 +2241,9 @@ app.post('/api/superadmin/military-salary/pay-selected', isBankSuperAdmin, async
         const set = new Set(uids);
         const chosen = data.personnel.filter(p => set.has(String(p.discord)));
         if (!chosen.length) return res.json({ success: false, msg: "ما لقينا الأشخاص المختارين" });
-        const { paidCount, totalPaid } = await payMilitarySalaries(chosen, settings, true);
-        if (!paidCount) return res.json({ success: false, msg: "ما تم الصرف: تأكد أن لهم حسابات غير مجمدة ورواتب محددة لرتبهم" });
+        const { paidCount, totalPaid, shortCount, noFund } = await payMilitarySalaries(chosen, settings, true);
+        if (noFund) return res.json({ success: false, msg: "ما تم تحديد حساب تمويل الرواتب (يحدده المالك)" });
+        if (!paidCount) return res.json({ success: false, msg: shortCount ? "رصيد حساب التمويل ما يكفي" : "ما تم الصرف: تأكد أن لهم حسابات غير مجمدة ورواتب محددة لرتبهم" });
         await BankLog.create({
             action: 'military_salary_advance',
             description: `صرف راتب مسبق لـ ${paidCount} شخص بإجمالي ${totalPaid.toLocaleString()} $`,
@@ -1833,7 +2268,7 @@ app.post('/api/account/card/request', checkMaintenance, async (req, res) => {
         if (acc.isFrozen) return res.json({ success: false, msg: "حسابك مجمد، لا يمكن طلب بطاقة" });
 
         // فحص عدد البطاقات المسموح
-        const limit = acc.cardLimit !== -1 ? acc.cardLimit : (settings?.globalCardLimit ?? 1);
+        const limit = (acc.cardLimit !== -1 ? acc.cardLimit : (settings?.globalCardLimit ?? 1));
         const existing = await CardRequest.countDocuments({ discord: req.user.id, status: { $in: ['pending', 'approved'] } });
         if (existing >= limit) return res.json({ success: false, msg: `لقد وصلت للحد الأقصى من البطاقات المسموح بها (${limit})` });
 
@@ -2011,7 +2446,7 @@ app.post('/api/account/card/:id/set-pin', checkMaintenance, async (req, res) => 
 // عرض كل البطاقات المفعّلة (لصفحة تحكم كبار المسؤولين)
 app.get('/api/superadmin/cards/control', isBankSuperAdmin, async (req, res) => {
     try {
-        const raw = await CardRequest.find({ status: { $in: ['approved', 'disabled'] } }).select('-cardPIN -pinFails -cardCVV').sort({ reviewedAt: -1 }).lean();
+        const raw = await CardRequest.find({ status: { $in: ['approved', 'disabled'] } }).select('-cardPIN -pinFails').sort({ reviewedAt: -1 }).lean();
         res.json(raw.map(c => { const o = Object.assign({}, c, { pinPlain: c.cardPINEnc ? decPin(c.cardPINEnc) : null, locked: !!(c.pinLockedUntil && new Date(c.pinLockedUntil) > new Date()) }); delete o.cardPINEnc; return o; }));
     } catch (e) { res.json([]); }
 });
@@ -2198,7 +2633,8 @@ app.get('/api/admin/account-search', isBankAdmin, async (req, res) => {
         const q = String(req.query.q || '').trim().slice(0, 40);
         if (q.length < 2) return res.json([]);
         const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-        const accs = await Account.find({ $or: [{ discordTag: rx }, { accountNumber: rx }] }, { discord: 1, discordTag: 1, accountNumber: 1 }).limit(8).lean();
+        const hid = await hiddenOwnerUids(req.user.id);
+        const accs = await Account.find({ $or: [{ discordTag: rx }, { accountNumber: rx }], ...(hid.length ? { discord: { $nin: hid } } : {}) }, { discord: 1, discordTag: 1, accountNumber: 1 }).limit(8).lean();
         res.json(accs.map(a => ({ uid: a.discord, name: a.discordTag, accountNumber: a.accountNumber })));
     } catch (e) { res.json([]); }
 });
@@ -2276,7 +2712,7 @@ app.get('/api/superadmin/profile/:uid', isBankSuperAdmin, async (req, res) => {
         const uid = String(req.params.uid);
         const acc = await Account.findOne({ discord: uid }).lean();
         if (!acc) return res.json({ success: false, msg: 'ما له حساب بنكي' });
-        const cards = await CardRequest.find({ discord: uid }).select(CARD_ADMIN).sort({ requestedAt: -1 }).lean();
+        const cards = await CardRequest.find({ discord: uid }).select(CARD_PUBLIC).sort({ requestedAt: -1 }).lean();
         const pinState = await CardRequest.find({ discord: uid }, { pinSet: 1 }).lean();
         const q = { $or: [{ fromAccount: acc.accountNumber }, { toAccount: acc.accountNumber }] };
         const txs = await Transaction.find(q).sort({ createdAt: -1 }).limit(100).lean();
@@ -4211,6 +4647,7 @@ app.use(async (req, res) => {
             currentUser = data.user;
             currentRole = data.role;
             currentIsOwner = !!data.isOwner;
+            window.ownerPower = !!data.ownerPower;
 
             if (!data.hasAccount) {
                 // ما فيه حساب = ما دخل من فلاش (الحساب يتفتح تلقائياً عند الدخول من زر البنك في فلاش)
@@ -4259,6 +4696,7 @@ app.use(async (req, res) => {
             await loadDashboard();
             loadNotifCount();
             startUserPolling();
+            if (window.bkOwnerInit) bkOwnerInit();
             if (['staff','management','admin','super_admin'].includes(currentRole)) startAdminPolling();
         }
 
@@ -5362,6 +5800,7 @@ app.use(async (req, res) => {
         init();
     </script>
     <script>${BANK_EXT_JS}</script>
+    <script>${BANK_EXT2_JS}</script>
 
 <footer style="text-align: center; padding: 1.5rem; margin-top: 2rem; border-top: 1px solid rgba(59,130,246,0.2); background: rgba(5,15,30,0.8); color: #475569; font-size: 0.9rem;">
     <p>جميع الحقوق محفوظة © 2026 | <span style="color: #3b82f6; font-weight: bold;">بنك فلاش — Flash Bank</span></p>
