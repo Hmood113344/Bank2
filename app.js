@@ -239,6 +239,7 @@ const BankSettingsSchema = new mongoose.Schema({
     loanExpiryApplyTo: { type: String, default: 'new' },  // 'new' | 'existing' | 'both'
     logClearUsed: { type: Boolean, default: false },
     notifWipeDone: { type: Boolean, default: false },
+    cardExpiryBackfill: { type: Boolean, default: false },
     supportCanned: { type: [{ title: String, text: String }], default: [] }
 });
 const BankSettings = mongoose.model("BankSettings", BankSettingsSchema);
@@ -343,7 +344,10 @@ setInterval(async () => {
     }
 }, 60 * 1000);
 
-const BANK_EXT_CSS = String.raw`.sp-row{background:rgba(255,255,255,.04);border:1px solid rgba(59,130,246,.2);border-radius:12px;padding:10px 12px;margin-bottom:8px;cursor:pointer}
+const BANK_EXT_CSS = String.raw`
+html,body{touch-action:manipulation;-webkit-text-size-adjust:100%}input,textarea,select{font-size:16px !important}
+.sp-chat{overflow:hidden}.sp-rate{max-height:42vh;overflow:auto;flex-shrink:0}.sp-msgs{min-height:120px}#supportModal .modal-content{overscroll-behavior:contain}
+.sp-row{background:rgba(255,255,255,.04);border:1px solid rgba(59,130,246,.2);border-radius:12px;padding:10px 12px;margin-bottom:8px;cursor:pointer}
 .sp-row .t1{display:flex;justify-content:space-between;align-items:center;gap:8px;font-weight:bold;font-size:.9rem}
 .sp-row .t2{color:#94a3b8;font-size:.8rem;margin-top:3px}
 .sp-badge{background:#ef4444;color:#fff;border-radius:10px;padding:0 7px;font-size:.7rem;margin-inline-start:6px}
@@ -375,10 +379,15 @@ const BANK_EXT_CSS = String.raw`.sp-row{background:rgba(255,255,255,.04);border:
 .bk-back{transform:rotateY(180deg);justify-content:flex-start;padding:16px 0}.bk-shine{position:absolute;inset:0;background:linear-gradient(115deg,transparent 30%,rgba(255,255,255,.14) 45%,transparent 60%);pointer-events:none}
 .bk-chip{width:44px;height:33px;border-radius:7px;background:linear-gradient(135deg,#fde68a,#b45309);box-shadow:inset 0 0 0 1px rgba(0,0,0,.25)}.bk-num{font-size:1.22rem;letter-spacing:3px;text-shadow:0 1px 3px rgba(0,0,0,.5)}
 .bk-lbl{font-size:.55rem;letter-spacing:1px}.bk-val{font-size:.85rem;text-transform:uppercase}.bk-net{display:flex}.bk-net i{width:26px;height:26px;border-radius:50%;background:rgba(239,68,68,.9);display:block}.bk-net i+i{background:rgba(250,204,21,.9);margin-left:-11px}
-.bk-mag{height:38px;background:#000;margin-top:6px}.bk-sig{flex:1;height:32px;background:repeating-linear-gradient(45deg,#e2e8f0,#e2e8f0 4px,#cbd5e1 4px,#cbd5e1 8px)}.bk-cvv{background:#fff;color:#000;padding:6px 10px;border-radius:4px;font-weight:bold;letter-spacing:2px}
+.bk-mag{height:46px;background:linear-gradient(180deg,#000,#1a1a1a 50%,#000);margin-top:8px;box-shadow:0 1px 0 rgba(255,255,255,.08)}.bk-game{margin:6px 14px 0;padding:5px 8px;border:1px solid #fca5a5;border-radius:6px;background:rgba(0,0,0,.45);color:#fecaca;font-size:.62rem;text-align:center;font-weight:bold;direction:rtl;line-height:1.5}.bk-sig{flex:1;height:32px;background:repeating-linear-gradient(45deg,#e2e8f0,#e2e8f0 4px,#cbd5e1 4px,#cbd5e1 8px)}.bk-cvv{background:#fff;color:#000;padding:6px 10px;border-radius:4px;font-weight:bold;letter-spacing:2px}
 .bk-frozen{position:absolute;top:10px;left:10px;background:rgba(0,0,0,.65);color:#fca5a5;font-size:.65rem;padding:3px 8px;border-radius:6px;z-index:2}.bk-gray{filter:grayscale(1);opacity:.65}
 `;
-const BANK_EXT_JS = String.raw`// ═══════════ إضافات البنك: خدمة العملاء + البطاقة + ملف العضو + اللوق ═══════════
+const BANK_EXT_JS = String.raw`
+// منع تكبير الشاشة (تطبيق)
+['gesturestart', 'gesturechange', 'gestureend'].forEach(function (ev) { document.addEventListener(ev, function (e) { e.preventDefault(); }, { passive: false }); });
+document.addEventListener('touchmove', function (e) { if (e.touches && e.touches.length > 1) e.preventDefault(); }, { passive: false });
+var _lt = 0; document.addEventListener('touchend', function (e) { var n = Date.now(); if (n - _lt < 350) e.preventDefault(); _lt = n; }, { passive: false });
+// ═══════════ إضافات البنك: خدمة العملاء + البطاقة + ملف العضو + اللوق ═══════════
 var BKB = function (u) { return (window.BANK_BASE || '') + u; };
 function spEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 function spTime(d) { try { return new Date(d).toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } }
@@ -768,13 +777,16 @@ function bkCardHtml(c, o) {
     var exp = c.cardExpiry ? new Date(c.cardExpiry).toLocaleDateString('en-US', { month: '2-digit', year: '2-digit' }) : '--/--';
     var num = String(c.cardNumber || '').replace(/\s/g, '').replace(/(.{4})/g, '$1 ').trim() || '#### #### #### ####';
     var bg = 'background:radial-gradient(circle at 85% 0%,' + th[0] + ' 0%,' + th[1] + ' 75%);';
-    var logo = '<svg viewBox="0 0 100 100" width="26" height="26" style="vertical-align:middle"><rect width="100" height="100" rx="22" fill="rgba(255,255,255,.14)"/><path fill="' + th[2] + '" d="M56 8 22 56h22l-6 36 40-52H54z"/></svg>';
+    var logo = '<svg viewBox="0 0 100 100" width="30" height="30" style="vertical-align:middle"><rect width="100" height="100" rx="22" fill="#fff"/><path transform="translate(10 10) scale(.8)" fill="#1d4ed8" d="M50 6 L92 30 H8 Z M16 38 h14 v38 h-14 Z M43 38 h14 v38 h-14 Z M70 38 h14 v38 h-14 Z M8 82 H92 V94 H8 Z"/></svg>';
     var front = '<div class="bk-face bk-front" style="' + bg + '"><div class="bk-shine"></div>' + (c.cardFrozen ? '<div class="bk-frozen">🔒 مجمّدة</div>' : '') +
         '<div style="display:flex;justify-content:space-between;align-items:center"><span style="font-weight:900;letter-spacing:2px;color:' + th[2] + '">' + logo + ' FLASH BANK</span><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="' + th[2] + '" stroke-width="1.8" stroke-linecap="round"><path d="M8 8a6 6 0 0 1 0 8M12 5a10 10 0 0 1 0 14M16 2a14 14 0 0 1 0 20" transform="rotate(0 12 12)"/></svg></div>' +
         '<div class="bk-chip"></div><div class="bk-num">' + spEsc(num) + '</div>' +
         '<div style="display:flex;justify-content:space-between;align-items:flex-end"><div><div class="bk-lbl" style="color:' + th[2] + '">CARD HOLDER</div><div class="bk-val">' + spEsc(c.cardHolderName || '---') + '</div></div><div><div class="bk-lbl" style="color:' + th[2] + '">VALID THRU</div><div class="bk-val">' + exp + '</div></div><div class="bk-net"><i></i><i></i></div></div></div>';
-    var back = '<div class="bk-face bk-back" style="' + bg + '"><div class="bk-mag"></div><div style="display:flex;align-items:center;gap:8px;margin:14px 14px 8px"><div class="bk-sig">' + (o.showCvv && c.cardCVV ? '' : '') + '</div><div class="bk-cvv">' + (o.showCvv && c.cardCVV ? spEsc(c.cardCVV) : '•••') + '</div></div><p style="font-size:.62rem;color:' + th[2] + ';margin:0 14px">🔐 الرقم السري غير مطبوع على البطاقة — احفظه ولا تعطيه أحد</p><p style="font-size:.6rem;color:rgba(255,255,255,.55);margin:6px 14px">بنك فلاش — هذه البطاقة للاستخدام داخل اللعبة فقط</p></div>';
-    return '<div class="bk-wrap ' + (c.cardFrozen ? 'bk-gray' : '') + '" onclick="this.classList.toggle(\'flip\')"><div class="bk-inner">' + front + back + '</div></div><p style="text-align:center;color:#64748b;font-size:.72rem;margin:4px 0 0">اضغط على البطاقة لقلبها</p>';
+    var back = '<div class="bk-face bk-back" style="' + bg + '"><div class="bk-mag"></div><div style="display:flex;align-items:center;gap:8px;margin:12px 14px 6px"><div class="bk-sig"></div><div class="bk-cvv">' + (o.showCvv && c.cardCVV ? spEsc(c.cardCVV) : '•••') + '</div></div>' +
+        '<p style="font-size:.6rem;color:rgba(255,255,255,.75);margin:2px 14px;direction:rtl;text-align:right">🔐 الرقم السري غير مطبوع — احفظه ولا تعطيه أحد</p>' +
+        '<div class="bk-game">⚠️ هذي بطاقة لعبة وليست بطاقة حقيقية — للاستخدام داخل اللعبة فقط<br><span style="font-family:Arial">THIS IS A GAME CARD — NOT A REAL BANK CARD</span></div>' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin:6px 14px 0;color:rgba(255,255,255,.7);font-size:.55rem"><span>FLASH BANK</span><span>CUSTOMER SERVICE: IN-GAME</span></div></div>';
+    return '<div class="bk-wrap ' + (c.cardFrozen ? 'bk-gray' : '') + '" onclick="this.classList.toggle(\'flip\')"><div class="bk-inner">' + front + back + '</div></div><p style="text-align:center;color:#64748b;font-size:.72rem;margin:4px 0 0">اضغط على البطاقة لقلبها</p><p style="text-align:center;color:#fca5a5;font-size:.74rem;margin:2px 0 0;font-weight:bold">⚠️ بطاقة لعبة وليست حقيقية</p>';
 }
 async function loadMyCards() {
     loadMilitaryOptions();
@@ -799,16 +811,56 @@ async function loadMyCards() {
 // ── تحكم البطاقات (كبار المسؤولين): الرقم السري يعرضونه بزر ──
 async function loadCardControlPanel() {
     var cards = await (await fetch('/api/superadmin/cards/control')).json();
+    window.CC_CARDS = cards;
     var el = document.getElementById('card-control-container');
-    if (!cards.length) { el.innerHTML = '<p style="color:#64748b;text-align:center;padding:20px">لا توجد بطاقات مفعّلة حالياً.</p>'; return; }
+    if (!cards.length) { el.innerHTML = '<p style="color:#64748b; text-align:center; padding:20px;">لا توجد بطاقات مفعّلة حالياً.</p>'; return; }
     var names = { blue: 'أزرق', green: 'أخضر', red: 'أحمر', gold: 'ذهبي', purple: 'بنفسجي', black: 'أسود' };
     el.innerHTML = cards.map(function (c) {
-        return '<div class="card" style="margin-bottom:10px;' + (c.cardFrozen ? 'border-color:#475569;opacity:.85' : 'border-color:#3b82f6') + '"><b>' + spEsc(c.discordTag) + '</b> <span style="color:#64748b;font-size:.8rem">' + spEsc(c.discord) + '</span>' +
-            '<p style="color:#94a3b8;font-size:.85rem;margin-top:4px">رقم البطاقة: ' + spEsc(c.cardNumber || '---') + ' • اللون: ' + (names[c.cardColor] || c.cardColor) + '</p>' +
-            (c.cardFrozen ? '<p style="color:#fca5a5;font-size:.82rem">🔒 البطاقة مجمّدة</p>' : '') +
-            '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"><button class="btn btn-blue" style="padding:5px 10px" ' + (c.pinSet ? '' : 'disabled') + ' onclick="ccShowPin(\'' + c._id + '\')">👁️ عرض الرقم السري</button><button class="btn btn-yellow" style="padding:5px 10px" onclick="ccChangePin(\'' + c._id + '\')">✏️ تعيين رقم جديد</button>' +
-            '<button class="btn ' + (c.cardFrozen ? 'btn-green' : 'btn-yellow') + '" style="padding:5px 10px" onclick="ccToggleFreeze(\'' + c._id + '\')">' + (c.cardFrozen ? '🔓 فك التجميد' : '🔒 تجميد') + '</button><button class="btn btn-red" style="padding:5px 10px" onclick="ccDeleteCard(\'' + c._id + '\')">🗑️ حذف</button></div><div id="cc-msg-' + c._id + '"></div></div>';
+        var id = c._id;
+        return '<div class="card" style="margin-bottom:10px; ' + (c.cardFrozen ? 'border-color:#475569; opacity:0.85;' : 'border-color:#3b82f6;') + '">' +
+            '<div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:8px;"><div>' +
+            '<b>' + spEsc(c.discordTag) + '</b> <span style="color:#64748b; font-size:0.8rem;">' + spEsc(c.discord) + '</span>' +
+            '<p style="margin-top:5px; color:#94a3b8; font-size:0.85rem;">رقم البطاقة: ' + spEsc(c.cardNumber || '---') + '</p>' +
+            '<p style="color:#94a3b8; font-size:0.85rem;">اللون: ' + (names[c.cardColor] || c.cardColor) + '</p>' +
+            '<p style="color:#94a3b8; font-size:0.85rem;">الانتهاء: ' + (c.cardExpiry ? spDate(c.cardExpiry) : '—') + '</p>' +
+            '<p style="color:#94a3b8; font-size:0.85rem;">الرقم السري: ' + (c.pinSet && c.pinPlain ? '<b style="color:#fde047; letter-spacing:2px;">' + spEsc(c.pinPlain) + '</b>' : '<span style="color:#64748b;">لم يُعيَّن بعد</span>') + '</p>' +
+            (c.cardFrozen ? '<p style="color:#fca5a5; font-size:0.82rem;">🔒 البطاقة مجمّدة حالياً</p>' : '') + (c.status === 'disabled' ? '<p style="color:#fca5a5; font-size:0.82rem;">🚫 معطّلة</p>' : '') + (c.locked ? '<p style="color:#fca5a5; font-size:0.82rem;">⛔ مقفولة بسبب محاولات خاطئة</p>' : '') +
+            '</div><div style="display:flex; gap:6px; flex-direction:column; min-width:220px;">' +
+            '<div style="display:flex; gap:6px;"><input id="cc-pin-' + id + '" placeholder="رقم سري جديد (4 أرقام)" maxlength="4" inputmode="numeric" style="padding:5px 8px; font-size:0.8rem; margin-bottom:0;" /><button class="btn btn-blue" style="padding:5px 10px;" onclick="ccChangePin(\'' + id + '\')">💾</button></div>' +
+            '<button class="btn btn-blue" style="padding:5px 10px;" onclick="ccView(\'' + id + '\')">💳 عرض البطاقة</button>' +
+            '<div style="display:flex; gap:6px;"><button class="btn ' + (c.cardFrozen ? 'btn-green' : 'btn-yellow') + '" style="padding:5px 10px; flex:1;" onclick="ccToggleFreeze(\'' + id + '\')">' + (c.cardFrozen ? '🔓 فك التجميد' : '🔒 تجميد') + '</button><button class="btn btn-red" style="padding:5px 10px;" onclick="ccDeleteCard(\'' + id + '\')">🗑️ حذف</button></div>' +
+            '<button class="btn" id="cc-more-btn-' + id + '" style="padding:5px 10px; background:rgba(59,130,246,.2); border:1px solid #3b82f6;" onclick="document.getElementById(\'cc-more-' + id + '\').style.display = document.getElementById(\'cc-more-' + id + '\').style.display === \'none\' ? \'grid\' : \'none\'">🎛️ تحكم</button>' +
+            '<div id="cc-more-' + id + '" style="display:none; grid-template-columns:1fr 1fr; gap:6px;">' +
+            '<button class="btn btn-blue" style="padding:5px 6px; font-size:.78rem;" onclick="ccAct(\'' + id + '\',\'color\')">🎨 تغيير اللون</button>' +
+            '<button class="btn btn-blue" style="padding:5px 6px; font-size:.78rem;" onclick="ccAct(\'' + id + '\',\'extend\')">📅 تمديد الصلاحية</button>' +
+            '<button class="btn btn-yellow" style="padding:5px 6px; font-size:.78rem;" onclick="ccAct(\'' + id + '\',\'reset-pin\')">🔄 إعادة تعيين السري</button>' +
+            '<button class="btn btn-green" style="padding:5px 6px; font-size:.78rem;" onclick="ccAct(\'' + id + '\',\'unlock\')">🔓 فك قفل المحاولات</button>' +
+            '<button class="btn btn-yellow" style="padding:5px 6px; font-size:.78rem;" onclick="ccAct(\'' + id + '\',\'disable\')">' + (c.status === 'disabled' ? '✅ تفعيل البطاقة' : '🚫 تعطيل البطاقة') + '</button>' +
+            '<button class="btn btn-blue" style="padding:5px 6px; font-size:.78rem;" onclick="ccAct(\'' + id + '\',\'notify\')">📨 إشعار للعضو</button>' +
+            '<button class="btn btn-blue" style="padding:5px 6px; font-size:.78rem;" onclick="ccAct(\'' + id + '\',\'copy\',\'' + spEsc(c.cardNumber || '') + '\')">📋 نسخ الرقم</button>' +
+            '<button class="btn btn-blue" style="padding:5px 6px; font-size:.78rem;" onclick="switchAdminTab(\'profile\'); setTimeout(function(){ pfOpen(\'' + c.discord + '\'); }, 150)">🔎 ملف العضو</button>' +
+            '</div><div id="cc-msg-' + id + '"></div></div></div></div>';
     }).join('');
+}
+function ccView(id) {
+    var c = (window.CC_CARDS || []).filter(function (x) { return x._id === id; })[0]; if (!c) return;
+    var ov = document.createElement('div');
+    ov.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.8);display:flex;align-items:center;justify-content:center;padding:16px';
+    ov.innerHTML = '<div style="width:100%;max-width:400px;text-align:center"><p style="color:#e2e8f0;margin-bottom:6px">' + spEsc(c.discordTag) + '</p>' + bkCardHtml(c, { showCvv: false }) + '<button class="btn btn-blue" style="margin-top:14px;width:100%">إغلاق</button></div>';
+    ov.onclick = function (e) { if (e.target === ov || e.target.tagName === 'BUTTON') ov.remove(); };
+    document.body.appendChild(ov);
+}
+async function ccAct(id, a, extra) {
+    var url = '/api/superadmin/cards/' + id + '/' + a, method = 'PUT', body = {};
+    if (a === 'copy') { try { await navigator.clipboard.writeText(extra); bkToast('تم النسخ', 'success'); } catch (e) {} return; }
+    if (a === 'color') { var c = await spAsk('اللون: blue / green / red / gold / purple / black', 'gold', 'تغيير'); if (!c) return; body.color = c.trim().toLowerCase(); }
+    if (a === 'extend') { var d = await spAsk('كم يوم تمدد من الحين؟', '7', 'تمديد'); if (!d) return; body.days = d.trim(); }
+    if (a === 'notify') { var m = await spAsk('اكتب الرسالة لصاحب البطاقة:', '', 'إرسال'); if (!m) return; body.message = m; method = 'POST'; }
+    if (a === 'reset-pin' && !(await spConfirm('تعيد تعيين الرقم السري؟ العضو بيحدد رقم جديد.'))) return;
+    if (a === 'disable') { url = '/api/admin/cards/' + id + '/toggle-disable'; }
+    var r = await fetch(url, { method: method, headers: { 'Content-Type': 'application/json' }, body: method === 'PUT' && a === 'disable' ? undefined : JSON.stringify(body) });
+    var data = await r.json().catch(function () { return {}; });
+    bkToast(data.msg || (data.success ? 'تم' : 'فشل'), data.success ? 'success' : 'danger'); loadCardControlPanel();
 }
 async function ccShowPin(id) {
     var d = await spApi('/api/superadmin/cards/' + id + '/pin').catch(function (e) { return { success: false, msg: e.message }; });
@@ -957,6 +1009,13 @@ async function initBankSettings() {
     if (!s) s = await BankSettings.create({});
     // أول تشغيل بعد التحديث: حذف سجل الإشعارات كامل (مرة وحدة بس)
     if (!s.notifWipeDone) { await Notification.deleteMany({}); await BankSettings.updateOne({}, { notifWipeDone: true }); console.log('🧹 تم حذف سجل الإشعارات'); }
+    // البطاقات اللي انقبلت اليوم: تاريخ انتهائها بعد أسبوع من القبول (مرة وحدة)
+    if (!s.cardExpiryBackfill) {
+        const sod = new Date(Date.now() + 3 * 3600000); sod.setUTCHours(0, 0, 0, 0); const start = new Date(sod.getTime() - 3 * 3600000);
+        const todays = await CardRequest.find({ status: 'approved', reviewedAt: { $gte: start }, cardNumber: { $ne: null } });
+        for (const c of todays) await CardRequest.updateOne({ _id: c._id }, { cardExpiry: new Date(new Date(c.reviewedAt).getTime() + 7 * 24 * 60 * 60 * 1000) });
+        await BankSettings.updateOne({}, { cardExpiryBackfill: true });
+    }
     // تشفير أي رقم سري قديم كان محفوظ نص عادي
     const olds = await CardRequest.find({ cardPIN: { $nin: [null, ''] } });
     for (const c of olds) { await CardRequest.updateOne({ _id: c._id }, { cardPINEnc: encPin(c.cardPIN), cardPIN: null }); }
@@ -1890,6 +1949,7 @@ app.put('/api/admin/cards/:id/:action', isStaffOrAbove, async (req, res) => {
                 cardHolderName: holderName,
                 cardCVV: generateCVV(),
                 cardColor: finalColor,
+                cardExpiry: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
                 pinSet: false,
                 cardPIN: null, cardPINEnc: null, pinFails: 0, pinLockedUntil: null
             });
@@ -1951,8 +2011,8 @@ app.post('/api/account/card/:id/set-pin', checkMaintenance, async (req, res) => 
 // عرض كل البطاقات المفعّلة (لصفحة تحكم كبار المسؤولين)
 app.get('/api/superadmin/cards/control', isBankSuperAdmin, async (req, res) => {
     try {
-        const cards = await CardRequest.find({ status: { $in: ['approved', 'disabled'] } }).select(CARD_ADMIN).sort({ reviewedAt: -1 });
-        res.json(cards);
+        const raw = await CardRequest.find({ status: { $in: ['approved', 'disabled'] } }).select('-cardPIN -pinFails -cardCVV').sort({ reviewedAt: -1 }).lean();
+        res.json(raw.map(c => { const o = Object.assign({}, c, { pinPlain: c.cardPINEnc ? decPin(c.cardPINEnc) : null, locked: !!(c.pinLockedUntil && new Date(c.pinLockedUntil) > new Date()) }); delete o.cardPINEnc; return o; }));
     } catch (e) { res.json([]); }
 });
 
@@ -1979,6 +2039,36 @@ app.get('/api/superadmin/cards/:id/pin', isBankSuperAdmin, async (req, res) => {
         res.json({ success: true, pin: decPin(card.cardPINEnc) });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
+// أزرار تحكم إضافية (كبار المسؤولين)
+async function cardCtl(req, res, fn, logText) {
+    try {
+        const card = await CardRequest.findById(req.params.id);
+        if (!card) return res.json({ success: false, msg: 'البطاقة غير موجودة' });
+        const msg = await fn(card);
+        await BankLog.create({ action: 'card_control', description: `${logText} — ${card.discordTag}`, performedBy: req.user.id, performedByTag: (await isTrueOwner(req.user.id)) ? 'كبار المسؤولين' : req.user.username, targetDiscord: card.discord, targetTag: card.discordTag });
+        bumpActivity(); res.json({ success: true, msg: msg || 'تم' });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+}
+app.put('/api/superadmin/cards/:id/color', isBankSuperAdmin, (req, res) => cardCtl(req, res, async card => {
+    const c = String(req.body.color || ''); if (!['blue', 'green', 'red', 'gold', 'purple', 'black'].includes(c)) throw new Error('لون غير صالح');
+    await CardRequest.updateOne({ _id: card._id }, { cardColor: c }); return '🎨 تم تغيير اللون';
+}, 'تغيير لون بطاقة'));
+app.put('/api/superadmin/cards/:id/reset-pin', isBankSuperAdmin, (req, res) => cardCtl(req, res, async card => {
+    await CardRequest.updateOne({ _id: card._id }, { cardPINEnc: null, cardPIN: null, pinSet: false, pinFails: 0, pinLockedUntil: null });
+    await Notification.create({ discord: card.discord, message: '🔐 تمت إعادة تعيين الرقم السري لبطاقتك — حدد رقم جديد من صفحة بطاقاتي.', type: 'warning' }); return '🔄 تمت إعادة التعيين، العضو يحدد رقم جديد';
+}, 'إعادة تعيين الرقم السري'));
+app.put('/api/superadmin/cards/:id/unlock', isBankSuperAdmin, (req, res) => cardCtl(req, res, async card => {
+    await CardRequest.updateOne({ _id: card._id }, { pinFails: 0, pinLockedUntil: null }); return '🔓 تم فك قفل المحاولات';
+}, 'فك قفل محاولات البطاقة'));
+app.put('/api/superadmin/cards/:id/extend', isBankSuperAdmin, (req, res) => cardCtl(req, res, async card => {
+    const days = Math.min(365, Math.max(1, parseInt(req.body.days, 10) || 7));
+    await CardRequest.updateOne({ _id: card._id }, { cardExpiry: new Date(Date.now() + days * 86400000), ...(card.status === 'expired' ? { status: 'approved' } : {}) });
+    await Notification.create({ discord: card.discord, message: `📅 تم تمديد صلاحية بطاقتك ${days} يوم.`, type: 'success' }); return `📅 تم التمديد ${days} يوم`;
+}, 'تمديد صلاحية بطاقة'));
+app.post('/api/superadmin/cards/:id/notify', isBankSuperAdmin, (req, res) => cardCtl(req, res, async card => {
+    const m = String(req.body.message || '').trim().slice(0, 300); if (!m) throw new Error('اكتب الرسالة');
+    await Notification.create({ discord: card.discord, message: '📢 بخصوص بطاقتك: ' + m, type: 'info' }); return '📨 تم إرسال الإشعار';
+}, 'إشعار لصاحب بطاقة'));
 // فريز/فك فريز البطاقة (شكلي — حق كبار المسؤولين فقط)
 app.put('/api/superadmin/cards/:id/freeze', isBankSuperAdmin, async (req, res) => {
     try {
@@ -2948,7 +3038,7 @@ app.use(async (req, res) => {
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <script>
         // لو البنك مفتوح داخل فلاش (المسار /bank) نضيف المسار لكل طلبات الـ API تلقائياً
         window.BANK_BASE = ${JSON.stringify(pfx(req))};
