@@ -1031,13 +1031,14 @@ function bkBindSwipe(c) {
 }
 
 // ═══════════ التحديث التلقائي (بدون منطق التذاكر القديم) ═══════════
-var pollInterval = null, adminPollInterval = null, lastSeenActivity = 0, lastSeenAdminActivity = 0, lastUnreadCount = null, spTick = 0;
+var pollInterval = null, adminPollInterval = null, lastSeenActivity = 0, lastSeenAdminActivity = 0, lastUnreadCount = null, spTick = 0, lastSeenRolesChange = 0;
 function startUserPolling() {
     if (pollInterval) clearInterval(pollInterval);
     pollInterval = setInterval(async function () {
         try {
             var data = await (await fetch('/api/poll/user')).json();
             if (!data || !Object.keys(data).length) return;
+            if (data.role !== undefined && data.role !== currentRole && typeof syncRole === 'function') syncRole();   // تغيّرت رتبتي (توظيف/فصل/تعيين)
             if (data.unreadCount !== undefined && data.unreadCount !== lastUnreadCount) { lastUnreadCount = data.unreadCount; loadNotifCount(); }
             if (data.latestUnreadId !== undefined) handleNotifPush(data.latestUnreadId);
             if (currentAccount && (data.balance !== undefined || data.isFrozen !== undefined)) {
@@ -1058,6 +1059,18 @@ function startAdminPolling() {
         try {
             var data = await (await fetch('/api/poll/admin')).json();
             if (!data || !Object.keys(data).length) return;
+            // انسحبت صلاحيتي (السيرفر رفض) أو تغيّرت رتبتي => نحدّث الشاشة فوراً
+            if (data.success === false || (data.role !== undefined && data.role !== currentRole)) { if (typeof syncRole === 'function') syncRole(); return; }
+            // توظيف/فصل/تعيين مسؤول من أحد ثاني => نحدّث قائمة الموظفين والمسؤولين المفتوحة عند الكبار
+            if (data.rolesChange) {
+                if (lastSeenRolesChange && data.rolesChange !== lastSeenRolesChange) {
+                    var ae = document.activeElement, typing = ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName);
+                    var st = document.getElementById('atab-staff-section'), se = document.getElementById('atab-settings-section');
+                    if (!typing && st && st.style.display !== 'none' && typeof loadStaff === 'function') loadStaff();
+                    if (!typing && se && se.style.display !== 'none' && typeof loadBankSettingsPanel === 'function') loadBankSettingsPanel();
+                }
+                lastSeenRolesChange = data.rolesChange;
+            }
             var ch = data.lastActivity && lastSeenAdminActivity && data.lastActivity !== lastSeenAdminActivity;
             if (ch) {
                 [['accounts', 'loadAdminAccounts'], ['loans', 'loadAdminLoans'], ['cards', 'loadAdminCards'], ['bank-log', 'loadBankLog']].forEach(function (p) {
@@ -1468,6 +1481,9 @@ let lastBankActivity = Date.now();
 let lastTicketActivity = Date.now();
 function bumpActivity() { lastBankActivity = Date.now(); }
 function bumpTicketActivity() { lastTicketActivity = Date.now(); bumpActivity(); }
+// تغيّر الصلاحيات (توظيف / فصل / تعيين مسؤول / إزالته): كل المتصلين والكبار يلقطونها بأقرب بولنق
+let lastRolesChange = Date.now();
+function bumpRolesChange() { lastRolesChange = Date.now(); bumpActivity(); }
 
 async function initBankSettings() {
     let s = await BankSettings.findOne();
@@ -2879,12 +2895,14 @@ app.post('/api/superadmin/admin/add', isBankSuperAdmin, async (req, res) => {
     if (!acc) return res.json({ success: false, msg: "هذا الحساب غير موجود — لازم يكون دخل البنك من فلاش مرة وحدة على الأقل" });
     await BankSettings.updateOne({}, { $addToSet: { adminList: uid } });
     await BankLog.create({ action: 'add_admin', description: `تم تعيين ${acc.discordTag} مسؤول للبنك`, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: uid, targetTag: acc.discordTag });
+    bumpRolesChange();
     res.json({ success: true, msg: `تم تعيين ${acc.discordTag} مسؤول للبنك` });
 });
 
 app.post('/api/superadmin/admin/remove', isBankSuperAdmin, async (req, res) => {
     const uid = String(req.body.accountUid || req.body.discordId || '').trim();
     await BankSettings.updateOne({}, { $pull: { adminList: uid } });
+    bumpRolesChange();
     res.json({ success: true, msg: "تم إزالة المسؤول" });
 });
 
@@ -2972,6 +2990,7 @@ app.post('/api/staff/hire', isBankAdmin, async (req, res) => {
             hiredBy: req.user.id, hiredByTag: req.user.username, isActive: true, hiredAt: new Date()
         }, { upsert: true });
         await BankLog.create({ action: 'hire_staff', description: `تم توظيف ${discordTag} كـ ${staffRole === 'management' ? 'إدارة' : 'موظف'}`, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: discordId, targetTag: discordTag });
+        bumpRolesChange();
         res.json({ success: true, msg: `تم توظيف ${discordTag} بنجاح` });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
@@ -2985,6 +3004,7 @@ app.put('/api/staff/:id/fire', isBankAdmin, async (req, res) => {
             return res.json({ success: false, msg: "فقط كبار المسؤولين يمكنهم فصل الإدارة" });
         await Staff.findByIdAndUpdate(req.params.id, { isActive: false });
         await BankLog.create({ action: 'fire_staff', description: `تم فصل الموظف ${staff.discordTag}`, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: staff.discord, targetTag: staff.discordTag });
+        bumpRolesChange();
         res.json({ success: true });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
@@ -3070,7 +3090,8 @@ app.get('/api/poll/user', checkMaintenance, async (req, res) => {
         const acc = await Account.findOne({ discord: req.user.id });
         const unreadCount = await Notification.countDocuments({ discord: req.user.id, read: false });
         const latestUnread = await Notification.findOne({ discord: req.user.id, read: false }).sort({ createdAt: -1 }).select('_id');
-        res.json({ balance: acc?.balance, savingsBalance: acc?.savingsBalance, isFrozen: acc?.isFrozen, unreadCount, latestUnreadId: latestUnread ? String(latestUnread._id) : null, lastActivity: lastBankActivity, lastTicketActivity });
+        const role = await getBankRole(req.user.id);   // الرتبة الحية: لو تغيّرت الشاشة تتحدث لحظياً
+        res.json({ balance: acc?.balance, savingsBalance: acc?.savingsBalance, isFrozen: acc?.isFrozen, unreadCount, latestUnreadId: latestUnread ? String(latestUnread._id) : null, lastActivity: lastBankActivity, lastTicketActivity, role, rolesChange: lastRolesChange });
     } catch (e) { res.json({}); }
 });
 app.get('/api/poll/admin', isStaffOrAbove, async (req, res) => {
@@ -3078,7 +3099,7 @@ app.get('/api/poll/admin', isStaffOrAbove, async (req, res) => {
         const openTickets = await BankTicket.countDocuments({ status: 'waiting' });
         const pendingLoans = await Loan.countDocuments({ status: 'pending' });
         const pendingCards = await CardRequest.countDocuments({ status: 'pending' });
-        res.json({ openTickets, pendingLoans, pendingCards, lastActivity: lastBankActivity, lastTicketActivity });
+        res.json({ openTickets, pendingLoans, pendingCards, lastActivity: lastBankActivity, lastTicketActivity, role: req.bankRole, rolesChange: lastRolesChange });
     } catch (e) { res.json({}); }
 });
 
@@ -4884,6 +4905,65 @@ app.use(async (req, res) => {
             showMainSite();
         }
 
+        // ═══════════ تحديث الصلاحيات لحظياً (بدون ريفرش) ═══════════
+        const BK_STAFF_ROLES = ['staff','management','admin','super_admin'];
+        const BK_TABS_ALL = ['stats','accounts','loans','cards','support','staff','locks','card-control','profile','settings','military-salary','bank-log'];
+        const BK_TABS_EXTRA = ['card-control','profile','settings','military-salary','bank-log'];
+        const BK_TABS_BY_ROLE = {
+            staff: ['loans','cards','support'],
+            management: ['accounts','loans','cards','support'],
+            admin: ['stats','accounts','loans','cards','support','staff','locks'],
+            super_admin: BK_TABS_ALL
+        };
+        const BK_ROLE_LABEL = { user: 'مستخدم', staff: 'موظف', management: 'إداري', admin: 'مسؤول البنك', super_admin: 'كبار المسؤولين' };
+        function applyRoleUI() {
+            const isStaff = BK_STAFF_ROLES.includes(currentRole);
+            const fab = document.getElementById('admin-fab-btn');
+            if (fab) {
+                fab.style.display = isStaff ? 'block' : 'none';
+                fab.innerText = currentRole === 'staff' ? '⚙️ لوحة الموظف' : currentRole === 'management' ? '⚙️ لوحة الإداري' : '⚙️ إدارة البنك';
+            }
+            const title = document.getElementById('admin-panel-title');
+            if (title) title.innerText = currentRole === 'staff' ? 'لوحة الموظف 👤' : currentRole === 'management' ? 'لوحة الإداري 🏢' : currentRole === 'super_admin' ? 'لوحة كبار مسؤولي البنك 👑' : 'لوحة إدارة البنك ⚙️';
+            const allowed = BK_TABS_BY_ROLE[currentRole] || [];
+            BK_TABS_ALL.forEach(function (t) {
+                const b = document.getElementById('atab-' + t);
+                if (b) b.style.display = allowed.includes(t) ? (BK_TABS_EXTRA.includes(t) ? 'block' : '') : 'none';
+            });
+            const locks = document.getElementById('superadmin-only-locks');
+            if (locks) locks.style.display = currentRole === 'super_admin' ? 'block' : 'none';
+            // لو لوحة الإدارة مفتوحة: تتسكر لو انسحبت الصلاحية، أو تنتقل لتبويب مسموح
+            const modal = document.getElementById('adminModal');
+            if (modal && modal.style.display === 'block') {
+                if (!isStaff) closeAdminModal();
+                else {
+                    const active = BK_TABS_ALL.find(function (t) { const b = document.getElementById('atab-' + t); return b && b.classList.contains('active'); });
+                    if (!active || !allowed.includes(active)) switchAdminTab((currentRole === 'staff' || currentRole === 'management') ? 'loans' : 'stats');
+                }
+            }
+        }
+        let bkRoleSyncBusy = false, bkLastRoleSync = 0;
+        async function syncRole() {
+            if (bkRoleSyncBusy || Date.now() - bkLastRoleSync < 2000) return;
+            bkRoleSyncBusy = true; bkLastRoleSync = Date.now();
+            try {
+                const data = await (await fetch('/api/auth/me')).json();
+                if (!data || !data.loggedIn || data.flashRegistered === false) { location.reload(); return; }
+                if (data.maintenance && data.role !== 'super_admin' && data.role !== 'admin') { location.reload(); return; }
+                currentIsOwner = !!data.isOwner; window.ownerPower = !!data.ownerPower;
+                const old = currentRole;
+                if (data.role === old) return;
+                currentRole = data.role;
+                applyRoleUI();
+                if (BK_STAFF_ROLES.includes(currentRole)) { lastSeenAdminActivity = 0; lastSeenRolesChange = 0; startAdminPolling(); }
+                else if (adminPollInterval) { clearInterval(adminPollInterval); adminPollInterval = null; }
+                if (currentRole === 'user') bkToast('تم إنهاء صلاحياتك الإدارية في البنك', 'warning');
+                else bkToast('تم تحديث صلاحياتك: ' + (BK_ROLE_LABEL[currentRole] || currentRole), 'success');
+                if (typeof silentRefreshCurrentPage === 'function') silentRefreshCurrentPage();
+                if (typeof spBadges === 'function') spBadges();
+            } catch (e) {} finally { bkRoleSyncBusy = false; }
+        }
+
         async function showMainSite() {
             document.getElementById('main-site').style.display = 'block';
             document.getElementById('auth-section').innerHTML = \`
@@ -4891,35 +4971,7 @@ app.use(async (req, res) => {
                 <button class="nav-back" onclick="location.href=(window.BANK_BASE||'')+'/logout'">↩️ فلاش</button>
                 <button class="hamburger-btn" id="hamburger-btn" onclick="toggleMobileMenu()">☰</button>
             \`;
-            if(['staff','management','admin','super_admin'].includes(currentRole)) {
-                document.getElementById('admin-fab-btn').style.display = 'block';
-
-                if (currentRole === 'staff') {
-                    // موظف: القروض + البطاقات + الدعم فقط
-                    document.getElementById('admin-fab-btn').innerText = '⚙️ لوحة الموظف';
-                    document.getElementById('admin-panel-title').innerText = "لوحة الموظف 👤";
-                    ['atab-stats','atab-accounts','atab-card-control','atab-profile','atab-staff','atab-locks'].forEach(id => {
-                        const b = document.getElementById(id); if (b) b.style.display = 'none';
-                    });
-                } else if (currentRole === 'management') {
-                    // إداري: القروض + البطاقات + الدعم + الحسابات
-                    document.getElementById('admin-fab-btn').innerText = '⚙️ لوحة الإداري';
-                    document.getElementById('admin-panel-title').innerText = "لوحة الإداري 🏢";
-                    ['atab-stats','atab-card-control','atab-profile','atab-staff','atab-locks'].forEach(id => {
-                        const b = document.getElementById(id); if (b) b.style.display = 'none';
-                    });
-                }
-
-                if(currentRole === 'super_admin') {
-                    document.getElementById('atab-settings').style.display = 'block';
-                    document.getElementById('atab-bank-log').style.display = 'block';
-                    document.getElementById('atab-card-control').style.display = 'block';
-                    document.getElementById('atab-profile').style.display = 'block';
-                    document.getElementById('atab-military-salary').style.display = 'block';
-                    document.getElementById('superadmin-only-locks').style.display = 'block';
-                    document.getElementById('admin-panel-title').innerText = "لوحة كبار مسؤولي البنك 👑";
-                }
-            }
+            applyRoleUI();
             await loadDashboard();
             loadNotifCount();
             startUserPolling();
