@@ -3,6 +3,8 @@ const mongoose = require("mongoose");
 const session = require("express-session");
 const passport = require("passport");
 const crypto = require("crypto");
+// نسخة التطبيق: هاش محتوى الملف نفسه، أي تعديل ينرفع يغيّرها والمتصلين يتحدثون لحالهم (زي فلاش)
+const APP_VER = (() => { try { return crypto.createHash("md5").update(require("fs").readFileSync(__filename)).digest("hex").slice(0, 12); } catch (e) { return String(Date.now()); } })();
 
 const app = express();
 app.get('/healthz', (req, res) => res.type('text').send('ok'));
@@ -1030,6 +1032,36 @@ function bkBindSwipe(c) {
     });
 }
 
+// ═══════════ تحديث الموقع تلقائياً لما ينزل تحديث جديد (زي فلاش) ═══════════
+var BKVER = { t: null };
+function bkVerBusy() {
+    try {
+        var a = document.activeElement;
+        if (a && (a.tagName === 'TEXTAREA' || a.tagName === 'INPUT' || a.tagName === 'SELECT' || a.isContentEditable)) return true;
+        var f = document.querySelectorAll('textarea, input[type=text], input[type=number], input[type=password], input:not([type])');
+        for (var i = 0; i < f.length; i++) { if ((f[i].value || '').trim() && f[i].offsetParent !== null) return true; }
+    } catch (e) {}
+    return false;
+}
+function bkVerCheck(v) {
+    if (!v || !window.APP_VER || v === window.APP_VER || BKVER.t) return;
+    BKVER.t = setInterval(bkVerApply, 4000);
+    bkVerApply();
+}
+function bkVerApply() {
+    if (bkVerBusy()) return;
+    var last = 0; try { last = parseInt(sessionStorage.getItem('bkVerReloadAt') || '0', 10); } catch (e) {}
+    if (Date.now() - last < 60000) return;
+    clearInterval(BKVER.t); BKVER.t = null;
+    try { bkToast('🔄 فيه تحديث جديد، جارِ تحديث الموقع...', 'info'); } catch (e) {}
+    // تأخير عشوائي بسيط عشان ما يدخلون كلهم بنفس اللحظة على السيرفر بعد إعادة التشغيل
+    setTimeout(function () {
+        if (bkVerBusy()) { if (!BKVER.t) BKVER.t = setInterval(bkVerApply, 4000); return; }
+        try { sessionStorage.setItem('bkVerReloadAt', String(Date.now())); } catch (e) {}
+        location.reload();
+    }, 800 + Math.floor(Math.random() * 4000));
+}
+
 // ═══════════ التحديث التلقائي (بدون منطق التذاكر القديم) ═══════════
 var pollInterval = null, adminPollInterval = null, lastSeenActivity = 0, lastSeenAdminActivity = 0, lastUnreadCount = null, spTick = 0, lastSeenRolesChange = 0;
 function startUserPolling() {
@@ -1038,6 +1070,7 @@ function startUserPolling() {
         try {
             var data = await (await fetch('/api/poll/user')).json();
             if (!data || !Object.keys(data).length) return;
+            if (data.ver) bkVerCheck(data.ver);
             if (data.role !== undefined && data.role !== currentRole && typeof syncRole === 'function') syncRole();   // تغيّرت رتبتي (توظيف/فصل/تعيين)
             if (data.unreadCount !== undefined && data.unreadCount !== lastUnreadCount) { lastUnreadCount = data.unreadCount; loadNotifCount(); }
             if (data.latestUnreadId !== undefined) handleNotifPush(data.latestUnreadId);
@@ -1059,6 +1092,7 @@ function startAdminPolling() {
         try {
             var data = await (await fetch('/api/poll/admin')).json();
             if (!data || !Object.keys(data).length) return;
+            if (data.ver) bkVerCheck(data.ver);
             // انسحبت صلاحيتي (السيرفر رفض) أو تغيّرت رتبتي => نحدّث الشاشة فوراً
             if (data.success === false || (data.role !== undefined && data.role !== currentRole)) { if (typeof syncRole === 'function') syncRole(); return; }
             // توظيف/فصل/تعيين مسؤول من أحد ثاني => نحدّث قائمة الموظفين والمسؤولين المفتوحة عند الكبار
@@ -1472,7 +1506,6 @@ function bkOdToggle() { if (!BK_REAL_OWNER) return; bkOdSet(!BK_OD); }
 
 `;
 
-const SUPER_ADMIN_IDS = ['1003511814140743825','1231269832201207808'];
 
 // ── نظام التحديث اللحظي (Real-time activity signal) ──────────────────────
 // أي عملية تغيّر رصيد/حساب/تذكرة تستدعي هذي الدالة، وكل الأطراف (الشخص
@@ -1539,7 +1572,7 @@ async function checkMaintenance(req, res, next) {
             const role = await getBankRole(req.user.id);
             if (role === 'super_admin' || role === 'admin') return next();
         }
-        return res.status(503).json({ success: false, maintenance: true, msg: "🚨 البنك مغلق حالياً للصيانة العامة بطلب من الإدارة العليا." });
+        return res.status(503).json({ ver: APP_VER, success: false, maintenance: true, msg: "🚨 البنك مغلق حالياً للصيانة العامة بطلب من الإدارة العليا." });
     }
     // البنك مخصص فقط لمنسوبي فلاش (عسكر مسجلين أو مواطنين مقبولين) — موظفو وإدارة البنك مستثنون من هذا الشرط
     if (req.isAuthenticated()) {
@@ -1556,17 +1589,20 @@ async function checkMaintenance(req, res, next) {
 
 // ── دوال مساعدة ─────────────────────────────────────────────────────────────
 // ترتيب الرتب: user < staff (موظف) < management (إداري) < admin (رئيس البنك) < super_admin (كبار المسؤولين)
-async function getBankRole(discordId) {
-    if (SUPER_ADMIN_IDS.includes(discordId)) return 'super_admin';
-    try { const fl = await FlashLink.findOne({ uid: String(discordId) }, { isSenior: 1 }).lean(); if (fl && fl.isSenior) return 'super_admin'; } catch (e) {}
+// الصلاحيات كلها مبنية على الحسابات (بدون أيديات ثابتة بالكود): علامة كبير من فلاش ← قائمة مسؤولي البنك ← سجل الموظفين
+// نرجّع معها «مصدر الصلاحية» عشان نعرف من وين جت الرتبة لأي حساب
+async function getBankRoleInfo(discordId) {
+    const uid = String(discordId);
+    try { const fl = await FlashLink.findOne({ uid }, { isSenior: 1 }).lean(); if (fl && fl.isSenior) return { role: 'super_admin', source: 'علامة كبير مسؤولين جاية من فلاش' }; } catch (e) {}
     const s = await BankSettings.findOne();
-    if (s && s.adminList.includes(discordId)) return 'admin';
-    const staff = await Staff.findOne({ discord: discordId, isActive: true });
-    if (staff) return staff.role === 'management' ? 'management' : 'staff';
-    return 'user';
+    if (s && (s.adminList || []).map(String).includes(uid)) return { role: 'admin', source: 'مضاف بقائمة مسؤولي البنك' };
+    const staff = await Staff.findOne({ discord: uid, isActive: true });
+    if (staff) return { role: staff.role === 'management' ? 'management' : 'staff', source: 'مسجّل بقائمة الموظفين — وظّفه ' + (staff.hiredByTag || 'غير معروف') };
+    return { role: 'user', source: '' };
 }
+async function getBankRole(discordId) { return (await getBankRoleInfo(discordId)).role; }
 
-// إشعار الخطر: كل كبار المسؤولين (الأيديات الثابتة + أي كبير مسؤولين داخل من فلاش)
+// إشعار الخطر: كل كبار المسؤولين (أي كبير مسؤولين داخل من فلاش)
 async function isBankOwner(discordId) {
     return (await getBankRole(String(discordId))) === 'super_admin';
 }
@@ -1718,12 +1754,12 @@ app.get('/logout', (req, res) => req.logout(() => res.redirect(flashHome(req))))
 
 app.get('/api/auth/me', async (req, res) => {
     if (req.isAuthenticated()) {
-        const role = await getBankRole(req.user.id);
+        const { role, source: roleSource } = await getBankRoleInfo(req.user.id);
         let flashRegistered = true;
         if (role === 'user') flashRegistered = await isFlashMember(req.user.id);
         const account = await Account.findOne({ discord: req.user.id });
         const settings = await BankSettings.findOne();
-        res.json({ loggedIn: true, user: req.user, role, hasAccount: !!account, maintenance: settings?.isMaintenance || false, flashRegistered, isOwner: await isBankOwner(req.user.id), ownerPower: await isTrueOwner(req.user.id) });
+        res.json({ loggedIn: true, user: req.user, role, roleSource, hasAccount: !!account, maintenance: settings?.isMaintenance || false, flashRegistered, isOwner: await isBankOwner(req.user.id), ownerPower: await isTrueOwner(req.user.id) });
     } else {
         const settings = await BankSettings.findOne();
         res.json({ loggedIn: false, maintenance: settings?.isMaintenance || false });
@@ -3091,7 +3127,7 @@ app.get('/api/poll/user', checkMaintenance, async (req, res) => {
         const unreadCount = await Notification.countDocuments({ discord: req.user.id, read: false });
         const latestUnread = await Notification.findOne({ discord: req.user.id, read: false }).sort({ createdAt: -1 }).select('_id');
         const role = await getBankRole(req.user.id);   // الرتبة الحية: لو تغيّرت الشاشة تتحدث لحظياً
-        res.json({ balance: acc?.balance, savingsBalance: acc?.savingsBalance, isFrozen: acc?.isFrozen, unreadCount, latestUnreadId: latestUnread ? String(latestUnread._id) : null, lastActivity: lastBankActivity, lastTicketActivity, role, rolesChange: lastRolesChange });
+        res.json({ balance: acc?.balance, savingsBalance: acc?.savingsBalance, isFrozen: acc?.isFrozen, unreadCount, latestUnreadId: latestUnread ? String(latestUnread._id) : null, lastActivity: lastBankActivity, lastTicketActivity, role, rolesChange: lastRolesChange, ver: APP_VER });
     } catch (e) { res.json({}); }
 });
 app.get('/api/poll/admin', isStaffOrAbove, async (req, res) => {
@@ -3099,7 +3135,7 @@ app.get('/api/poll/admin', isStaffOrAbove, async (req, res) => {
         const openTickets = await BankTicket.countDocuments({ status: 'waiting' });
         const pendingLoans = await Loan.countDocuments({ status: 'pending' });
         const pendingCards = await CardRequest.countDocuments({ status: 'pending' });
-        res.json({ openTickets, pendingLoans, pendingCards, lastActivity: lastBankActivity, lastTicketActivity, role: req.bankRole, rolesChange: lastRolesChange });
+        res.json({ openTickets, pendingLoans, pendingCards, lastActivity: lastBankActivity, lastTicketActivity, role: req.bankRole, rolesChange: lastRolesChange, ver: APP_VER });
     } catch (e) { res.json({}); }
 });
 
@@ -3718,6 +3754,7 @@ app.delete('/api/support/admin/tickets/:id', supMw, supSeniorOnly, async (req, r
 // ── الصفحة الرئيسية ─────────────────────────────────────────────────────────
 app.use(async (req, res) => {
     const FLASH_HOME = flashHome(req);
+    res.set('Cache-Control', 'no-store');
     res.send(`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -3726,6 +3763,7 @@ app.use(async (req, res) => {
     <script>
         // لو البنك مفتوح داخل فلاش (المسار /bank) نضيف المسار لكل طلبات الـ API تلقائياً
         window.BANK_BASE = ${JSON.stringify(pfx(req))};
+        window.APP_VER = ${JSON.stringify(APP_VER)};
         (function () {
             var B = window.BANK_BASE || '';
             if (!B) return;
@@ -4896,6 +4934,7 @@ app.use(async (req, res) => {
             currentRole = data.role;
             currentIsOwner = !!data.isOwner;
             window.ownerPower = !!data.ownerPower;
+            window.bkRoleSource = data.roleSource || '';
 
             if (!data.hasAccount) {
                 // ما فيه حساب = ما دخل من فلاش (الحساب يتفتح تلقائياً عند الدخول من زر البنك في فلاش)
@@ -4925,6 +4964,12 @@ app.use(async (req, res) => {
             }
             const title = document.getElementById('admin-panel-title');
             if (title) title.innerText = currentRole === 'staff' ? 'لوحة الموظف 👤' : currentRole === 'management' ? 'لوحة الإداري 🏢' : currentRole === 'super_admin' ? 'لوحة كبار مسؤولي البنك 👑' : 'لوحة إدارة البنك ⚙️';
+            // سطر صغير تحت العنوان يوضح من وين جت صلاحيتك
+            if (title && title.parentElement) {
+                let src = document.getElementById('admin-role-source');
+                if (!src) { src = document.createElement('div'); src.id = 'admin-role-source'; src.style.cssText = 'font-size:0.76rem;color:#64748b;margin:-12px 0 14px;'; title.parentElement.insertAdjacentElement('afterend', src); }
+                src.textContent = isStaff && window.bkRoleSource ? 'مصدر صلاحيتك: ' + window.bkRoleSource : '';
+            }
             const allowed = BK_TABS_BY_ROLE[currentRole] || [];
             BK_TABS_ALL.forEach(function (t) {
                 const b = document.getElementById('atab-' + t);
@@ -4951,6 +4996,7 @@ app.use(async (req, res) => {
                 if (!data || !data.loggedIn || data.flashRegistered === false) { location.reload(); return; }
                 if (data.maintenance && data.role !== 'super_admin' && data.role !== 'admin') { location.reload(); return; }
                 currentIsOwner = !!data.isOwner; window.ownerPower = !!data.ownerPower;
+                window.bkRoleSource = data.roleSource || '';
                 const old = currentRole;
                 if (data.role === old) return;
                 currentRole = data.role;
