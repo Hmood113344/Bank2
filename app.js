@@ -164,14 +164,33 @@ const CardRequestSchema = new mongoose.Schema({
     cardExpiry: Date,         // تاريخ انتهاء صلاحية البطاقة (يحدده كبار المسؤولين)
     // ── تحكم البطاقة (حق كبار المسؤولين) ──
     cardColor: { type: String, default: 'blue' },   // يحدده الأدمن وقت الموافقة
-    cardPIN: { type: String, default: null },       // رقم سري 4 أرقام يحدده المستخدم أول مرة
-    cardPINHash: { type: String, default: null },   // الرقم السري مشفّر (hash) — ما أحد يشوفه
+    cardPIN: { type: String, default: null },       // قديم (يُشفَّر تلقائياً عند التشغيل)
+    cardPINEnc: { type: String, default: null },    // الرقم السري مشفّر AES — يشوفه كبار المسؤولين فقط
+    pinFails: { type: Number, default: 0 },
+    pinLockedUntil: { type: Date, default: null },
     pinSet: { type: Boolean, default: false },      // هل المستخدم حط الرقم السري؟
     cardFrozen: { type: Boolean, default: false },  // فريز شكلي من كبار المسؤولين فقط
 });
 const CardRequest = mongoose.model("CardRequest", CardRequestSchema);
 
-// (تذاكر خدمة العملاء صارت في نظام فلاش المنقول — SupportTicket معرّف أسفل)
+// تذاكر خدمة العملاء
+const SupportTicketSchema = new mongoose.Schema({
+    discord: String,
+    discordTag: String,
+    accountNumber: String,
+    subject: String,
+    status: { type: String, default: 'open' }, // open / in_progress / closed
+    messages: [{
+        sender: String,      // discord id or 'bot' or 'admin'
+        senderName: String,
+        content: String,
+        isAdmin: { type: Boolean, default: false },
+        createdAt: { type: Date, default: Date.now }
+    }],
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now }
+});
+const SupportTicket = mongoose.model("SupportTicket", SupportTicketSchema);
 
 // سجل أحداث البنك العام (لكبار المسؤولين فقط)
 const BankLogSchema = new mongoose.Schema({
@@ -218,9 +237,9 @@ const BankSettingsSchema = new mongoose.Schema({
     // إعداد انتهاء القروض
     loanExpiryDays: { type: Number, default: 0 },           // 0 = بدون انتهاء
     loanExpiryApplyTo: { type: String, default: 'new' },  // 'new' | 'existing' | 'both'
-    supportCanned: { type: [{ title: String, text: String }], default: [] },   // ردود جاهزة لخدمة العملاء
-    logClearUsed: { type: Boolean, default: false },      // زر حذف اللوق الشامل انستخدم؟
-    notifWipeDone: { type: Boolean, default: false }      // مسح سجل الإشعارات مرة وحدة عند هذا التحديث
+    logClearUsed: { type: Boolean, default: false },
+    notifWipeDone: { type: Boolean, default: false },
+    supportCanned: { type: [{ title: String, text: String }], default: [] }
 });
 const BankSettings = mongoose.model("BankSettings", BankSettingsSchema);
 
@@ -324,6 +343,605 @@ setInterval(async () => {
     }
 }, 60 * 1000);
 
+const BANK_EXT_CSS = String.raw`.sp-row{background:rgba(255,255,255,.04);border:1px solid rgba(59,130,246,.2);border-radius:12px;padding:10px 12px;margin-bottom:8px;cursor:pointer}
+.sp-row .t1{display:flex;justify-content:space-between;align-items:center;gap:8px;font-weight:bold;font-size:.9rem}
+.sp-row .t2{color:#94a3b8;font-size:.8rem;margin-top:3px}
+.sp-badge{background:#ef4444;color:#fff;border-radius:10px;padding:0 7px;font-size:.7rem;margin-inline-start:6px}
+.sp-chip{font-size:.72rem;padding:2px 8px;border-radius:10px;background:#334155;white-space:nowrap}
+.sp-chip.ai{background:#4c1d95}.sp-chip.waiting{background:#92400e}.sp-chip.active{background:#166534}.sp-chip.closed{background:#475569}
+.sp-link{background:none;border:none;color:#60a5fa;cursor:pointer;font-family:inherit;font-size:.85rem}
+.sp-chat{display:flex;flex-direction:column;height:72vh;max-height:640px}
+.sp-bar{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.sp-title{font-weight:bold;flex:1;text-align:center}
+.sp-state{margin-bottom:6px}.sp-msgs{flex:1;overflow-y:auto;padding:10px;background:rgba(0,0,0,.25);border-radius:10px;display:flex;flex-direction:column;gap:8px}
+.sp-msg{max-width:84%;display:flex;flex-direction:column}.sp-msg.me{align-self:flex-start}.sp-msg.other{align-self:flex-end}
+.sp-msg .sp-b{padding:8px 11px;border-radius:12px;white-space:pre-wrap;word-break:break-word;font-size:.9rem;background:rgba(255,255,255,.08)}
+.sp-msg.me .sp-b{background:#1d4ed8}.sp-msg.ai .sp-b{background:#3b2a6b}.sp-msg.other.admin .sp-b,.sp-msg.other .sp-b{background:rgba(255,255,255,.1)}
+.sp-msg.sys{align-self:center;max-width:92%}.sp-msg.sys .sp-b{background:transparent;color:#94a3b8;font-size:.78rem;text-align:center}
+.sp-msg.note{align-self:center;max-width:92%}.sp-msg.note .sp-b{background:#713f12;color:#fef9c3}
+.sp-msg.del .sp-b{background:#7f1d1d}.sp-deltag{font-size:.7rem;color:#fecaca;margin-bottom:3px}
+.sp-who{font-size:.72rem;color:#94a3b8;margin-bottom:2px}.sp-time{font-size:.66rem;color:#64748b;margin-top:2px}
+.sp-role{font-size:.62rem;padding:0 6px;border-radius:8px;margin-inline-start:5px}.sp-role.senior{background:#b45309;color:#fff}.sp-role.admin{background:#1d4ed8;color:#fff}
+.sp-quote{border-right:3px solid #60a5fa;padding:2px 8px;margin-bottom:5px;font-size:.78rem;color:#cbd5e1;background:rgba(0,0,0,.2);border-radius:6px}.sp-quote b{display:block;color:#60a5fa}
+.sp-img{max-width:100%;max-height:220px;border-radius:8px;display:block;margin-top:4px;cursor:zoom-in}
+.sp-compose{display:flex;gap:6px;align-items:flex-end;margin-top:8px}.sp-compose textarea{margin:0;flex:1;resize:none;min-height:40px}
+.sp-attach,.sp-mic{background:rgba(255,255,255,.08);border:none;border-radius:10px;padding:9px 11px;cursor:pointer;font-size:1rem;color:#fff}
+.sp-typing{font-size:.75rem;color:#94a3b8;min-height:16px;padding:2px 6px}.sp-ctx{background:rgba(59,130,246,.15);border-radius:8px;padding:5px 9px;font-size:.78rem;margin-top:6px}
+.sp-info{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.3);border-radius:10px;padding:8px;margin-bottom:6px;font-size:.8rem;max-height:150px;overflow:auto}
+.sp-ir{display:flex;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px dashed rgba(255,255,255,.07);font-size:.82rem}.sp-ir span:first-child{color:#94a3b8}
+.sp-rate{background:rgba(234,179,8,.08);border:1px solid #eab308;border-radius:10px;padding:10px;margin-top:8px}.sp-stars button{background:none;border:none;font-size:1.8rem;color:#475569;cursor:pointer}.sp-stars button.on{color:#facc15}
+.sp-tabs{display:flex;gap:6px;overflow-x:auto;margin-bottom:10px}.sp-tab{background:rgba(255,255,255,.06);border:1px solid transparent;color:#94a3b8;border-radius:8px;padding:6px 12px;cursor:pointer;font-family:inherit;white-space:nowrap}.sp-tab.on{background:rgba(59,130,246,.25);border-color:#3b82f6;color:#60a5fa}
+.bk-wrap{perspective:1000px;max-width:370px;margin-top:12px;cursor:pointer}.bk-inner{position:relative;width:100%;aspect-ratio:1.586;transition:transform .7s;transform-style:preserve-3d}.bk-wrap.flip .bk-inner{transform:rotateY(180deg)}
+.bk-face{position:absolute;inset:0;border-radius:18px;padding:16px 18px;backface-visibility:hidden;-webkit-backface-visibility:hidden;color:#fff;overflow:hidden;box-shadow:0 12px 30px rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.18);display:flex;flex-direction:column;justify-content:space-between;direction:ltr;font-family:'Courier New',monospace}
+.bk-back{transform:rotateY(180deg);justify-content:flex-start;padding:16px 0}.bk-shine{position:absolute;inset:0;background:linear-gradient(115deg,transparent 30%,rgba(255,255,255,.14) 45%,transparent 60%);pointer-events:none}
+.bk-chip{width:44px;height:33px;border-radius:7px;background:linear-gradient(135deg,#fde68a,#b45309);box-shadow:inset 0 0 0 1px rgba(0,0,0,.25)}.bk-num{font-size:1.22rem;letter-spacing:3px;text-shadow:0 1px 3px rgba(0,0,0,.5)}
+.bk-lbl{font-size:.55rem;letter-spacing:1px}.bk-val{font-size:.85rem;text-transform:uppercase}.bk-net{display:flex}.bk-net i{width:26px;height:26px;border-radius:50%;background:rgba(239,68,68,.9);display:block}.bk-net i+i{background:rgba(250,204,21,.9);margin-left:-11px}
+.bk-mag{height:38px;background:#000;margin-top:6px}.bk-sig{flex:1;height:32px;background:repeating-linear-gradient(45deg,#e2e8f0,#e2e8f0 4px,#cbd5e1 4px,#cbd5e1 8px)}.bk-cvv{background:#fff;color:#000;padding:6px 10px;border-radius:4px;font-weight:bold;letter-spacing:2px}
+.bk-frozen{position:absolute;top:10px;left:10px;background:rgba(0,0,0,.65);color:#fca5a5;font-size:.65rem;padding:3px 8px;border-radius:6px;z-index:2}.bk-gray{filter:grayscale(1);opacity:.65}
+`;
+const BANK_EXT_JS = String.raw`// ═══════════ إضافات البنك: خدمة العملاء + البطاقة + ملف العضو + اللوق ═══════════
+var BKB = function (u) { return (window.BANK_BASE || '') + u; };
+function spEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function spTime(d) { try { return new Date(d).toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } }
+function spDate(d) { try { return new Date(d).toLocaleString('ar-SA'); } catch (e) { return ''; } }
+function bkToast(m, t) { try { uiToast(m, t || 'info'); } catch (e) { alert(m); } }
+async function spApi(url, opts) {
+    opts = opts || {};
+    var o = { method: opts.method || 'GET', headers: { 'Content-Type': 'application/json' } };
+    if (opts.body !== undefined) o.body = typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body);
+    var r = await fetch(url, o);
+    var d = await r.json().catch(function () { return {}; });
+    if (!r.ok || d.success === false) { var e = new Error(d.error || d.msg || 'خطأ'); e.data = d; throw e; }
+    return d;
+}
+function spAsk(msg, ph, okText) {
+    return new Promise(function (resolve) {
+        var ov = document.createElement('div');
+        ov.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;padding:16px;';
+        ov.innerHTML = '<div style="background:#0d1f3c;border:1px solid #3b82f6;border-radius:14px;padding:18px;max-width:380px;width:100%;"><p style="margin-bottom:10px;">' + spEsc(msg) + '</p><textarea id="sp-ask-in" rows="2" placeholder="' + spEsc(ph || '') + '" style="margin-bottom:10px;"></textarea><div style="display:flex;gap:8px;"><button class="btn btn-blue" style="flex:1" id="sp-ask-ok">' + (okText || 'تأكيد') + '</button><button class="btn" style="flex:1;background:#334155" id="sp-ask-no">إلغاء</button></div></div>';
+        document.body.appendChild(ov);
+        var done = function (v) { ov.remove(); resolve(v); };
+        ov.querySelector('#sp-ask-ok').onclick = function () { done(ov.querySelector('#sp-ask-in').value); };
+        ov.querySelector('#sp-ask-no').onclick = function () { done(null); };
+    });
+}
+async function spConfirm(m) { try { return await uiConfirm(m, { okText: 'تأكيد' }); } catch (e) { return confirm(m); } }
+
+var SP = { cur: null, img: null, reply: null, edit: null, note: false, tab: 'waiting', meta: null, timer: null, loading: false, rec: null, mode: 'user' };
+var SP_ST = { ai: '🤖 مساعد آلي', waiting: '⏳ بانتظار إداري', active: '✅ مع إداري', closed: '🔒 مغلق' };
+
+function openSupportModal() { document.getElementById('supportModal').style.display = 'block'; SP.mode = 'user'; spShowList(); }
+function closeSupportModal() { document.getElementById('supportModal').style.display = 'none'; spStop(); SP.cur = null; spBadges(); }
+function spStop() { if (SP.timer) { clearInterval(SP.timer); SP.timer = null; } }
+function spBox() { return document.getElementById(SP.cur && SP.cur.box ? SP.cur.box : (SP.mode === 'admin' ? 'sp-admin-body' : 'sp-body')); }
+
+async function spLoadMeta() { if (!SP.meta) SP.meta = await spApi('/api/support/meta'); return SP.meta; }
+function spShowList() {
+    spStop(); SP.cur = null; SP.img = null;
+    document.getElementById('sp-body').innerHTML = '<button class="btn btn-blue btn-full" id="sp-newbtn" onclick="spShowNew()" style="margin-bottom:12px;">+ تكت جديد</button><div id="sp-list" style="color:#64748b;text-align:center;padding:16px;">جارِ التحميل...</div>';
+    spLoadList();
+}
+async function spLoadList() {
+    var box = document.getElementById('sp-list'); if (!box) return;
+    try {
+        var d = await spApi('/api/support/tickets');
+        var unrated = d.tickets.filter(function (t) { return t.needRate; })[0];
+        if (unrated && !d.banned) { spOpenTicket(unrated.id, 'user', 'sp-body'); return; }
+        var hasOpen = d.tickets.some(function (t) { return t.status !== 'closed'; });
+        var nb = document.getElementById('sp-newbtn');
+        if (nb) { nb.disabled = hasOpen || !!d.banned; nb.style.opacity = (hasOpen || d.banned) ? '.55' : ''; nb.textContent = d.banned ? '🚫 تم حظرك من خدمة العملاء' : hasOpen ? '🔒 عندك تكت مفتوح، لين يتسكّر ما تقدر تفتح جديد' : '+ تكت جديد'; }
+        if (!d.tickets.length) { box.innerHTML = 'ما عندك تكتات، افتح تكت جديد وبنساعدك 👌'; return; }
+        box.innerHTML = d.tickets.map(function (t) { return spRowHtml(t, 'user', 'sp-body', false); }).join('');
+    } catch (e) { box.innerHTML = '<span style="color:#fca5a5">' + spEsc(e.message) + '</span>'; }
+}
+function spRowHtml(t, mode, boxId, del) {
+    return '<div class="sp-row" onclick="spOpenTicket(\'' + t.id + '\',\'' + mode + '\',\'' + boxId + '\')"><div class="t1"><span>#' + t.no + ' — ' + spEsc(mode === 'admin' ? t.name : t.category) + (t.unread ? '<span class="sp-badge">' + t.unread + '</span>' : '') + '</span><span class="sp-chip ' + t.status + '">' + SP_ST[t.status] + (t.adminName && mode === 'admin' ? ' — ' + spEsc(t.adminName) : '') + '</span></div>' +
+        (mode === 'admin' ? '<div class="t2">' + spEsc(t.category) + (t.place ? ' • ' + spEsc(t.place) : '') + '</div>' : '') + '<div class="t2">' + spEsc(t.last || '') + '</div>' +
+        (del ? '<div style="margin-top:6px"><button class="sp-link" style="color:#fca5a5" onclick="event.stopPropagation();spDeleteRow(\'' + t.id + '\')">🗑️ حذف</button></div>' : '') + '</div>';
+}
+async function spShowNew() {
+    SP.img = null; var m = await spLoadMeta();
+    document.getElementById('sp-body').innerHTML = '<button class="sp-link" onclick="spShowList()">‹ رجوع</button>' +
+        '<label>نوع المشكلة</label><select id="spn-cat" onchange="spCatChanged()">' + m.cats.map(function (c) { return '<option>' + spEsc(c) + '</option>'; }).join('') + '</select>' +
+        '<div id="spn-place-wrap"><label>وين بالضبط؟</label><select id="spn-place"></select></div>' +
+        '<label>اشرح المشكلة</label><textarea id="spn-text" rows="4" maxlength="1500" placeholder="وش اللي صار؟ وش الخطأ اللي ظهر؟"></textarea>' +
+        '<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px"><label class="sp-attach">📎<input type="file" accept="image/*" style="display:none" onchange="spPick(this)"></label><div id="sp-prev"></div></div>' +
+        '<button class="btn btn-blue btn-full" id="spn-go" onclick="spCreate()">فتح التكت</button>';
+    spCatChanged();
+}
+function spCatChanged() {
+    var c = document.getElementById('spn-cat').value, l = (SP.meta.places || {})[c], w = document.getElementById('spn-place-wrap');
+    if (!l) { w.style.display = 'none'; return; }
+    w.style.display = ''; document.getElementById('spn-place').innerHTML = l.map(function (x) { return '<option>' + spEsc(x) + '</option>'; }).join('');
+}
+async function spCreate() {
+    var b = document.getElementById('spn-go'), text = document.getElementById('spn-text').value.trim();
+    if (!text && !SP.img) return bkToast('اشرح المشكلة أو أرفق صورة', 'warning');
+    b.disabled = true;
+    try {
+        var w = document.getElementById('spn-place-wrap');
+        var d = await spApi('/api/support/tickets', { method: 'POST', body: { category: document.getElementById('spn-cat').value, place: w.style.display !== 'none' ? document.getElementById('spn-place').value : '', text: text, image: SP.img } });
+        SP.img = null; spOpenTicket(d.id, 'user', 'sp-body');
+    } catch (e) { bkToast(e.message, 'danger'); b.disabled = false; if (e.data && e.data.needRate) spOpenTicket(e.data.needRate, 'user', 'sp-body'); }
+}
+function spPick(inp) {
+    var f = inp.files && inp.files[0]; inp.value = ''; if (!f) return;
+    if (f.type.indexOf('image/') !== 0) return bkToast('اختر صورة فقط', 'warning');
+    var fr = new FileReader();
+    fr.onload = function () {
+        var im = new Image();
+        im.onload = function () {
+            var max = 1100, w = im.width, h = im.height;
+            if (w > max || h > max) { var k = Math.min(max / w, max / h); w = Math.round(w * k); h = Math.round(h * k); }
+            var cv = document.createElement('canvas'); cv.width = w; cv.height = h; cv.getContext('2d').drawImage(im, 0, 0, w, h);
+            var q = 0.8, out = cv.toDataURL('image/jpeg', q);
+            while (out.length > 1100000 && q > 0.3) { q -= 0.15; out = cv.toDataURL('image/jpeg', q); }
+            SP.img = out; spPaintPrev();
+        };
+        im.src = fr.result;
+    };
+    fr.readAsDataURL(f);
+}
+function spPaintPrev() { var p = document.getElementById('sp-prev'); if (p) p.innerHTML = SP.img ? '<img src="' + SP.img + '" style="height:46px;border-radius:6px"> <button class="sp-link" onclick="SP.img=null;spPaintPrev()">✕</button>' : ''; }
+
+// ── المحادثة ──
+async function spOpenTicket(id, mode, boxId) {
+    spStop(); SP.mode = mode; SP.cur = { id: id, mode: mode, box: boxId, n: 0, mver: undefined, mm: {}, role: null }; SP.img = null; SP.reply = null; SP.edit = null; SP.note = false;
+    var admin = mode === 'admin';
+    document.getElementById(boxId).innerHTML = '<div class="sp-chat"><div class="sp-bar"><button class="sp-link" onclick="spBack()">‹ رجوع</button><div class="sp-title" id="sp-title">...</div><span id="sp-tools"></span></div>' +
+        '<div class="sp-state" id="sp-state"></div><div class="sp-info" id="sp-info" style="display:none"></div><div class="sp-msgs" id="sp-msgs"></div><div id="sp-typing" class="sp-typing"></div><div id="sp-rate" class="sp-rate" style="display:none"></div><div id="sp-prev"></div><div id="sp-ctx" class="sp-ctx" style="display:none"></div>' +
+        '<div class="sp-compose" id="sp-compose"><label class="sp-attach">📎<input type="file" accept="image/*" style="display:none" onchange="spPick(this)"></label><button class="sp-mic" id="sp-mic" onclick="spVoice()">🎙️</button>' +
+        (admin ? '<button class="sp-mic" id="sp-note-btn" title="ملاحظة داخلية" onclick="spNoteToggle()">📝</button><button class="sp-mic" title="ردود جاهزة" onclick="spCanned()">⚡</button>' : '') +
+        '<textarea id="sp-in" rows="1" placeholder="اكتب رسالتك..."></textarea><button class="btn btn-blue" id="sp-send" onclick="spSend()">➤</button></div></div>';
+    var ta = document.getElementById('sp-in');
+    ta.onkeydown = function (e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); spSend(); } };
+    var lastPing = 0; ta.oninput = function () { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 110) + 'px'; if (Date.now() - lastPing > 2000 && SP.cur) { lastPing = Date.now(); spApi('/api/support/tickets/' + SP.cur.id + '/typing', { method: 'POST', body: {} }).catch(function () {}); } };
+    document.getElementById('sp-msgs').onclick = spMsgClick;
+    await spLoadNew(true);
+    SP.timer = setInterval(function () { if (SP.cur) spLoadNew(); }, 2200);
+}
+function spBack() {
+    spStop(); SP.cur = null; SP.img = null; SP.reply = null; SP.edit = null;
+    if (SP.mode === 'admin') spaShowList(); else spShowList();
+}
+async function spLoadNew(first) {
+    var c = SP.cur; if (!c || SP.loading) return; SP.loading = true;
+    try {
+        var d = await spApi('/api/support/tickets/' + c.id + '?after=' + c.n);
+        if (SP.cur !== c) return;
+        c.t = d.ticket; c.role = d.role; c.canInspect = !!d.canInspect; c.senior = !!d.senior;
+        var sk = (d.shared || []).join(','), skCh = c.sharedKey !== sk; c.sharedKey = sk; c.shared = d.shared || [];
+        var box = document.getElementById('sp-msgs'); if (!box) return;
+        if (c.mver === undefined) c.mver = d.mver;
+        else if (d.mver !== c.mver) { c.mver = d.mver; c.n = 0; c.mm = {}; box.innerHTML = ''; SP.loading = false; return spLoadNew(); }
+        var near = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
+        d.msgs.forEach(function (m) { box.insertAdjacentHTML('beforeend', spMsgHtml(m)); });
+        c.n = d.n;
+        var tp = document.getElementById('sp-typing'); if (tp) tp.textContent = d.typing ? ('✍️ ' + d.typing + ' يكتب...') : (d.aiTyping ? '🤖 المساعد يكتب...' : '');
+        spPaintState();
+        if (skCh) spLoadInfo();
+        if (first || (near && d.msgs.length)) box.scrollTop = box.scrollHeight;
+        if (d.msgs.length) spBadges();
+    } catch (e) {
+        if (first) { var el = document.getElementById(c.box); if (el) el.innerHTML = '<div style="color:#fca5a5;padding:12px">' + spEsc(e.message) + '</div>'; }
+        else if (/غير موجود/.test(e.message)) { bkToast('هذا التكت انحذف', 'warning'); spBack(); }
+    } finally { SP.loading = false; }
+}
+function spMedia(c, m) {
+    var src = BKB('/api/support/tickets/' + c.id + '/media/' + m.media);
+    if (m.mk === 'img') return '<img class="sp-img" loading="lazy" src="' + src + '" onclick="spViewImg(this.src)">';
+    if (m.mk === 'aud') return '<audio controls preload="none" src="' + src + '" style="max-width:100%;height:36px"></audio>';
+    return '';
+}
+function spViewImg(src) { var o = document.createElement('div'); o.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.92);display:flex;align-items:center;justify-content:center'; o.innerHTML = '<img src="' + src + '" style="max-width:96%;max-height:92%">'; o.onclick = function () { o.remove(); }; document.body.appendChild(o); }
+function spMsgHtml(m) {
+    if (m.hid) return '';
+    var c = SP.cur; c.mm[m.i] = m;
+    var roleTag = m.role === 'senior' ? '<span class="sp-role senior">كبار المسؤولين</span>' : (m.sender === 'admin' ? '<span class="sp-role admin">إداري</span>' : '');
+    if (m.sender === 'note') return '<div class="sp-msg note" data-i="' + m.i + '"><div class="sp-who">📝 ملاحظة داخلية (ما تظهر للعضو) — ' + spEsc(m.name) + roleTag + '</div><div class="sp-b">' + spEsc(m.text) + '</div><div class="sp-time">' + spTime(m.at) + '</div></div>';
+    var mine = c.mode === 'admin' ? m.sender === 'admin' : m.sender === 'user';
+    var cls = m.sender === 'system' ? 'sys' : (mine ? 'me' : 'other') + (m.sender === 'ai' ? ' ai' : '') + (m.del ? ' del' : '');
+    var who = m.sender === 'system' ? '' : '<div class="sp-who">' + (m.sender === 'ai' ? '🤖 ' : m.sender === 'admin' ? '🛡️ ' : '') + spEsc(m.name) + roleTag + '</div>';
+    var quote = m.rp != null ? '<div class="sp-quote"><b>' + spEsc(m.rpn) + '</b>' + spEsc(m.rpt) + '</div>' : '';
+    var delTag = m.del ? '<div class="sp-deltag">🗑️ ' + (c.mode === 'admin' ? 'محذوفة — حذفها ' + spEsc(m.delBy) + (m.rev ? ' • معروضة للعضو' : ' • مخفية عن العضو') : 'رسالة محذوفة (عرضتها لك الإدارة)') + '</div>' : '';
+    var data = m.sender === 'system' ? '' : ' data-i="' + m.i + '"';
+    return '<div class="sp-msg ' + cls + '"' + data + '>' + who + '<div class="sp-b">' + delTag + quote + spEsc(m.text) + (m.media ? spMedia(c, m) : '') + '</div>' + (m.sender === 'system' ? '' : '<div class="sp-time">' + spTime(m.at) + (m.ed ? ' • معدّلة' : '') + '</div>') + '</div>';
+}
+function spPaintState() {
+    var c = SP.cur, t = c.t, st = document.getElementById('sp-state'); if (!st) return;
+    document.getElementById('sp-title').textContent = '#' + t.no + ' — ' + (c.mode === 'admin' ? t.name : t.category);
+    var h = '<span class="sp-chip ' + t.status + '">' + SP_ST[t.status] + (t.adminName ? ' — ' + spEsc(t.adminName) : '') + '</span>';
+    var tools = '';
+    if (c.mode === 'admin') {
+        if (t.status === 'waiting' || (t.status === 'ai' && false)) h += ' <button class="btn btn-green" style="padding:4px 10px" onclick="spJoin()">✋ استلام</button>';
+        if (t.status !== 'closed') h += ' <button class="btn btn-red" style="padding:4px 10px" onclick="spCloseTicket()">🔒 إغلاق</button>';
+        if (c.canInspect) tools += '<button class="sp-link" onclick="spInspect()">🔎 فحص</button> ';
+        if (c.senior) tools += '<button class="sp-link" style="color:#fca5a5" onclick="spBan()">🚫 حظر</button>';
+    } else if (t.status === 'ai') h += ' <button class="btn btn-blue" style="padding:4px 10px" onclick="spHuman()">🧑‍💼 تحدث مع عضو حقيقي</button>';
+    st.innerHTML = h + '<div style="color:#94a3b8;font-size:.78rem;margin-top:4px">' + spEsc(t.category) + (t.place ? ' • ' + spEsc(t.place) : '') + '</div>';
+    document.getElementById('sp-tools').innerHTML = tools;
+    var closed = t.status === 'closed', cp = document.getElementById('sp-compose');
+    var canWrite = !closed && (c.mode === 'user' || c.senior || (t.status === 'active'));
+    cp.style.display = canWrite ? 'flex' : 'none';
+    var rb = document.getElementById('sp-rate');
+    if (closed && c.mode === 'user' && t.rating == null) { if (!rb.innerHTML) { rb.innerHTML = '<b>⭐ قيّم خدمة الدعم</b><div style="font-size:.78rem;color:#94a3b8">التقييم إجباري عشان تفتح تكت جديد</div><div class="sp-stars" id="sp-stars">' + [1, 2, 3, 4, 5].map(function (n) { return '<button onclick="spStar(' + n + ')">★</button>'; }).join('') + '</div><textarea id="sp-rate-c" rows="2" maxlength="300" placeholder="تعليق (اختياري)"></textarea><button class="btn btn-blue btn-full" id="sp-rate-go" disabled onclick="spRate()">إرسال التقييم</button>'; } rb.style.display = 'block'; }
+    else rb.style.display = 'none';
+    if (c.mode === 'user' && c.shared && c.shared.length) { var inf = document.getElementById('sp-info'); if (inf && !inf.dataset.l) { inf.dataset.l = '1'; } }
+}
+var SPR = { n: 0 };
+function spStar(n) { SPR.n = n; var b = document.getElementById('sp-stars').children; for (var i = 0; i < b.length; i++) b[i].className = i < n ? 'on' : ''; document.getElementById('sp-rate-go').disabled = false; }
+async function spRate() {
+    var c = SP.cur; if (!c || !SPR.n) return;
+    try { await spApi('/api/support/tickets/' + c.id + '/rate', { method: 'POST', body: { stars: SPR.n, comment: (document.getElementById('sp-rate-c') || {}).value || '' } }); bkToast('🙏 شكراً لتقييمك', 'success'); document.getElementById('sp-rate').innerHTML = ''; spBack(); }
+    catch (e) { bkToast(e.message, 'danger'); }
+}
+async function spLoadInfo() {
+    var c = SP.cur, el = document.getElementById('sp-info'); if (!c || !el) return;
+    if (!c.shared || !c.shared.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    try {
+        var d = await spApi('/api/support/tickets/' + c.id + '/info');
+        if (!d.items.length) { el.style.display = 'none'; return; }
+        el.style.display = ''; el.innerHTML = '<b>🔎 معلومات معروضة' + (c.mode === 'user' ? ' لك' : ' للعضو') + '</b>' + d.items.map(function (g) { return '<div class="sp-grp"><div style="color:#60a5fa;font-weight:bold">' + spEsc(g.title) + '</div>' + g.rows.map(function (r) { return '<div class="sp-ir"><span>' + spEsc(r.l) + '</span><span>' + spEsc(r.d ? spDate(r.v) : r.at ? spDate(r.at) + ' — ' + r.v : r.v) + '</span></div>'; }).join('') + '</div>'; }).join('');
+    } catch (e) {}
+}
+async function spSend() {
+    var c = SP.cur; if (!c) return;
+    var ta = document.getElementById('sp-in'), text = ta.value.trim();
+    if (SP.edit != null) {
+        if (!text) return;
+        try { await spApi('/api/support/tickets/' + c.id + '/messages/' + SP.edit + '/edit', { method: 'POST', body: { text: text } }); SP.edit = null; ta.value = ''; spPaintCtx(); spLoadNew(); } catch (e) { bkToast(e.message, 'danger'); }
+        return;
+    }
+    if (!text && !SP.img) return;
+    var btn = document.getElementById('sp-send'); btn.disabled = true;
+    try {
+        if (SP.note) await spApi('/api/support/tickets/' + c.id + '/note', { method: 'POST', body: { text: text } });
+        else await spApi('/api/support/tickets/' + c.id + '/messages', { method: 'POST', body: { text: text, image: SP.img, replyTo: SP.reply } });
+        ta.value = ''; ta.style.height = 'auto'; SP.img = null; SP.reply = null; spPaintPrev(); spPaintCtx(); await spLoadNew();
+        var b = document.getElementById('sp-msgs'); if (b) b.scrollTop = b.scrollHeight;
+    } catch (e) { bkToast(e.message, 'danger'); }
+    btn.disabled = false;
+}
+function spNoteToggle() { SP.note = !SP.note; var b = document.getElementById('sp-note-btn'); if (b) b.style.background = SP.note ? '#eab308' : ''; document.getElementById('sp-in').placeholder = SP.note ? 'ملاحظة داخلية (ما تظهر للعضو)...' : 'اكتب رسالتك...'; }
+function spPaintCtx() {
+    var b = document.getElementById('sp-ctx'); if (!b) return;
+    var c = SP.cur;
+    if (SP.edit != null) { b.style.display = ''; b.innerHTML = '✏️ تعديل رسالة <button class="sp-link" onclick="SP.edit=null;document.getElementById(\'sp-in\').value=\'\';spPaintCtx()">✕</button>'; }
+    else if (SP.reply != null && c.mm[SP.reply]) { b.style.display = ''; b.innerHTML = '↩️ رد على ' + spEsc(c.mm[SP.reply].name || '') + ': ' + spEsc((c.mm[SP.reply].text || '').slice(0, 40)) + ' <button class="sp-link" onclick="SP.reply=null;spPaintCtx()">✕</button>'; }
+    else { b.style.display = 'none'; b.innerHTML = ''; }
+}
+function spMsgClick(e) {
+    var el = e.target.closest('.sp-msg[data-i]'); if (!el || e.target.closest('img,audio,button')) return;
+    var c = SP.cur, m = c.mm[el.dataset.i]; if (!m) return;
+    var closed = c.t.status === 'closed', items = [];
+    if (!m.del && !closed && m.sender !== 'note') items.push(['↩️ رد', 'reply']);
+    if (m.text) items.push(['📋 نسخ', 'copy']);
+    if (m.own && !m.del && !closed && !m.media && (m.sender === 'user' || m.sender === 'admin')) items.push(['✏️ تعديل', 'edit']);
+    if (!m.del && m.sender !== 'note' && (m.own || c.senior)) items.push(['🗑️ حذف', 'del']);
+    if (c.senior && m.del) items.push([m.rev ? '🙈 إخفاء عن العضو' : '👁️ عرض للعضو', 'reveal']);
+    if (c.senior && m.edits && m.edits.length) items.push(['🕘 سجل التعديل', 'hist']);
+    if (!items.length) return;
+    var ov = document.createElement('div'); ov.style.cssText = 'position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.55);display:flex;align-items:flex-end;justify-content:center';
+    ov.innerHTML = '<div style="background:#0d1f3c;border-radius:14px 14px 0 0;width:100%;max-width:420px;padding:10px">' + items.map(function (it) { return '<button class="btn btn-full" style="background:rgba(255,255,255,.07);margin-bottom:6px" data-a="' + it[1] + '">' + it[0] + '</button>'; }).join('') + '</div>';
+    ov.onclick = function (ev) { var a = ev.target.getAttribute('data-a'); ov.remove(); if (a) spMsgAct(a, m); };
+    document.body.appendChild(ov);
+}
+async function spMsgAct(a, m) {
+    var c = SP.cur, base = '/api/support/tickets/' + c.id + '/messages/' + m.i;
+    try {
+        if (a === 'reply') { SP.reply = m.i; SP.edit = null; spPaintCtx(); document.getElementById('sp-in').focus(); }
+        else if (a === 'copy') { try { await navigator.clipboard.writeText(m.text); bkToast('تم النسخ', 'success'); } catch (e) {} }
+        else if (a === 'edit') { SP.edit = m.i; SP.reply = null; document.getElementById('sp-in').value = m.text; spPaintCtx(); document.getElementById('sp-in').focus(); }
+        else if (a === 'del') { if (await spConfirm('تحذف هذي الرسالة؟')) { await spApi(base + '/delete', { method: 'POST', body: {} }); spLoadNew(); } }
+        else if (a === 'reveal') { await spApi(base + '/reveal', { method: 'POST', body: { show: !m.rev } }); spLoadNew(); }
+        else if (a === 'hist') { uiAlert('سجل التعديلات:\n' + m.edits.map(function (x) { return '• ' + spDate(x.at) + ': ' + x.text; }).join('\n')); }
+    } catch (e) { bkToast(e.message, 'danger'); }
+}
+async function spHuman() { try { await spApi('/api/support/tickets/' + SP.cur.id + '/human', { method: 'POST', body: {} }); spLoadNew(); } catch (e) { bkToast(e.message, 'danger'); } }
+async function spJoin() { try { await spApi('/api/support/admin/tickets/' + SP.cur.id + '/join', { method: 'POST', body: {} }); spLoadNew(); } catch (e) { bkToast(e.message, 'danger'); } }
+async function spCloseTicket() { if (!(await spConfirm('تقفل هذا التكت؟'))) return; try { await spApi('/api/support/tickets/' + SP.cur.id + '/close', { method: 'POST', body: {} }); spLoadNew(); } catch (e) { bkToast(e.message, 'danger'); } }
+async function spBan() { var r = await spAsk('حظر هذا العضو من خدمة العملاء؟ اكتب السبب (اختياري):', 'السبب', 'حظر'); if (r === null) return; try { await spApi('/api/support/admin/tickets/' + SP.cur.id + '/ban', { method: 'POST', body: { reason: r } }); bkToast('🚫 تم الحظر', 'success'); spLoadNew(); } catch (e) { bkToast(e.message, 'danger'); } }
+async function spDeleteRow(id) { if (!(await spConfirm('تحذف التكت نهائياً؟'))) return; try { await spApi('/api/support/admin/tickets/' + id, { method: 'DELETE' }); spaLoadList(); } catch (e) { bkToast(e.message, 'danger'); } }
+async function spDeleteAllClosed() { if (!(await spConfirm('تحذف كل التكتات المغلقة نهائياً؟'))) return; try { var d = await spApi('/api/support/admin/closed', { method: 'DELETE' }); bkToast('🗑️ انحذف ' + d.deleted, 'success'); spaLoadList(); } catch (e) { bkToast(e.message, 'danger'); } }
+
+// ── الردود الجاهزة ──
+async function spCanned() {
+    var d = await spApi('/api/support/admin/canned').catch(function () { return { list: [] }; });
+    var ov = document.createElement('div'); ov.style.cssText = 'position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.6);display:flex;align-items:flex-end;justify-content:center';
+    var senior = SP.cur && SP.cur.senior;
+    ov.innerHTML = '<div style="background:#0d1f3c;border-radius:14px 14px 0 0;width:100%;max-width:440px;max-height:75vh;overflow:auto;padding:12px"><b>⚡ ردود جاهزة</b>' + d.list.map(function (r) { return '<div class="sp-row" data-t="' + spEsc(r.text) + '"><div class="t1"><span>' + spEsc(r.title) + '</span>' + (senior ? '<button class="sp-link" style="color:#fca5a5" data-del="' + r.id + '">🗑️</button>' : '') + '</div><div class="t2">' + spEsc(r.text) + '</div></div>'; }).join('') + (senior ? '<button class="btn btn-green btn-full" data-add="1">+ إضافة رد</button>' : '') + '</div>';
+    ov.onclick = async function (ev) {
+        var del = ev.target.getAttribute('data-del'), add = ev.target.getAttribute('data-add'), row = ev.target.closest('[data-t]');
+        if (del) { await spApi('/api/support/admin/canned/' + del, { method: 'DELETE' }); ov.remove(); spCanned(); }
+        else if (add) { var t = await spAsk('عنوان الرد:'); if (!t) return; var x = await spAsk('نص الرد:'); if (!x) return; try { await spApi('/api/support/admin/canned', { method: 'POST', body: { title: t, text: x } }); } catch (e) { bkToast(e.message, 'danger'); } ov.remove(); spCanned(); }
+        else if (row) { document.getElementById('sp-in').value = row.getAttribute('data-t'); ov.remove(); }
+        else if (ev.target === ov) ov.remove();
+    };
+    document.body.appendChild(ov);
+}
+
+// ── فحص العضو ──
+var SPI = { cat: null, rows: [], sel: {} };
+function spInspect() {
+    var ov = document.createElement('div'); ov.id = 'sp-insp'; ov.style.cssText = 'position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;padding:12px';
+    ov.innerHTML = '<div style="background:#0d1f3c;border:1px solid #3b82f6;border-radius:14px;width:100%;max-width:480px;max-height:85vh;overflow:auto;padding:14px"><div style="display:flex;justify-content:space-between"><b>🔎 فحص العضو</b><button class="sp-link" onclick="document.getElementById(\'sp-insp\').remove()">✕</button></div><div style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0">' + [['account', '🏦 الحساب'], ['card', '💳 البطاقة'], ['transfers', '💸 الحوالات'], ['loan', '📋 القروض'], ['flash', '⚡ فلاش']].map(function (c) { return '<button class="btn btn-blue" style="padding:5px 10px" onclick="spInspectCat(\'' + c[0] + '\')">' + c[1] + '</button>'; }).join('') + '</div><div id="sp-insp-body" style="color:#94a3b8;font-size:.85rem">اختر قسم، وعلّم اللي تبي يظهر للعضو.</div></div>';
+    document.body.appendChild(ov);
+}
+async function spInspectCat(cat) {
+    var b = document.getElementById('sp-insp-body'); b.textContent = 'جارِ التحميل...';
+    try {
+        var d = await spApi('/api/support/admin/tickets/' + SP.cur.id + '/inspect/' + cat);
+        SPI.cat = cat; SPI.rows = d.rows; SPI.sel = {}; d.rows.forEach(function (r) { SPI.sel[r.k] = !!r.shown; });
+        b.innerHTML = '<b style="color:#60a5fa">' + spEsc(d.title) + '</b>' + d.rows.map(function (r, i) { return '<label style="display:flex;gap:8px;align-items:flex-start;padding:6px 0;border-bottom:1px dashed rgba(255,255,255,.08);cursor:pointer"><input type="checkbox" style="width:auto;margin:3px 0 0" ' + (r.shown ? 'checked' : '') + ' onchange="SPI.sel[SPI.rows[' + i + '].k]=this.checked"><span style="flex:1"><span style="color:#94a3b8">' + spEsc(r.l) + '</span><br>' + spEsc(r.d ? spDate(r.v) : r.at ? spDate(r.at) + ' — ' + r.v : r.v) + '</span></label>'; }).join('') + '<button class="btn btn-green btn-full" style="margin-top:10px" onclick="spShare()">💾 حفظ (إظهار المعلّم للعضو)</button>';
+    } catch (e) { b.innerHTML = '<span style="color:#fca5a5">' + spEsc(e.message) + '</span>'; }
+}
+async function spShare() {
+    var show = [], hide = []; SPI.rows.forEach(function (r) { (SPI.sel[r.k] ? show : hide).push(r.k); });
+    try { await spApi('/api/support/admin/tickets/' + SP.cur.id + '/share', { method: 'POST', body: { show: show, hide: hide } }); bkToast('✅ تم الحفظ', 'success'); spLoadNew(); } catch (e) { bkToast(e.message, 'danger'); }
+}
+
+// ── الرسائل الصوتية ──
+async function spVoice() {
+    var mic = document.getElementById('sp-mic');
+    if (SP.rec) { SP.rec.stop(); return; }
+    if (!(navigator.mediaDevices && window.MediaRecorder)) return bkToast('جهازك ما يدعم التسجيل الصوتي', 'warning');
+    try {
+        var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        var mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'].filter(function (m) { return MediaRecorder.isTypeSupported(m); })[0] || '';
+        var rec = new MediaRecorder(stream, mime ? { mimeType: mime } : {}), chunks = [], t0 = Date.now();
+        rec.ondataavailable = function (e) { if (e.data.size) chunks.push(e.data); };
+        rec.onstop = async function () {
+            stream.getTracks().forEach(function (t) { t.stop(); }); SP.rec = null; mic.textContent = '🎙️'; mic.style.background = '';
+            var dur = Math.round((Date.now() - t0) / 1000); if (dur < 1) return;
+            var blob = new Blob(chunks, { type: rec.mimeType || 'audio/webm' });
+            if (blob.size > 2.5 * 1024 * 1024) return bkToast('الرسالة الصوتية طويلة', 'warning');
+            var fr = new FileReader();
+            fr.onload = async function () {
+                try { await spApi('/api/support/tickets/' + SP.cur.id + '/messages', { method: 'POST', body: { audio: String(fr.result).split(',')[1], audioMime: (rec.mimeType || 'audio/webm').split(';')[0], audioDuration: dur, replyTo: SP.reply } }); SP.reply = null; spPaintCtx(); spLoadNew(); }
+                catch (e) { bkToast(e.message, 'danger'); }
+            };
+            fr.readAsDataURL(blob);
+        };
+        rec.start(); SP.rec = rec; mic.textContent = '⏹️'; mic.style.background = '#ef4444';
+        setTimeout(function () { if (SP.rec === rec) rec.stop(); }, 120000);
+    } catch (e) { bkToast('تعذر فتح المايك', 'danger'); }
+}
+
+// ── لوحة الإدارة / كبار التكتات ──
+function loadAdminSupport() {
+    SP.mode = 'admin'; spStop(); SP.cur = null;
+    var box = document.getElementById('admin-support-container');
+    box.innerHTML = '<div class="sp-tabs" id="spa-tabs"></div><div id="sp-admin-body" style="min-height:360px"></div>';
+    spaShowList();
+}
+function spaShowList() {
+    spStop(); SP.cur = null; SP.mode = 'admin';
+    var senior = currentRole === 'super_admin';
+    var tabs = senior ? [['waiting', '⏳ انتظار'], ['active', '✅ قيد المتابعة'], ['ai', '🤖 المساعد'], ['closed', '🔒 مغلقة'], ['rates', '⭐ التقييمات'], ['bans', '🚫 المحظورين']] : [['waiting', '⏳ انتظار الإدارة']];
+    if (!senior) SP.tab = 'waiting';
+    document.getElementById('spa-tabs').innerHTML = tabs.map(function (t) { return '<button class="sp-tab ' + (SP.tab === t[0] ? 'on' : '') + '" onclick="SP.tab=\'' + t[0] + '\';spaShowList()">' + t[1] + '</button>'; }).join('');
+    document.getElementById('sp-admin-body').innerHTML = '<div id="spa-list" style="color:#64748b;text-align:center;padding:16px">جارِ التحميل...</div>';
+    spaLoadList();
+}
+async function spaLoadList() {
+    var box = document.getElementById('spa-list'); if (!box) return;
+    try {
+        if (SP.tab === 'bans') {
+            var b = await spApi('/api/support/admin/bans');
+            box.innerHTML = b.bans.length ? b.bans.map(function (x) { return '<div class="sp-row"><div class="t1"><span>🚫 ' + spEsc(x.name) + '</span><button class="sp-link" style="color:#86efac" onclick="spUnban(\'' + x.id + '\')">فك الحظر</button></div><div class="t2">' + (x.reason ? 'السبب: ' + spEsc(x.reason) : 'بدون سبب') + ' — ' + spEsc(x.by || '') + '</div></div>'; }).join('') : 'ما فيه محظورين';
+            return;
+        }
+        if (SP.tab === 'rates') {
+            var d = await spApi('/api/support/admin/ratings');
+            if (!d.total) { box.innerHTML = 'ما فيه تقييمات للحين'; return; }
+            box.innerHTML = '<div class="sp-row"><div class="t1"><span>📊 الإجمالي</span><span>⭐ ' + d.avg.toFixed(2) + ' (' + d.total + ')</span></div></div>' + d.admins.map(function (a) { return '<div class="sp-row" onclick="spRatingAdmin(\'' + spEsc(a.uid) + '\',\'' + spEsc(a.name) + '\')"><div class="t1"><span>🛡️ ' + spEsc(a.name) + '</span><span>⭐ ' + a.avg.toFixed(2) + ' (' + a.count + ')</span></div><div class="t2">' + [5, 4, 3, 2, 1].map(function (n) { return n + '★ ' + a.dist[n - 1]; }).join(' • ') + '</div></div>'; }).join('') + (d.recent.length ? '<b style="display:block;margin:10px 0 4px">💬 آخر التعليقات</b>' + d.recent.map(function (r) { return '<div class="sp-row"><div class="t1"><span>#' + r.no + ' — ' + spEsc(r.name) + '</span><span>' + '★'.repeat(r.stars) + '</span></div><div class="t2">' + spEsc(r.comment) + '</div><div class="t2">الإداري: ' + spEsc(r.adminName || '-') + '</div></div>'; }).join('') : '');
+            return;
+        }
+        var l = await spApi('/api/support/admin/tickets?status=' + SP.tab);
+        var canDel = currentRole === 'super_admin' && SP.tab === 'closed';
+        box.innerHTML = l.tickets.length ? (canDel ? '<button class="btn btn-red btn-full" style="margin-bottom:10px" onclick="spDeleteAllClosed()">🗑️ حذف كل التكتات المغلقة</button>' : '') + l.tickets.map(function (t) { return spRowHtml(t, 'admin', 'sp-admin-body', canDel); }).join('') : 'ما فيه تكتات هنا';
+    } catch (e) { box.innerHTML = '<span style="color:#fca5a5">' + spEsc(e.message) + '</span>'; }
+}
+async function spRatingAdmin(uid, name) {
+    var box = document.getElementById('spa-list');
+    try { var d = await spApi('/api/support/admin/ratings/' + encodeURIComponent(uid)); box.innerHTML = '<button class="sp-link" onclick="spaLoadList()">‹ رجوع</button> <b>🛡️ ' + spEsc(name) + '</b>' + d.list.map(function (r) { return '<div class="sp-row" onclick="spOpenTicket(\'' + r.ticketId + '\',\'admin\',\'sp-admin-body\')"><div class="t1"><span>#' + r.no + ' — ' + spEsc(r.name) + '</span><span>' + '★'.repeat(r.stars) + '</span></div>' + (r.comment ? '<div class="t2">' + spEsc(r.comment) + '</div>' : '') + '</div>'; }).join(''); } catch (e) { bkToast(e.message, 'danger'); }
+}
+async function spUnban(id) { if (!(await spConfirm('تفك الحظر؟'))) return; try { await spApi('/api/support/admin/bans/' + id, { method: 'DELETE' }); spaLoadList(); } catch (e) { bkToast(e.message, 'danger'); } }
+function loadAdminTicketsLog() { loadAdminSupport(); }
+
+// عدّاد التكتات على الأزرار
+async function spBadges() {
+    try {
+        var d = await spApi('/api/support/badges');
+        var n = d.user || 0;
+        ['nav-support'].forEach(function (id) { var b = document.getElementById(id); if (b) b.innerHTML = '🎧 خدمة العملاء' + (n ? ' <span class="sp-badge">' + n + '</span>' : ''); });
+        if (d.admin) { var t = document.getElementById('atab-support'); if (t) t.innerHTML = '🎧 الدعم' + ((d.admin.waiting + d.admin.unread) ? ' <span class="sp-badge">' + (d.admin.waiting + d.admin.unread) + '</span>' : ''); }
+    } catch (e) {}
+}
+
+// ═══════════ البطاقة الجديدة ═══════════
+var BK_THEMES = {
+    blue: ['#1d4ed8', '#0b1d4a', '#60a5fa'], green: ['#15803d', '#052e16', '#4ade80'], red: ['#b91c1c', '#450a0a', '#fca5a5'],
+    gold: ['#b45309', '#3b1d03', '#fde047'], purple: ['#6d28d9', '#2e1065', '#c4b5fd'], black: ['#334155', '#020617', '#94a3b8']
+};
+function bkCardHtml(c, o) {
+    o = o || {}; var th = BK_THEMES[c.cardColor] || BK_THEMES.blue;
+    var exp = c.cardExpiry ? new Date(c.cardExpiry).toLocaleDateString('en-US', { month: '2-digit', year: '2-digit' }) : '--/--';
+    var num = String(c.cardNumber || '').replace(/\s/g, '').replace(/(.{4})/g, '$1 ').trim() || '#### #### #### ####';
+    var bg = 'background:radial-gradient(circle at 85% 0%,' + th[0] + ' 0%,' + th[1] + ' 75%);';
+    var logo = '<svg viewBox="0 0 100 100" width="26" height="26" style="vertical-align:middle"><rect width="100" height="100" rx="22" fill="rgba(255,255,255,.14)"/><path fill="' + th[2] + '" d="M56 8 22 56h22l-6 36 40-52H54z"/></svg>';
+    var front = '<div class="bk-face bk-front" style="' + bg + '"><div class="bk-shine"></div>' + (c.cardFrozen ? '<div class="bk-frozen">🔒 مجمّدة</div>' : '') +
+        '<div style="display:flex;justify-content:space-between;align-items:center"><span style="font-weight:900;letter-spacing:2px;color:' + th[2] + '">' + logo + ' FLASH BANK</span><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="' + th[2] + '" stroke-width="1.8" stroke-linecap="round"><path d="M8 8a6 6 0 0 1 0 8M12 5a10 10 0 0 1 0 14M16 2a14 14 0 0 1 0 20" transform="rotate(0 12 12)"/></svg></div>' +
+        '<div class="bk-chip"></div><div class="bk-num">' + spEsc(num) + '</div>' +
+        '<div style="display:flex;justify-content:space-between;align-items:flex-end"><div><div class="bk-lbl" style="color:' + th[2] + '">CARD HOLDER</div><div class="bk-val">' + spEsc(c.cardHolderName || '---') + '</div></div><div><div class="bk-lbl" style="color:' + th[2] + '">VALID THRU</div><div class="bk-val">' + exp + '</div></div><div class="bk-net"><i></i><i></i></div></div></div>';
+    var back = '<div class="bk-face bk-back" style="' + bg + '"><div class="bk-mag"></div><div style="display:flex;align-items:center;gap:8px;margin:14px 14px 8px"><div class="bk-sig">' + (o.showCvv && c.cardCVV ? '' : '') + '</div><div class="bk-cvv">' + (o.showCvv && c.cardCVV ? spEsc(c.cardCVV) : '•••') + '</div></div><p style="font-size:.62rem;color:' + th[2] + ';margin:0 14px">🔐 الرقم السري غير مطبوع على البطاقة — احفظه ولا تعطيه أحد</p><p style="font-size:.6rem;color:rgba(255,255,255,.55);margin:6px 14px">بنك فلاش — هذه البطاقة للاستخدام داخل اللعبة فقط</p></div>';
+    return '<div class="bk-wrap ' + (c.cardFrozen ? 'bk-gray' : '') + '" onclick="this.classList.toggle(\'flip\')"><div class="bk-inner">' + front + back + '</div></div><p style="text-align:center;color:#64748b;font-size:.72rem;margin:4px 0 0">اضغط على البطاقة لقلبها</p>';
+}
+async function loadMyCards() {
+    loadMilitaryOptions();
+    var cards = await (await fetch('/api/account/cards')).json();
+    var container = document.getElementById('cards-list-container');
+    if (!cards.length) { container.innerHTML = '<div class="card" style="text-align:center;color:#64748b">لا توجد بطاقات بعد.</div>'; return; }
+    var statusMap = { pending: '⏳ قيد المراجعة', approved: '✅ مفعّلة', rejected: '❌ مرفوضة', disabled: '🚫 معطّلة من الإدارة', expired: '⌛ منتهية الصلاحية' };
+    var colorMap = { pending: '#fde047', approved: '#4ade80', rejected: '#fca5a5', disabled: '#ef4444', expired: '#94a3b8' };
+    container.innerHTML = cards.map(function (c) {
+        var isExpired = c.cardExpiry && new Date(c.cardExpiry) < new Date() && c.status === 'approved', status = isExpired ? 'expired' : c.status;
+        var needsPin = c.status === 'approved' && c.cardNumber && !c.pinSet;
+        var card = c.status === 'approved' && c.cardNumber && c.pinSet ? bkCardHtml(c, { showCvv: true }) : '';
+        var pinSetup = needsPin ? '<div style="background:#0f1420;border:2px solid #ef4444;border-radius:16px;padding:18px;margin-top:12px;max-width:380px;text-align:center"><div style="font-size:3rem;color:#ef4444;line-height:1">🔐</div><p style="color:#fca5a5;font-weight:bold;margin:8px 0">عيّن رقمك السري لتفعيل البطاقة</p><p style="color:#94a3b8;font-size:.78rem;margin-bottom:10px">احفظه في بالك: ما يظهر لك ولا يطبع على البطاقة، وما يشوفه غير كبار المسؤولين.</p><button class="btn btn-red" style="width:100%" onclick="openPinPad(\'' + c._id + '\')">✅ تحديد الرقم السري</button></div>' : '';
+        return '<div class="card" style="margin-bottom:14px;border-color:' + (colorMap[status] || '#3b82f6') + '"><b style="color:' + colorMap[status] + '">' + (statusMap[status] || status) + '</b>' +
+            '<p style="color:#94a3b8;font-size:.85rem;margin-top:4px">' + (c.militaryRank ? ('الرتبة: ' + spEsc(c.militaryRank) + ' | القطاع: ' + spEsc(c.militarySector || '—') + ' | اليونت: ' + spEsc(c.militaryUnit || '—')) : '') + '</p>' +
+            (c.adminNote ? '<p style="color:#60a5fa;font-size:.83rem;margin-top:4px">ملاحظة الإدارة: ' + spEsc(c.adminNote) + '</p>' : '') + card + pinSetup +
+            (isExpired ? '<p style="color:#fca5a5;font-size:.78rem;margin-top:8px">⌛ البطاقة منتهية</p><button class="btn btn-yellow" style="margin-top:8px" onclick="renewCard(\'' + c._id + '\')">🔄 تجديد البطاقة</button>' : '') +
+            (status === 'disabled' ? '<p style="color:#ef4444;font-size:.82rem;margin-top:8px">⚠️ تم تعطيل هذه البطاقة. تواصل مع خدمة العملاء.</p>' : '') + '</div>';
+    }).join('');
+}
+
+// ── تحكم البطاقات (كبار المسؤولين): الرقم السري يعرضونه بزر ──
+async function loadCardControlPanel() {
+    var cards = await (await fetch('/api/superadmin/cards/control')).json();
+    var el = document.getElementById('card-control-container');
+    if (!cards.length) { el.innerHTML = '<p style="color:#64748b;text-align:center;padding:20px">لا توجد بطاقات مفعّلة حالياً.</p>'; return; }
+    var names = { blue: 'أزرق', green: 'أخضر', red: 'أحمر', gold: 'ذهبي', purple: 'بنفسجي', black: 'أسود' };
+    el.innerHTML = cards.map(function (c) {
+        return '<div class="card" style="margin-bottom:10px;' + (c.cardFrozen ? 'border-color:#475569;opacity:.85' : 'border-color:#3b82f6') + '"><b>' + spEsc(c.discordTag) + '</b> <span style="color:#64748b;font-size:.8rem">' + spEsc(c.discord) + '</span>' +
+            '<p style="color:#94a3b8;font-size:.85rem;margin-top:4px">رقم البطاقة: ' + spEsc(c.cardNumber || '---') + ' • اللون: ' + (names[c.cardColor] || c.cardColor) + '</p>' +
+            (c.cardFrozen ? '<p style="color:#fca5a5;font-size:.82rem">🔒 البطاقة مجمّدة</p>' : '') +
+            '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"><button class="btn btn-blue" style="padding:5px 10px" ' + (c.pinSet ? '' : 'disabled') + ' onclick="ccShowPin(\'' + c._id + '\')">👁️ عرض الرقم السري</button><button class="btn btn-yellow" style="padding:5px 10px" onclick="ccChangePin(\'' + c._id + '\')">✏️ تعيين رقم جديد</button>' +
+            '<button class="btn ' + (c.cardFrozen ? 'btn-green' : 'btn-yellow') + '" style="padding:5px 10px" onclick="ccToggleFreeze(\'' + c._id + '\')">' + (c.cardFrozen ? '🔓 فك التجميد' : '🔒 تجميد') + '</button><button class="btn btn-red" style="padding:5px 10px" onclick="ccDeleteCard(\'' + c._id + '\')">🗑️ حذف</button></div><div id="cc-msg-' + c._id + '"></div></div>';
+    }).join('');
+}
+async function ccShowPin(id) {
+    var d = await spApi('/api/superadmin/cards/' + id + '/pin').catch(function (e) { return { success: false, msg: e.message }; });
+    uiAlert(d.success ? (d.pin ? '🔐 الرقم السري: ' + d.pin + '\n(مسجّل في اللوق إنك عرضته)' : 'ما عيّن رقم سري بعد') : d.msg);
+}
+async function ccChangePin(id) {
+    var pin = await spAsk('اكتب الرقم السري الجديد (4 أرقام):', '0000', 'حفظ');
+    if (pin === null) return; pin = pin.trim();
+    if (!/^\d{4}$/.test(pin)) return bkToast('لازم 4 أرقام', 'warning');
+    var d = await spApi('/api/superadmin/cards/' + id + '/pin', { method: 'PUT', body: { pin: pin } }).catch(function (e) { return { msg: e.message }; });
+    bkToast(d.msg || 'تم', d.success ? 'success' : 'danger'); loadCardControlPanel();
+}
+
+// ═══════════ ملف العضو (كبار المسؤولين) ═══════════
+function loadProfilePanel() {
+    document.getElementById('profile-container').innerHTML = '<div class="card card-blue"><h2>🔎 ملف عضو</h2><input id="pf-q" placeholder="ابحث بالاسم أو رقم الحساب..." autocomplete="off" oninput="pfSearch()"><div id="pf-res"></div></div><div id="pf-out"></div>';
+}
+var pfT = null;
+function pfSearch() {
+    clearTimeout(pfT);
+    pfT = setTimeout(async function () {
+        var q = document.getElementById('pf-q').value.trim(), box = document.getElementById('pf-res');
+        if (q.length < 2) { box.innerHTML = ''; return; }
+        var l = await (await fetch('/api/admin/account-search?q=' + encodeURIComponent(q))).json();
+        box.innerHTML = l.map(function (a) { return '<div class="sp-row" onclick="pfOpen(\'' + a.uid + '\')"><div class="t1"><span>👤 ' + spEsc(a.name) + '</span><span>' + spEsc(a.accountNumber) + '</span></div></div>'; }).join('') || '<p style="color:#64748b">ما لقيت أحد</p>';
+    }, 300);
+}
+async function pfOpen(uid) {
+    var out = document.getElementById('pf-out'); out.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    var d = await spApi('/api/superadmin/profile/' + uid).catch(function (e) { return { success: false, msg: e.message }; });
+    if (!d.success) { out.innerHTML = '<div class="card" style="color:#fca5a5">' + spEsc(d.msg) + '</div>'; return; }
+    var a = d.account, f = d.flash, row = function (l, v) { return '<div class="sp-ir"><span>' + l + '</span><span>' + spEsc(v == null || v === '' ? '—' : v) + '</span></div>'; };
+    var tx = function (t) { return t ? (t.amount || 0).toLocaleString() + ' $ — ' + spDate(t.createdAt) + (t.note ? ' — ' + t.note : '') : 'لا يوجد'; };
+    var h = '<div class="card"><h2>🏦 الحساب البنكي الآن</h2>' + row('الاسم', a.discordTag) + row('رقم الحساب', a.accountNumber) + row('الرصيد الجاري', (a.balance || 0).toLocaleString() + ' $') + row('رصيد التوفير', (a.savingsBalance || 0).toLocaleString() + ' $') + row('الحالة', a.isFrozen ? '🔒 مجمّد' : '✅ نشط') + row('محظور من الدعم', a.supportBanned ? 'نعم' : 'لا') + row('تاريخ الفتح', spDate(a.createdAt)) +
+        '<button class="btn ' + (a.isFrozen ? 'btn-green' : 'btn-yellow') + '" style="margin-top:8px" onclick="pfFreeze(\'' + a._id + '\',\'' + uid + '\')">' + (a.isFrozen ? '🔓 فك تجميد الحساب' : '🔒 تجميد الحساب') + '</button></div>';
+    h += '<div class="card"><h2>⚡ حسابه في فلاش الآن</h2>' + (f ? row('الاسم', f.name) + row('الرتبة', f.rank) + row('اليونت', f.unit) + row('القطاع', f.sector) + row('النقاط', f.points) + row('رقم البطاقة العسكرية', f.cardNumber) + row('البطاقة', f.revoked ? '🚫 ملغاة' : '✅ سارية') + row('الحالة', f.blocked ? '⛔ موقوف' : 'نشط') : '<p style="color:#64748b">تعذر جلب بيانات فلاش (أو ما له ملف).</p>') + '</div>';
+    h += '<div class="card"><h2>💳 بطاقاته</h2>' + (d.cards.length ? d.cards.map(function (c) {
+        return (c.cardNumber ? bkCardHtml(c, { showCvv: false }) : '') + '<div style="margin:8px 0 14px">' + row('الحالة', { pending: '⏳ قيد المراجعة', approved: '✅ مفعّلة', rejected: '❌ مرفوضة', disabled: '🚫 معطّلة' }[c.status] || c.status) + row('الانتهاء', c.cardExpiry ? spDate(c.cardExpiry) : '—') + row('التجميد', c.cardFrozen ? 'مجمّدة' : 'لا') + row('الرقم السري', c.pinSet ? 'معيّن' : 'لم يُعيَّن') + row('تاريخ الطلب', spDate(c.requestedAt)) +
+            (c.pinSet ? '<button class="btn btn-blue" style="margin-top:6px;padding:5px 10px" onclick="ccShowPin(\'' + c._id + '\')">👁️ عرض الرقم السري</button>' : '') + '</div>';
+    }).join('') : '<p style="color:#64748b">ما عنده بطاقات.</p>') + '</div>';
+    h += '<div class="card"><h2>💸 الحوالات</h2>' + row('📥 آخر حوالة واردة', tx(d.lastIn)) + row('📤 آخر حوالة صادرة', tx(d.lastOut)) +
+        '<h3 style="margin:12px 0 6px;color:#60a5fa;font-size:.95rem">سجل الحركات (آخر ' + d.txs.length + ')</h3>' + (d.txs.map(function (t) { var out = t.fromAccount === a.accountNumber; return '<div class="sp-row" style="cursor:default"><div class="t1"><span style="color:' + (out ? '#fca5a5' : '#4ade80') + '">' + (out ? '📤 ' : '📥 ') + (t.amount || 0).toLocaleString() + ' $</span><span style="font-size:.75rem;color:#64748b">' + spDate(t.createdAt) + '</span></div><div class="t2">' + spEsc(t.type || '') + (t.note ? ' — ' + spEsc(t.note) : '') + ' ' + spEsc(out ? (t.toAccount ? '← ' + t.toAccount : '') : (t.fromAccount ? '→ ' + t.fromAccount : '')) + '</div></div>'; }).join('') || '<p style="color:#64748b">لا توجد حركات.</p>') + '</div>';
+    if (d.loans.length) h += '<div class="card"><h2>📋 القروض</h2>' + d.loans.map(function (l) { return row(spDate(l.requestedAt) + ' — ' + l.status, (l.amount || 0).toLocaleString() + ' $ (متبقي ' + (l.remaining || 0).toLocaleString() + ')'); }).join('') + '</div>';
+    out.innerHTML = h;
+}
+async function pfFreeze(id, uid) { await fetch('/api/admin/accounts/' + id + '/freeze', { method: 'PUT' }); pfOpen(uid); }
+
+// ═══════════ سجل البنك: حذف كامل + سحب لليمين للمالك ═══════════
+async function loadBankLog() {
+    var d = await (await fetch('/api/superadmin/logs')).json();
+    var logs = d.list || [], el = document.getElementById('bank-log-container');
+    var clr = d.logClearAvailable ? '<div class="card" style="border-color:#7f1d1d;display:flex;justify-content:space-between;align-items:center;gap:8px"><div><b style="color:#f87171">🗑️ حذف اللوق الشامل</b><div style="font-size:.78rem;color:#94a3b8">يشتغل مرة وحدة بس، وبعدها الزر يختفي.</div></div><button class="btn btn-red" onclick="clearAllBankLogs()">حذف اللوق</button></div>' : '';
+    var colors = { register: '#4ade80', transfer: '#60a5fa', loan_approve: '#4ade80', loan_reject: '#fca5a5', card_approve: '#4ade80', card_reject: '#fca5a5', manual_deposit: '#4ade80', manual_deduct: '#fca5a5', card_pin_view: '#fde047', support_ban: '#f87171' };
+    el.innerHTML = clr + (logs.length ? logs.map(function (l) {
+        return '<div class="bk-log" data-lid="' + l._id + '" style="padding:8px 12px;border-right:3px solid ' + (colors[l.action] || '#64748b') + ';background:rgba(255,255,255,.03);border-radius:6px;margin-bottom:6px"><div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px"><span style="color:' + (colors[l.action] || '#94a3b8') + ';font-size:.8rem;font-weight:bold">' + spEsc(String(l.action || '').replace(/_/g, ' ').toUpperCase()) + '</span><span style="color:#475569;font-size:.75rem">' + spDate(l.createdAt) + '</span></div><p style="font-size:.83rem;margin-top:3px">' + spEsc(l.description) + '</p>' + (l.performedByTag ? '<p style="color:#64748b;font-size:.75rem">بواسطة: ' + spEsc(l.performedByTag) + '</p>' : '') + '</div>';
+    }).join('') : '<p style="color:#64748b;text-align:center;padding:20px">لا توجد أحداث مسجلة.</p>');
+    if (d.canSwipe) bkBindSwipe(el);
+}
+async function clearAllBankLogs() {
+    if (!(await spConfirm('⚠️ بيتحذف كل اللوق نهائياً، والزر ما يرجع بعدها. متأكد؟'))) return;
+    var d = await spApi('/api/superadmin/logs/clear', { method: 'POST', body: {} }).catch(function (e) { return { success: false, msg: e.message }; });
+    bkToast(d.success ? 'تم حذف اللوق' : d.msg, d.success ? 'success' : 'danger'); loadBankLog();
+}
+function bkBindSwipe(c) {
+    Array.prototype.forEach.call(c.querySelectorAll('.bk-log[data-lid]'), function (el) {
+        var sx = 0, sy = 0, dx = 0, on = false; el.style.touchAction = 'pan-y';
+        el.addEventListener('pointerdown', function (e) { on = true; sx = e.clientX; sy = e.clientY; dx = 0; el.style.transition = 'none'; try { el.setPointerCapture(e.pointerId); } catch (x) {} });
+        el.addEventListener('pointermove', function (e) {
+            if (!on) return; dx = e.clientX - sx;
+            if (Math.abs(e.clientY - sy) > Math.abs(dx) + 12) { on = false; el.style.transform = ''; el.style.opacity = ''; return; }
+            if (dx > 0) { el.style.transform = 'translateX(' + dx + 'px)'; el.style.opacity = String(Math.max(.25, 1 - dx / 300)); }
+        });
+        var end = async function () {
+            if (!on) return; on = false; el.style.transition = 'transform .2s,opacity .2s';
+            if (dx < 120) { el.style.transform = ''; el.style.opacity = ''; return; }
+            el.style.transform = 'translateX(110%)'; el.style.opacity = '0';
+            try { await spApi('/api/superadmin/logs/' + el.dataset.lid, { method: 'DELETE' }); setTimeout(function () { el.remove(); }, 200); }
+            catch (e) { el.style.transform = ''; el.style.opacity = ''; }
+        };
+        el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
+    });
+}
+
+// ═══════════ التحديث التلقائي (بدون منطق التذاكر القديم) ═══════════
+var pollInterval = null, adminPollInterval = null, lastSeenActivity = 0, lastSeenAdminActivity = 0, lastUnreadCount = null, spTick = 0;
+function startUserPolling() {
+    if (pollInterval) clearInterval(pollInterval);
+    pollInterval = setInterval(async function () {
+        try {
+            var data = await (await fetch('/api/poll/user')).json();
+            if (!data || !Object.keys(data).length) return;
+            if (data.unreadCount !== undefined && data.unreadCount !== lastUnreadCount) { lastUnreadCount = data.unreadCount; loadNotifCount(); }
+            if (data.latestUnreadId !== undefined) handleNotifPush(data.latestUnreadId);
+            if (currentAccount && (data.balance !== undefined || data.isFrozen !== undefined)) {
+                var ch = currentAccount.balance !== data.balance || currentAccount.savingsBalance !== data.savingsBalance || currentAccount.isFrozen !== data.isFrozen;
+                currentAccount.balance = data.balance; currentAccount.savingsBalance = data.savingsBalance; currentAccount.isFrozen = data.isFrozen;
+                if (ch) loadDashboard();
+            }
+            if (data.lastActivity) { if (lastSeenActivity && data.lastActivity !== lastSeenActivity) silentRefreshCurrentPage(); lastSeenActivity = data.lastActivity; }
+            if (pendingSilentRefresh) silentRefreshCurrentPage();
+            if (++spTick % 4 === 0) spBadges();
+        } catch (e) {}
+    }, 2500);
+    spBadges();
+}
+function startAdminPolling() {
+    if (adminPollInterval) clearInterval(adminPollInterval);
+    adminPollInterval = setInterval(async function () {
+        try {
+            var data = await (await fetch('/api/poll/admin')).json();
+            if (!data || !Object.keys(data).length) return;
+            var ch = data.lastActivity && lastSeenAdminActivity && data.lastActivity !== lastSeenAdminActivity;
+            if (ch) {
+                [['accounts', 'loadAdminAccounts'], ['loans', 'loadAdminLoans'], ['cards', 'loadAdminCards'], ['bank-log', 'loadBankLog']].forEach(function (p) {
+                    var s = document.getElementById('atab-' + p[0] + '-section');
+                    if (s && s.style.display !== 'none' && typeof window[p[1]] === 'function') window[p[1]]();
+                });
+            }
+            if (data.lastActivity) lastSeenAdminActivity = data.lastActivity;
+        } catch (e) {}
+    }, 3000);
+}
+// ربط تبويب ملف العضو + تحديث ظهور التبويبات
+(function () {
+    var _sw = switchAdminTab;
+    switchAdminTab = function (tab) {
+        _sw(tab);
+        ['profile'].forEach(function (t) { var b = document.getElementById('atab-' + t), s = document.getElementById('atab-' + t + '-section'); if (b) b.classList.toggle('active', t === tab); if (s) s.style.display = t === tab ? 'block' : 'none'; });
+        if (tab === 'profile') loadProfilePanel();
+    };
+})();
+`;
+
 const SUPER_ADMIN_IDS = ['1003511814140743825','1231269832201207808'];
 
 // ── نظام التحديث اللحظي (Real-time activity signal) ──────────────────────
@@ -334,9 +952,14 @@ let lastTicketActivity = Date.now();
 function bumpActivity() { lastBankActivity = Date.now(); }
 function bumpTicketActivity() { lastTicketActivity = Date.now(); bumpActivity(); }
 
- async function initBankSettings() {
-    const s = await BankSettings.findOne();
-    if (!s) await BankSettings.create({});
+async function initBankSettings() {
+    let s = await BankSettings.findOne();
+    if (!s) s = await BankSettings.create({});
+    // أول تشغيل بعد التحديث: حذف سجل الإشعارات كامل (مرة وحدة بس)
+    if (!s.notifWipeDone) { await Notification.deleteMany({}); await BankSettings.updateOne({}, { notifWipeDone: true }); console.log('🧹 تم حذف سجل الإشعارات'); }
+    // تشفير أي رقم سري قديم كان محفوظ نص عادي
+    const olds = await CardRequest.find({ cardPIN: { $nin: [null, ''] } });
+    for (const c of olds) { await CardRequest.updateOne({ _id: c._id }, { cardPINEnc: encPin(c.cardPIN), cardPIN: null }); }
 }
 initBankSettings();
 
@@ -353,34 +976,12 @@ app.use(session({
 
 app.use(passport.initialize());  // ← أضف هذا
 app.use(passport.session());     // ← وهذا
-app.use(express.json());
+app.use(express.json({ limit: '8mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 
 passport.serializeUser((user, done) => done(null, user));
 passport.deserializeUser((obj, done) => done(null, obj));
-
-// ── حماية حساب المالك المخفي: أي طلب على حسابه/بطاقته/قرضه من غيره يرجع "غير موجود" ──
-function ownerGuard(kind) {
-    return async (req, res, next) => {
-        try {
-            if (!ownerUids.size || !req.isAuthenticated() || isOwnerUid(req.user.id)) return next();
-            const id = req.params.id;
-            if (!mongoose.Types.ObjectId.isValid(id)) return next();
-            const M = kind === 'acc' ? Account : kind === 'card' ? CardRequest : Loan;
-            const doc = await M.findById(id, { discord: 1 }).lean();
-            if (doc && ownerUids.has(String(doc.discord))) return res.status(404).json({ success: false, msg: 'غير موجود' });
-        } catch (e) {}
-        next();
-    };
-}
-app.use('/api/admin/accounts/:id', ownerGuard('acc'));
-app.use('/api/superadmin/accounts/:id', ownerGuard('acc'));
-app.use('/api/admin/cards/:id', ownerGuard('card'));
-app.use('/api/superadmin/cards/:id', ownerGuard('card'));
-app.use('/api/admin/loans/:id', ownerGuard('loan'));
-
-
 
 // جدار حماية لفحص صيانة البنك العامة
 // يتحقق أن هذا الشخص مسجّل فعلاً في موقع فلاش (عسكري معه رتبة معتمدة، أو مواطن مقبول ومسجّل)
@@ -430,6 +1031,34 @@ async function isBankOwner(discordId) {
     return (await getBankRole(String(discordId))) === 'super_admin';
 }
 
+// المالك الحقيقي (مخفي): يجي علامته من فلاش عند الدخول، أو من BANK_OWNER_IDS
+async function isTrueOwner(uid) {
+    uid = String(uid);
+    if ((process.env.BANK_OWNER_IDS || '').split(',').map(x => x.trim()).includes(uid)) return true;
+    try { const fl = await FlashLink.findOne({ uid }, { isOwner: 1 }).lean(); return !!(fl && fl.isOwner); } catch (e) { return false; }
+}
+// الرقم السري للبطاقة: مشفّر AES-256-GCM (مو hash) عشان كبار المسؤولين بس يقدرون يعرضونه
+const PIN_KEY = crypto.createHash('sha256').update('bank-pin|' + (process.env.BANK_PIN_KEY || INTERNAL_API_KEY || 'change-me-bank-pin-key')).digest();
+function encPin(pin) {
+    const iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', PIN_KEY, iv);
+    const enc = Buffer.concat([c.update(String(pin), 'utf8'), c.final()]);
+    return [iv, c.getAuthTag(), enc].map(x => x.toString('base64')).join(':');
+}
+function decPin(str) {
+    try {
+        const [iv, tag, enc] = String(str || '').split(':').map(x => Buffer.from(x, 'base64'));
+        const d = crypto.createDecipheriv('aes-256-gcm', PIN_KEY, iv); d.setAuthTag(tag);
+        return Buffer.concat([d.update(enc), d.final()]).toString('utf8');
+    } catch (e) { return null; }
+}
+function pinMatches(card, pin) {
+    const real = decPin(card.cardPINEnc);
+    if (real == null) return false;
+    const a = Buffer.from(real), b = Buffer.from(String(pin));
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+const CARD_PUBLIC = '-cardPIN -cardPINEnc -pinFails -pinLockedUntil';
+const CARD_ADMIN = CARD_PUBLIC + ' -cardCVV';
 async function isBankAdmin(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ success: false, msg: "يجب تسجيل الدخول" });
     const role = await getBankRole(req.user.id);
@@ -520,7 +1149,6 @@ app.get('/sso', async (req, res) => {
         const uid = String(p.uid).slice(0, 64);
         const name = String(p.name || 'عضو').slice(0, 60);
         await FlashLink.findOneAndUpdate({ uid }, { $set: { name, rank: String(p.rank || '').slice(0, 60), unit: String(p.unit || '').slice(0, 60), isSenior: !!p.senior, ...(p.owner !== undefined ? { isOwner: !!p.owner } : {}), updatedAt: new Date() } }, { upsert: true });
-        refreshAuthSets();
 
         let acc = await Account.findOne({ discord: uid });
         if (!acc) {
@@ -554,7 +1182,7 @@ app.get('/api/auth/me', async (req, res) => {
         if (role === 'user') flashRegistered = await isFlashMember(req.user.id);
         const account = await Account.findOne({ discord: req.user.id });
         const settings = await BankSettings.findOne();
-        res.json({ loggedIn: true, user: req.user, role, hasAccount: !!account, maintenance: settings?.isMaintenance || false, flashRegistered, isOwner: await isBankOwner(req.user.id), realOwner: isOwnerUid(req.user.id) });
+        res.json({ loggedIn: true, user: req.user, role, hasAccount: !!account, maintenance: settings?.isMaintenance || false, flashRegistered, isOwner: await isBankOwner(req.user.id), ownerPower: await isTrueOwner(req.user.id) });
     } else {
         const settings = await BankSettings.findOne();
         res.json({ loggedIn: false, maintenance: settings?.isMaintenance || false });
@@ -613,10 +1241,14 @@ app.post('/api/flash/violations/pay', ensureInternalFlash, checkMaintenance, asy
         if (!card || !card.cardNumber) return res.json({ success: false, msg: 'لا توجد بطاقة بنكية مفعّلة لهذا المواطن' });
         if (card.cardFrozen) return res.json({ success: false, msg: 'البطاقة مجمّدة' });
         if (!card.pinSet) return res.json({ success: false, msg: 'لم يتم تعيين رقم سري لهذه البطاقة بعد' });
+        if (card.pinLockedUntil && new Date(card.pinLockedUntil) > new Date()) return res.json({ success: false, msg: '🔒 البطاقة مقفولة مؤقتاً بسبب محاولات خاطئة، جرّب بعد شوي' });
         const normalizedStored = String(card.cardNumber).replace(/\s/g, '');
-        if (normalizedStored !== normalizedInput || !verifyPin(cardPIN, card.cardPINHash)) {
+        if (normalizedStored !== normalizedInput || !pinMatches(card, cardPIN)) {
+            const fails = (card.pinFails || 0) + 1;
+            await CardRequest.updateOne({ _id: card._id }, { pinFails: fails >= 5 ? 0 : fails, pinLockedUntil: fails >= 5 ? new Date(Date.now() + 15 * 60000) : null });
             return res.json({ success: false, msg: 'رقم البطاقة أو الرقم السري غير صحيح' });
         }
+        if (card.pinFails) await CardRequest.updateOne({ _id: card._id }, { pinFails: 0, pinLockedUntil: null });
 
         const amt = Number(amount);
         if (!(amt > 0)) return res.json({ success: false, msg: 'مبلغ غير صالح' });
@@ -909,8 +1541,7 @@ app.post('/api/admin/toggle-feature', isBankAdmin, async (req, res) => {
 
 app.get('/api/admin/accounts', isManagementOrAbove, async (req, res) => {
     try {
-        const hid = hiddenOwnerIds(req);
-        const accounts = await Account.find(hid.length ? { discord: { $nin: hid } } : {}).sort({ createdAt: -1 });
+        const accounts = await Account.find().sort({ createdAt: -1 });
         res.json(accounts);
     } catch (e) { res.json([]); }
 });
@@ -960,10 +1591,7 @@ app.post('/api/admin/accounts/:id/balance', isBankAdmin, async (req, res) => {
 
 app.get('/api/admin/loans', isStaffOrAbove, async (req, res) => {
     try {
-        const hid = hiddenOwnerIds(req);
-        const q = { status: { $in: ['pending', 'approved'] } };
-        if (hid.length) q.discord = { $nin: hid };
-        const loans = await Loan.find(q).sort({ requestedAt: -1 });
+        const loans = await Loan.find({ status: { $in: ['pending', 'approved'] } }).sort({ requestedAt: -1 });
         res.json(loans);
     } catch (e) { res.json([]); }
 });
@@ -1222,19 +1850,16 @@ app.get('/api/account/card/military-options', checkMaintenance, async (req, res)
 app.get('/api/account/cards', checkMaintenance, async (req, res) => {
     if (!req.isAuthenticated()) return res.json([]);
     try {
-        const cards = await CardRequest.find({ discord: req.user.id }).sort({ requestedAt: -1 });
-        res.json(cards.map(c => cardSafe(c, false)));
+        const cards = await CardRequest.find({ discord: req.user.id }).select(CARD_PUBLIC).sort({ requestedAt: -1 });
+        res.json(cards);
     } catch (e) { res.json([]); }
 });
 
 // عرض جميع طلبات البطاقات للأدمن
 app.get('/api/admin/cards', isStaffOrAbove, async (req, res) => {
     try {
-        const hid = hiddenOwnerIds(req);
-        const q = { status: 'pending' };
-        if (hid.length) q.discord = { $nin: hid };
-        const cards = await CardRequest.find(q).sort({ requestedAt: -1 });
-        res.json(cards.map(c => cardSafe(c, true)));
+        const cards = await CardRequest.find({ status: 'pending' }).select(CARD_ADMIN).sort({ requestedAt: -1 });
+        res.json(cards);
     } catch (e) { res.json([]); }
 });
 
@@ -1266,7 +1891,7 @@ app.put('/api/admin/cards/:id/:action', isStaffOrAbove, async (req, res) => {
                 cardCVV: generateCVV(),
                 cardColor: finalColor,
                 pinSet: false,
-                cardPIN: null, cardPINHash: null
+                cardPIN: null, cardPINEnc: null, pinFails: 0, pinLockedUntil: null
             });
             await Notification.create({
                 discord: card.discord,
@@ -1317,8 +1942,8 @@ app.post('/api/account/card/:id/set-pin', checkMaintenance, async (req, res) => 
         if (!card) return res.json({ success: false, msg: "البطاقة غير موجودة" });
         if (card.status !== 'approved') return res.json({ success: false, msg: "لا يمكن تعيين رقم سري لهذه البطاقة" });
         if (card.pinSet) return res.json({ success: false, msg: "تم تعيين الرقم السري مسبقاً" });
-        await CardRequest.findByIdAndUpdate(card._id, { cardPINHash: hashPin(pin), cardPIN: null, pinSet: true });
-        res.json({ success: true, msg: "✅ تم حفظ الرقم السري بنجاح" });
+        await CardRequest.findByIdAndUpdate(card._id, { cardPINEnc: encPin(pin), cardPIN: null, pinSet: true, pinFails: 0, pinLockedUntil: null });
+        res.json({ success: true, msg: "✅ تم حفظ الرقم السري بنجاح — احفظه ولا تعطيه أحد، ما أحد يقدر يشوفه غير كبار المسؤولين" });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
 
@@ -1326,27 +1951,34 @@ app.post('/api/account/card/:id/set-pin', checkMaintenance, async (req, res) => 
 // عرض كل البطاقات المفعّلة (لصفحة تحكم كبار المسؤولين)
 app.get('/api/superadmin/cards/control', isBankSuperAdmin, async (req, res) => {
     try {
-        const hid = hiddenOwnerIds(req);
-        const q = { status: { $in: ['approved', 'disabled'] } };
-        if (hid.length) q.discord = { $nin: hid };
-        const cards = await CardRequest.find(q).sort({ reviewedAt: -1 });
-        res.json(cards.map(c => cardSafe(c, true)));
+        const cards = await CardRequest.find({ status: { $in: ['approved', 'disabled'] } }).select(CARD_ADMIN).sort({ reviewedAt: -1 });
+        res.json(cards);
     } catch (e) { res.json([]); }
 });
 
-// إعادة تعيين الرقم السري: ما أحد يشوف الرقم (حتى كبار المسؤولين) — الإعادة تمسحه ويحط العضو رقم جديد بنفسه
+// عرض/تغيير الرقم السري لبطاقة معينة
 app.put('/api/superadmin/cards/:id/pin', isBankSuperAdmin, async (req, res) => {
     try {
+        const { pin } = req.body;
+        if (!pin || !/^\d{4}$/.test(pin)) return res.json({ success: false, msg: "يجب أن يتكون الرقم السري من 4 أرقام" });
         const card = await CardRequest.findById(req.params.id);
         if (!card) return res.json({ success: false, msg: "البطاقة غير موجودة" });
-        await CardRequest.findByIdAndUpdate(card._id, { cardPIN: null, cardPINHash: null, pinSet: false });
-        await Notification.create({ discord: card.discord, message: `🔐 تمت إعادة تعيين الرقم السري لبطاقتك. افتح صفحة البطاقات وعيّن رقماً سرياً جديداً (احفظه — ما أحد يعرفه).`, type: 'warning' });
-        await BankLog.create({ action: 'card_pin_reset', description: `إعادة تعيين الرقم السري لبطاقة ${card.discordTag}`, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: card.discord, targetTag: card.discordTag });
-        bumpActivity();
-        res.json({ success: true, msg: "✅ تمت إعادة التعيين — العضو يحط رقماً جديداً بنفسه" });
+        await CardRequest.findByIdAndUpdate(card._id, { cardPINEnc: encPin(pin), cardPIN: null, pinSet: true, pinFails: 0, pinLockedUntil: null });
+        await BankLog.create({ action: 'card_pin_change', description: `تغيير الرقم السري لبطاقة ${card.discordTag}`, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: card.discord, targetTag: card.discordTag });
+        res.json({ success: true, msg: "✅ تم تغيير الرقم السري" });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
 
+// عرض الرقم السري (كبار المسؤولين فقط) — كل عرض ينسجل في اللوق
+app.get('/api/superadmin/cards/:id/pin', isBankSuperAdmin, async (req, res) => {
+    try {
+        const card = await CardRequest.findById(req.params.id).select('discord discordTag pinSet cardPINEnc');
+        if (!card) return res.json({ success: false, msg: 'البطاقة غير موجودة' });
+        if (!card.pinSet || !card.cardPINEnc) return res.json({ success: true, pin: null });
+        await BankLog.create({ action: 'card_pin_view', description: `عرض الرقم السري لبطاقة ${card.discordTag}`, performedBy: req.user.id, performedByTag: (await isTrueOwner(req.user.id)) ? 'كبار المسؤولين' : req.user.username, targetDiscord: card.discord, targetTag: card.discordTag });
+        res.json({ success: true, pin: decPin(card.cardPINEnc) });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
 // فريز/فك فريز البطاقة (شكلي — حق كبار المسؤولين فقط)
 app.put('/api/superadmin/cards/:id/freeze', isBankSuperAdmin, async (req, res) => {
     try {
@@ -1431,1276 +2063,6 @@ app.post('/api/admin/global-card-limit', isBankAdmin, async (req, res) => {
     } catch (e) { res.json({ success: false }); }
 });
 
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 🎧 خدمة العملاء (منقولة من فلاش بالكامل): مساعد آلي، تكتات بالصور والصوت، رد/تعديل/حذف رسائل،
-// ملاحظات داخلية، ردود جاهزة، فحص العضو، تقييمات، حظر، تعديل الحساب... كل شي
-// ═══════════════════════════════════════════════════════════════════════════
-const BANK_CFG = {
-    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
-    SUPPORT_AI_MODEL: process.env.SUPPORT_AI_MODEL || 'claude-sonnet-4-6',
-    MAX_PHOTO_MB: 1,
-    SITE_NAME: 'بنك فلاش'
-};
-const SUPPORT_CATEGORIES = ['مشكلة في الحساب البنكي', 'تحويل / رصيد', 'قرض', 'البطاقة البنكية', 'رواتب العساكر', 'اقتراح', 'أخرى'];
-
-// ── الصلاحيات: كبار المسؤولين + المالك المخفي ──
-const seniorUids = new Set(SUPER_ADMIN_IDS);
-const ownerUids = new Set(String(process.env.BANK_OWNER_IDS || '').split(',').map(s => s.trim()).filter(Boolean));
-async function refreshAuthSets() {
-    try {
-        const list = await FlashLink.find({ $or: [{ isSenior: true }, { isOwner: true }] }, { uid: 1, isSenior: 1, isOwner: 1 }).lean();
-        const sen = new Set(SUPER_ADMIN_IDS), own = new Set(String(process.env.BANK_OWNER_IDS || '').split(',').map(s => s.trim()).filter(Boolean));
-        list.forEach(l => { if (l.isSenior || l.isOwner) sen.add(l.uid); if (l.isOwner) own.add(l.uid); });
-        own.forEach(u => sen.add(u));
-        seniorUids.clear(); sen.forEach(u => seniorUids.add(u));
-        ownerUids.clear(); own.forEach(u => ownerUids.add(u));
-    } catch (e) {}
-}
-setTimeout(refreshAuthSets, 3000);
-setInterval(refreshAuthSets, 60 * 1000);
-function isSeniorAdmin(uid) { return !!uid && seniorUids.has(String(uid)); }
-function isOwnerUid(uid) { return !!uid && ownerUids.has(String(uid)); }
-// المالك مخفي عن الكل (حتى كبار المسؤولين) ما عدا نفسه
-function hiddenOwnerIds(req) {
-    if (req && req.user && ownerUids.has(String(req.user.id))) return [];
-    return Array.from(ownerUids);
-}
-function stealthActor(uid) { return isOwnerUid(uid); }
-async function isSupportAdmin(uid) {
-    if (!uid) return false;
-    if (isSeniorAdmin(uid)) return true;
-    const r = await getBankRole(String(uid));
-    return r === 'staff' || r === 'management' || r === 'admin' || r === 'super_admin';
-}
-// يكتب في سجل البنك (نفس واجهة logEvent حقت فلاش)
-async function logEvent(o) {
-    try {
-        await BankLog.create({ action: o.action, description: o.details || '', performedBy: o.actorId || null, performedByTag: o.actorTag || '', targetDiscord: o.discordId || null, targetTag: o.discordTag || '' });
-    } catch (e) {}
-}
-function sseBroadcast() { bumpTicketActivity(); }   // البنك يشتغل بالبولنق (خلف بروكسي فلاش ما يمشي SSE)
-
-// حاجز: خدمة العملاء تحتاج تسجيل دخول + احترام الصيانة/القفل/الحظر
-app.use('/api/support', async (req, res, next) => {
-    try {
-        if (!req.isAuthenticated()) return res.status(401).json({ error: 'سجّل دخولك من فلاش أولاً' });
-        const role = await getBankRole(String(req.user.id));
-        const staff = ['staff', 'management', 'admin', 'super_admin'].includes(role);
-        const s = await BankSettings.findOne();
-        if (!staff && s && s.isMaintenance) return res.status(503).json({ error: '🚨 البنك مغلق حالياً للصيانة العامة.' });
-        if (!staff && s && s.disableSupport && req.method !== 'GET') return res.status(403).json({ error: s.disableSupportReason || '🔒 خدمة العملاء موقوفة حالياً.' });
-        next();
-    } catch (e) { res.status(500).json({ error: 'خطأ' }); }
-});
-
-const SupportTicket = mongoose.model("SupportTicketV2", new mongoose.Schema({
-    no: { type: Number, index: true },
-    uid: { type: String, default: null, index: true },
-    guestToken: { type: String, default: null, index: true },
-    deviceToken: { type: String, default: null, index: true },
-    name: String,
-    category: String,
-    place: String,
-    subject: String,
-    ua: String,
-    status: { type: String, default: "ai" },
-    adminUid: { type: String, default: null },
-    adminName: { type: String, default: null },
-    discordMsgId: { type: String, default: null },
-    unreadUser: { type: Number, default: 0 },
-    unreadAdmin: { type: Number, default: 0 },
-    ratingRequired: { type: Boolean, default: false },
-    rating: { type: Number, default: null },
-    ratingComment: { type: String, default: null },
-    ratedAt: { type: Date, default: null },
-    closedByUid: { type: String, default: null },
-    closedByName: { type: String, default: null },
-    shared: { type: [String], default: [] },
-    messages: [{
-        sender: String,
-        name: String,
-        text: String,
-        image: String,
-        imageChannelId: { type: String, default: null }, imageMessageId: { type: String, default: null },
-        audio: { type: Buffer, default: undefined },
-        audioChannelId: { type: String, default: null }, audioMessageId: { type: String, default: null },
-        audioMime: { type: String, default: null }, audioDuration: { type: Number, default: null }, audioWave: { type: String, default: null },
-        suggest: Boolean,
-        role: String,
-        senderUid: { type: String, default: null },
-        replyTo: { type: Number, default: null },
-        edited: { type: Boolean, default: false }, editedAt: { type: Date, default: null },
-        edits: { type: [{ _id: false, text: String, at: Date }], default: [] },
-        deleted: { type: Boolean, default: false }, deletedAt: { type: Date, default: null },
-        deletedByUid: { type: String, default: null }, deletedByName: { type: String, default: null },
-        revealed: { type: Boolean, default: false },
-        createdAt: { type: Date, default: Date.now },
-    }],
-    mver: { type: Number, default: 0 },
-}, { timestamps: true }));
-
-const SupportRating = mongoose.model("SupportRating", new mongoose.Schema({
-    ticketId: String, no: Number, uid: String, name: String, category: String,
-    adminUid: { type: String, index: true }, adminName: String,
-    stars: Number, comment: String,
-    at: { type: Date, default: Date.now },
-}));
-const SUPPORT_CANNED_SEEDS = [
-    { title: "ترحيب", text: "هلا والله 👋 معك إدارة بنك فلاش، كيف أقدر أخدمك؟" },
-    { title: "نحتاج لقطة شاشة", text: "ممكن ترسل لقطة شاشة توضح المشكلة؟" },
-    { title: "جاري المراجعة", text: "استلمنا طلبك وجاري المراجعة، لا تقفل التكت وبنرد عليك بأقرب وقت 🙏" },
-    { title: "تم الحل", text: "تم حل المشكلة ✅ لو احتجت أي شي ثاني افتح تكت جديد، وبنسكّر هذا التكت." },
-    { title: "الرقم السري", text: "الرقم السري للبطاقة ما يعرفه أحد ولا حتى الإدارة، إذا نسيته نعيد تعيينه لك وتحط رقم جديد بنفسك." },
-];
-
-const SupportBan = mongoose.model("SupportBan", new mongoose.Schema({
-    uid: { type: String, default: null, index: true },
-    deviceTokens: { type: [String], default: [], index: true },
-    name: String,
-    reason: String,
-    bannedBy: String,
-    bannedByName: String,
-    createdAt: { type: Date, default: Date.now },
-}));
-async function supportBanned(uid, gt) {
-    if (uid) { try { const a = await Account.findOne({ discord: String(uid) }, { supportBanned: 1 }).lean(); if (a && a.supportBanned) return { uid }; } catch (e) {} }
-    const or = [];
-    if (uid) or.push({ uid });
-    if (gt) or.push({ deviceTokens: gt });
-    if (!or.length) return null;
-    return SupportBan.findOne({ $or: or }).lean();
-}
-const SUPPORT_BANNED_MSG = "تم حظرك من خدمة الدعم الفني";
-
-const SUPPORT_AI_PROMPT = [
-    "أنت مساعد خدمة العملاء في «بنك فلاش» — نظام بنك داخل لعبة أدوار (محاكاة) تابع لموقع فلاش، ولا يمت للواقع بصلة.",
-    "البنك فيه: حساب بنكي لكل عضو، تحويل أموال بين الحسابات برقم الحساب، توفير بفائدة، قروض بموافقة الإدارة، بطاقات بنكية بطلب وموافقة وفيها رقم سري من 4 أرقام يحدده العضو بنفسه، كشف حساب، إشعارات، رواتب العساكر حسب الرتبة، وسداد المخالفات بالبطاقة من موقع فلاش.",
-    "الموقع يتحدّث لحظياً بدون ريفرش، فلا تنصح بتحديث الصفحة كحل أول.",
-    "",
-    "أسلوبك: لهجة سعودية بيضاء بسيطة ومحترمة، ردود قصيرة (٢–٥ أسطر).",
-    "إذا المشكلة غير واضحة اسأل سؤال واحد فقط كل مرة: أي صفحة/قسم؟ وش اللي صار بالضبط؟ وش نص الخطأ إن وجد؟ متى صار؟ واطلب لقطة شاشة (يقدر يرفق صورة بزر 📎).",
-    "اعطه خطوات عملية قصيرة للمشاكل الشائعة: الدخول للبنك من زر «بنك فلاش» داخل فلاش من جديد، التأكد إن حسابه مو مجمّد، ومراجعة كشف الحساب.",
-    "",
-    "ممنوع: تخترع ميزات أو قرارات أو وعود. ما تقدر تغيّر أرصدة أو تعتمد قروض أو بطاقات أو تفك تجميد، هذي من صلاحية الإدارة فقط. لا تطلب الرقم السري للبطاقة أبداً ولا تقل إنك تعرفه، وما أحد يعرفه حتى الإدارة.",
-    "إذا المشكلة تحتاج إدارة (قرض، بطاقة، رصيد ناقص، حساب مجمّد، شكوى، خطأ ما انحل) قل له يضغط زر «تحدث مع عضو حقيقي» وأضف في آخر ردك العلامة [[HUMAN]] بدون أي شرح لها.",
-].join("\n");
-
-function supportGuestToken(req) {
-    const g = req.get("x-guest-token") || req.query.gt || "";
-    return /^[a-f0-9]{32}$/.test(String(g)) ? String(g) : null;
-}
-function supportCleanImage(v) {
-    if (!v || typeof v !== "string") return null;
-    if (v.length > BANK_CFG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return null;
-    return /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+\/=]+$/.test(v) ? v : null;
-}
-const SUPPORT_AUDIO_MAX_BYTES = 1200 * 1024;
-const SUPPORT_AUDIO_MAX_SEC = 180;
-const SUPPORT_AUDIO_EXT = { "audio/webm": "webm", "audio/ogg": "ogg", "audio/mp4": "m4a", "audio/x-m4a": "m4a", "audio/mpeg": "mp3" };
-function supportCleanAudio(b) {
-    if (!b || typeof b.audio !== "string") return null;
-    const mime = String(b.audioMime || "").split(";")[0].trim().toLowerCase();
-    const ext = SUPPORT_AUDIO_EXT[mime];
-    if (!ext) return null;
-    if (b.audio.length > SUPPORT_AUDIO_MAX_BYTES * 1.4 || !/^[A-Za-z0-9+/=]+$/.test(b.audio)) return null;
-    const buf = Buffer.from(b.audio, "base64");
-    if (buf.length < 200 || buf.length > SUPPORT_AUDIO_MAX_BYTES) return null;
-    const okMagic = (ext === "webm" && buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3)
-        || (ext === "ogg" && buf.toString("latin1", 0, 4) === "OggS")
-        || (ext === "m4a" && buf.toString("latin1", 4, 8) === "ftyp")
-        || (ext === "mp3" && (buf.toString("latin1", 0, 3) === "ID3" || (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0)));
-    if (!okMagic) return null;
-    let dur = Math.round(Number(b.audioDuration) || 0);
-    dur = Math.min(SUPPORT_AUDIO_MAX_SEC, Math.max(1, dur));
-    let wf = typeof b.audioWave === "string" && b.audioWave.length <= 400 && /^[A-Za-z0-9+/=]*$/.test(b.audioWave) ? b.audioWave : "";
-    return { buf, mime, ext, dur, wf };
-}
-async function supportAudioFields(c) {
-    const base = { audioMime: c.mime, audioDuration: c.dur, audioWave: c.wf };
-    return Object.assign(base, { audio: c.buf });
-}
-function supportLastPreview(t, forUser) {
-    let m = {};
-    const arr = t.messages || [];
-    for (let i = arr.length - 1; i >= 0; i--) { if (!arr[i].deleted && !(forUser && arr[i].sender === "note")) { m = arr[i]; break; } }
-    return (m.text || ((m.audioDuration || m.audioChannelId) ? "🎙️ رسالة صوتية" : "")).slice(0, 60);
-}
-async function supportLoad(req, res, full) {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) { res.status(404).json({ error: "التكت غير موجود" }); return null; }
-    const q = SupportTicket.findById(req.params.id);
-    if (!full) q.select("-messages.audio");
-    const t = await q;
-    if (!t) { res.status(404).json({ error: "التكت غير موجود" }); return null; }
-    const uid = req.user ? req.user.id : null;
-    const gt = supportGuestToken(req);
-    let role = null;
-    if ((uid && t.uid === uid) || (!t.uid && gt && t.guestToken === gt) || (gt && t.deviceToken && t.deviceToken === gt)) role = "owner";
-    else if (uid && await isSupportAdmin(uid)) {
-        role = "admin";
-        if (!isSeniorAdmin(uid) && !(t.status === "waiting" || t.adminUid === uid)) { res.status(403).json({ error: "هذا التكت مو من صلاحياتك" }); return null; }
-    }
-    if (!role) { res.status(403).json({ error: "ما عندك صلاحية على هذا التكت" }); return null; }
-    return { t, role, uid };
-}
-// هل الرسالة لهذا المشاهد؟ (العضو: رسايله | الإداري: رسايله هو)
-function supportIsOwnMsg(m, role, uid, username) {
-    if (role === "owner") return m.sender === "user";
-    return m.sender === "admin" && (m.senderUid ? m.senderUid === uid : (!!username && m.name === username));
-}
-// المحذوف: يشوفه الكبار (أحمر) والعضو فقط إذا الكبار عرضوها له
-function supportCanSeeDeleted(m, ctx) { return !!(ctx.senior || (ctx.role === "owner" && m.revealed)); }
-function supportPubMsg(m, i, ctx) {
-    ctx = ctx || { role: "owner", senior: false, uid: null, username: null, msgs: null };
-    if (m.deleted && !supportCanSeeDeleted(m, ctx)) return { i, sender: m.sender, name: m.name, hid: true, at: m.createdAt };
-    const o = { i, sender: m.sender, name: m.name, text: m.text || "", img: !!(m.image || m.imageChannelId), aud: !!(m.audio || m.audioChannelId || m.audioDuration), dur: m.audioDuration || 0, wf: m.audioWave || "", suggest: !!m.suggest, role: m.role || null, at: m.createdAt,
-        own: supportIsOwnMsg(m, ctx.role, ctx.uid, ctx.username), ed: !!m.edited, edAt: m.editedAt || null };
-    if (m.deleted) { o.del = true; o.delBy = m.deletedByName || ""; o.delAt = m.deletedAt || null; o.rev = !!m.revealed; }
-    if (typeof m.replyTo === "number" && m.replyTo >= 0 && ctx.msgs && ctx.msgs[m.replyTo]) {
-        const q = ctx.msgs[m.replyTo];
-        const hidden = (q.sender === "note" && ctx.role !== "admin") || (q.deleted && !supportCanSeeDeleted(q, ctx));
-        o.rp = m.replyTo;
-        o.rpn = hidden ? "" : (q.name || "");
-        o.rpt = hidden ? "رسالة محذوفة" : (q.text ? String(q.text).slice(0, 80) : ((q.audioDuration || q.audioChannelId) ? "🎙️ رسالة صوتية" : ((q.image || q.imageChannelId) ? "📷 صورة" : "")));
-    }
-    if (ctx.senior && m.edits && m.edits.length) o.edits = m.edits.map(e => ({ text: e.text, at: e.at }));
-    return o;
-}
-function supportCtx(x, req) {
-    return { role: x.role, senior: x.role === "admin" && isSeniorAdmin(x.uid), uid: x.uid, username: req.user ? req.user.username : null, msgs: x.t.messages };
-}
-function supportPubTicket(t) {
-    return { id: String(t._id), no: t.no, name: t.name, category: t.category, place: t.place, subject: t.subject, status: t.status, adminName: t.adminName, guest: !t.uid, updatedAt: t.updatedAt, createdAt: t.createdAt, rating: t.rating == null ? null : t.rating, needRate: !!(t.status === "closed" && t.ratingRequired && t.rating == null) };
-}
-function supportEvent(t, from, extra) { bumpTicketActivity(); }
-const supportAiTypingSet = new Set();
-function supportTyping(t, on) { if (on) supportAiTypingSet.add(String(t._id)); else supportAiTypingSet.delete(String(t._id)); }
-function supportAddMsg(t, m) {
-    t.messages.push(Object.assign({ createdAt: new Date() }, m));
-}
-
-
-async function supportImageFields(image) { return image ? { image } : {}; }
-
-async function supportAskAi(t) {
-    if (!BANK_CFG.ANTHROPIC_API_KEY || typeof fetch !== "function") return null;
-    const convo = t.messages.filter(m => !m.deleted && (m.sender === "user" || m.sender === "ai")).slice(-14);
-    let lastImgDataUrl = null;
-    {
-        const lm = convo[convo.length - 1];
-        if (lm && lm.sender === "user") {
-            if (lm.image) lastImgDataUrl = lm.image;
-        }
-    }
-    const msgs = [];
-    convo.forEach((m, idx) => {
-        const role = m.sender === "user" ? "user" : "assistant";
-        const parts = [];
-        if (role === "user" && (m.image || m.imageChannelId) && idx === convo.length - 1) {
-            const mm = lastImgDataUrl ? /^data:(image\/[a-z]+);base64,(.+)$/.exec(lastImgDataUrl) : null;
-            if (mm) parts.push({ type: "image", source: { type: "base64", media_type: mm[1], data: mm[2] } });
-        }
-        parts.push({ type: "text", text: m.text || ((m.image || m.imageChannelId) ? "(أرسل صورة)" : (m.audioDuration ? "(أرسل رسالة صوتية)" : "...")) });
-        const last = msgs[msgs.length - 1];
-        if (last && last.role === role) last.content.push(...parts); else msgs.push({ role, content: parts });
-    });
-    while (msgs.length && msgs[0].role !== "user") msgs.shift();
-    if (!msgs.length) return null;
-
-    let ctx = "الزائر غير مسجّل دخول (يتواصل من صفحة تسجيل الدخول).";
-    if (t.uid) {
-        const p = await FlashLink.findOne({ uid: String(t.uid) }).lean();
-        const a = await Account.findOne({ discord: String(t.uid) }, { isFrozen: 1 }).lean();
-        ctx = "العضو مسجّل دخول: الاسم " + t.name + (p ? "، الرتبة " + (p.rank || "-") + "، اليونت " + (p.unit || "-") : "") + (a ? (a.isFrozen ? "، حسابه البنكي مجمّد" : "، حسابه البنكي شغّال") : "") + ".";
-    }
-    ctx += " تصنيف التكت: " + (t.category || "-") + (t.place ? " — مكان المشكلة: " + t.place : "") + ". تاريخ اليوم: " + new Date().toISOString().slice(0, 10) + ".";
-
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 30000);
-    try {
-        const r = await fetch("https://api.anthropic.com/v1/messages", {
-            method: "POST",
-            signal: ctrl.signal,
-            headers: { "content-type": "application/json", "x-api-key": BANK_CFG.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-            body: JSON.stringify({ model: BANK_CFG.SUPPORT_AI_MODEL, max_tokens: 600, system: SUPPORT_AI_PROMPT + "\n\n" + ctx, messages: msgs }),
-        });
-        const d = await r.json();
-        if (!r.ok) throw new Error((d && d.error && d.error.message) || ("HTTP " + r.status));
-        return (d.content || []).filter(x => x.type === "text").map(x => x.text).join("\n").trim() || null;
-    } finally { clearTimeout(timer); }
-}
-
-function supportNorm(s) {
-    return String(s || "").toLowerCase().replace(/[\u064B-\u065F\u0640]/g, "").replace(/[أإآ]/g, "ا").replace(/ى/g, "ي").replace(/ة/g, "ه").replace(/[^\u0600-\u06FFa-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-}
-const SUPPORT_FAQ = [
-    { id: "human", keys: ["عضو حقيقي", "شخص حقيقي", "اكلم اداري", "ابي اداري", "ابغى اداري", "ابي ادارة", "ابغى ادارة", "موظف", "مسؤول", "مسوول", "بشري", "انسان", "مو بوت", "اكلم احد"], human: true,
-      a: "أكيد 👍 اضغط زر «🧑‍💼 تحدث مع عضو حقيقي» فوق، وبيوصل طلبك لفريق الإدارة وأول ما يدخل أحد بيرد عليك هنا مباشرة." },
-    { id: "thanks", keys: ["شكرا", "مشكور", "يعطيك العافيه", "الله يعطيك", "تسلم", "جزاك الله", "ممنون"], bare: true,
-      a: "العفو 🌹 إذا عندك أي شي ثاني اكتبه لي، وإذا انحلت مشكلتك تقدر تسكّر التكت." },
-    { id: "hello", keys: ["السلام عليكم", "سلام عليكم", "هلا", "مرحبا", "اهلين", "اهلا", "هاي", "صباح الخير", "مساء الخير"], bare: true,
-      a: "هلا والله 👋 وش المشكلة اللي تواجهك في البنك؟ اكتب لي وين صارت وش اللي صار بالضبط، وإذا فيه رسالة خطأ اكتبها أو أرفق صورة 📎" },
-    { id: "login", keys: ["ما اقدر ادخل", "ماقدر ادخل", "ما يدخل", "ما يفتح", "تسجيل الدخول", "تسجيل دخول", "الدخول للبنك", "ما يفتح البنك", "رابط الدخول", "انتهت صلاحية"],
-      a: "الدخول للبنك يتم فقط من زر «بنك فلاش» داخل تطبيق فلاش.\n1) ارجع لفلاش واضغط الزر من جديد (رابط الدخول يعيش دقيقة وينستخدم مرة وحدة).\n2) تأكد إن حسابك في فلاش مسجّل ومكتمل.\n3) إذا البنك واقف يظهر لك تنبيه صيانة." },
-    { id: "frozen", keys: ["مجمد", "مجمّد", "تجميد", "حسابي موقوف", "فريز", "موقوف"],
-      a: "التجميد يصدر من إدارة البنك فقط، وما تقدر تحول وأنت مجمّد. اضغط «تحدث مع عضو حقيقي» ووضّح لهم وبيراجعون حسابك.", human: true },
-    { id: "transfer", keys: ["تحويل", "حوالة", "حوالات", "حولت", "ما وصلت", "ما وصل المبلغ", "رقم الحساب", "رسوم التحويل", "رسوم"],
-      a: "لتحويل مبلغ: افتح «تحويل»، اكتب رقم حساب المستلم (6 أرقام) والمبلغ، وتأكد إن رصيدك يكفي المبلغ + رسوم التحويل (إن وجدت). التحويل يوصل لحظياً، وتلقاه في «كشف حساب».\nإذا حولت وما وصل، اكتب لي رقم حساب المستلم والمبلغ تقريباً." },
-    { id: "balance", keys: ["رصيدي", "الرصيد", "رصيد ناقص", "انخصم", "خصم", "اختفى", "ناقص", "راتبي", "الراتب", "رواتب"],
-      a: "كل حركة على حسابك (خصم/إيداع/راتب/رسوم) تنكتب في «كشف حساب» مع التاريخ والملاحظة، راجعه أول.\nرواتب العساكر تنزل تلقائياً حسب رتبتك في الجدول اللي تحدده الإدارة.\nإذا شفت حركة ما تعرفها اضغط «تحدث مع عضو حقيقي».", human: true },
-    { id: "savings", keys: ["توفير", "ادخار", "فائدة", "الفايده", "حساب التوفير"],
-      a: "حساب التوفير من صفحة «التوفير»: تقدر تودع وتسحب، وتنضاف عليك فائدة بنسبة تحددها إدارة البنك." },
-    { id: "loan", keys: ["قرض", "قروض", "اقتراض", "سلفة", "سداد القرض", "ادفع القرض"],
-      a: "طلب القرض من صفحة «القروض»: اكتب المبلغ وتنتظر موافقة الإدارة، وإذا انقبل ينزل في رصيدك مباشرة. السداد من نفس الصفحة، وبعض القروض ممكن يكون لها تاريخ انتهاء. إذا انتظرت طويل اضغط «تحدث مع عضو حقيقي».", human: false },
-    { id: "card", keys: ["بطاقه", "بطاقة", "بطاقتي", "البطاقه البنكيه", "طلب بطاقه", "رقم البطاقه", "تجديد البطاقه", "جددوا", "منتهيه"],
-      a: "البطاقة البنكية من صفحة «بطاقاتي»: تقدم طلب وتكتب رقم بطاقتك العسكرية، وتنتظر موافقة الإدارة. بعد القبول تحط رقمك السري (4 أرقام) وتتفعل البطاقة. إذا انتهت صلاحيتها تقدر تطلب تجديدها من نفس الصفحة." },
-    { id: "pin", keys: ["الرقم السري", "رقم سري", "الباسورد", "باسورد", "كلمه المرور", "كلمة المرور", "نسيت الرقم", "نسيت الرقم السري", "pin"],
-      a: "الرقم السري للبطاقة تحطه أنت بنفسك أول مرة، وما يظهر على البطاقة ولا يعرفه أحد، حتى الإدارة. لازم تحفظه.\nإذا نسيته اضغط «تحدث مع عضو حقيقي» وتطلب إعادة تعيينه، وتحط رقم جديد بنفسك.", human: true },
-    { id: "violation", keys: ["سداد المخالفه", "ادفع المخالفه", "مخالفه", "مخالفات", "دفع المخالفه بالبطاقه"],
-      a: "سداد المخالفات يتم من موقع فلاش نفسه بإدخال رقم بطاقتك البنكية ورقمك السري، ويتخصم من رصيدك مباشرة. تأكد إن بطاقتك مفعّلة وغير مجمّدة وإن رصيدك يكفي." },
-    { id: "notif", keys: ["اشعار", "اشعارات", "إشعار", "تنبيه"],
-      a: "إشعارات البنك تجيك داخل البنك (🔔) وكذلك تنرسل كإشعار على جهازك عبر فلاش إذا كنت مفعّل الإشعارات هناك." },
-    { id: "loading", keys: ["جاري التحميل", "جار التحميل", "تعليق", "معلق الموقع", "ما يشتغل", "لا يعمل", "صفحه بيضاء", "bug", "بطيء", "يهنق", "هنق", "فاضيه"],
-      a: "البنك يتحدث لحظياً بدون ما تحتاج تحدّث الصفحة، فإذا صار تعليق جرّب:\n1) ارجع لفلاش وافتح البنك من جديد.\n2) تأكد من الإنترنت.\nوإذا لسا موجودة، اكتب لي وش الصفحة وش اللي يظهر لك." },
-    { id: "suggest", keys: ["اقتراح", "اقترح", "فكره", "فكرة", "ابي اضيف", "ياليت", "يا ليت"], human: true,
-      a: "يسعدنا اقتراحك 🙏 اكتبه هنا بالتفصيل، واضغط «تحدث مع عضو حقيقي» عشان يوصل للإدارة." },
-    { id: "complaint", keys: ["شكوى", "شكويه", "اشتكي", "ظلم", "ظلمني", "تعدي", "تجاوز", "سرقه", "نصب"], human: true,
-      a: "نأسف لهذا الشي، الشكاوى تتابعها الإدارة مباشرة. اضغط «🧑‍💼 تحدث مع عضو حقيقي» ووضّح لهم القصة وأرفق أي إثبات عندك." },
-];
-const SUPPORT_HINT = { "مشكلة في الحساب البنكي": "frozen", "تحويل / رصيد": "transfer", "قرض": "loan", "البطاقة البنكية": "card", "رواتب العساكر": "balance", "اقتراح": "suggest", "تسجيل الدخول": "login", "التحويل": "transfer", "القروض": "loan", "بطاقاتي": "card" };
-
-function supportFaqReply(t) {
-    const users = t.messages.filter(m => m.sender === "user");
-    const lastUser = users[users.length - 1] || {};
-    const prevAi = [...t.messages].reverse().find(m => m.sender === "ai");
-    const aiCount = t.messages.filter(m => m.sender === "ai").length;
-    const text = supportNorm(lastUser.text);
-    const out = (txt, human) => ({ text: txt + (human ? " [[HUMAN]]" : ""), suggest: !!human });
-
-    if (!text) {
-        return out(users.length > 1 && aiCount >= 1 ? "وصلتنا الصورة 👍 إذا ما قدرت توصف لي المشكلة بكلام، اضغط «تحدث مع عضو حقيقي» وبيشوفها الإداري." : "وصلتنا الصورة 👍 اكتب لي الحين وش المشكلة بالضبط وفي أي صفحة صارت؟", users.length > 1 && aiCount >= 1);
-    }
-    let best = null, bestScore = 0;
-    for (const f of SUPPORT_FAQ) {
-        let sc = 0;
-        for (const k of f.keys) {
-            if (k.charAt(0) === "=") { if (text.split(" ").indexOf(supportNorm(k.slice(1))) !== -1) sc += 1; continue; }
-            const nk = supportNorm(k);
-            if (nk && text.indexOf(nk) !== -1) sc += nk.indexOf(" ") !== -1 ? 2 : 1;
-        }
-        if (f.bare && text.split(" ").length > 6) sc = 0;
-        if (sc > bestScore) { best = f; bestScore = sc; }
-    }
-    if (!best && users.length === 1) {
-        const hid = SUPPORT_HINT[t.place] || SUPPORT_HINT[t.category];
-        if (hid) best = SUPPORT_FAQ.find(f => f.id === hid) || null;
-    }
-    if (best) {
-        const ans = typeof best.a === "function" ? best.a() : best.a;
-        const tail = best.id === "hello" || best.id === "thanks" || best.id === "human" ? "" : "\n\nإذا ما انحلت مشكلتك اضغط «تحدث مع عضو حقيقي» 👇";
-        if (prevAi && prevAi.text && prevAi.text.indexOf(ans.slice(0, 40)) !== -1 && best.id !== "hello" && best.id !== "thanks") {
-            return out("شكلي كررت عليك نفس الجواب 😅 إذا الحل ما نفع، اضغط «تحدث مع عضو حقيقي» وبيتابع معك أحد من الإدارة.", true);
-        }
-        return out(ans + tail, !!best.human);
-    }
-    if (aiCount >= 2 || (prevAi && (prevAi.suggest || String(prevAi.text || "").indexOf("ما فهمت مشكلتك") === 0))) {
-        return out("ما قدرت أحدد مشكلتك بالضبط 🙏 اضغط «تحدث مع عضو حقيقي» وبيساعدك أحد من الإدارة.", true);
-    }
-    return out("ما فهمت مشكلتك بالضبط، ممكن توضح لي أكثر؟\n• في أي صفحة صارت؟\n• وش اللي صار بالضبط؟\n• هل ظهرت لك رسالة خطأ؟ (اكتبها أو أرفق صورة 📎)", false);
-}
-
-const supportAiBusy = new Set();
-const supportAiAgain = new Set();
-async function supportRunAi(id) {
-    if (supportAiBusy.has(id)) { supportAiAgain.add(id); return; }
-    supportAiBusy.add(id);
-    try {
-        let t = await SupportTicket.findById(id);
-        if (!t || t.status !== "ai") return;
-        supportTyping(t, true);
-        let text = null;
-        const aiCount = t.messages.filter(m => m.sender === "ai").length;
-        if (aiCount < 40) {
-            if (CONFIG.ANTHROPIC_API_KEY) { try { text = await supportAskAi(t); } catch (e) { console.error("❌ فشل المساعد الآلي:", e.message); } }
-            if (!text) {
-                if (!CONFIG.ANTHROPIC_API_KEY) await new Promise(r => setTimeout(r, 900));
-                const f = supportFaqReply(t);
-                text = f.text;
-            }
-        }
-        t = await SupportTicket.findById(id);
-        if (!t || t.status !== "ai") { if (t) supportTyping(t, false); return; }
-        let suggest = false;
-        if (!text) {
-            text = "ما قدرت أرد عليك الحين 🙏 اضغط زر «تحدث مع عضو حقيقي» وبيتواصل معك أحد من الإدارة.";
-            suggest = true;
-        } else if (text.indexOf("[[HUMAN]]") !== -1) {
-            text = text.split("[[HUMAN]]").join("").trim();
-            suggest = true;
-        }
-        supportAddMsg(t, { sender: "ai", name: "المساعد الآلي", text: text.slice(0, 1800), suggest });
-        t.unreadUser += 1;
-        await t.save();
-        supportTyping(t, false);
-        supportEvent(t, "ai");
-    } catch (e) {
-        console.error("❌ supportRunAi:", e.message);
-    } finally {
-        supportAiBusy.delete(id);
-        if (supportAiAgain.delete(id)) supportRunAi(id);
-    }
-}
-
-async function supportNotifyDiscord(t) {
-    try {
-        const lastUser = [...t.messages].reverse().find(m => m.sender === "user");
-        await sendDiscordWebhook("🎧 تكت دعم جديد #" + t.no + " بانتظار إداري",
-            "**العضو:** " + (t.name || "-") + "\n**التصنيف:** " + (t.category || "-") + (t.place ? " — " + t.place : "") + "\n**آخر رسالة:** " + String((lastUser && lastUser.text) || (lastUser && lastUser.image ? "(صورة)" : "-")).slice(0, 700), 15105815);
-    } catch (e) { console.error("❌ فشل إشعار ويب هوك التكت:", e.message); }
-}
-async function supportDiscordJoined(t) { }
-
-const supportGuestThrottle = new Map();
-const supportCreateLock = new Set();
-function supportClientIp(req) { return String((req.headers["x-forwarded-for"] || req.ip || "")).split(",")[0].trim(); }
-app.post("/api/support/tickets", async (req, res) => {
-    const uid = req.user ? req.user.id : null;
-    const gt = supportGuestToken(req);
-    if (!uid && !gt) return res.status(400).json({ error: "تعذر تحديد هويتك، حدّث الصفحة وحاول مرة ثانية" });
-    if (await supportBanned(uid, gt)) return res.status(403).json({ error: SUPPORT_BANNED_MSG });
-    const b = req.body || {};
-    const name = uid ? String(req.user.username || "عضو") : String(b.name || "").trim().slice(0, 40);
-    if (!uid && name.length < 2) return res.status(400).json({ error: "اكتب اسمك" });
-    const text = String(b.text || "").trim().slice(0, 1500);
-    const image = supportCleanImage(b.image);
-    if (b.image && !image) return res.status(400).json({ error: "الصورة غير صالحة أو حجمها كبير" });
-    if (!text && !image) return res.status(400).json({ error: "اكتب وصف المشكلة" });
-    if (!uid) {
-        const ip = supportClientIp(req);
-        const arr = (supportGuestThrottle.get(ip) || []).filter(x => Date.now() - x < 3600000);
-        if (arr.length >= 5) return res.status(429).json({ error: "فتحت تكتات كثير، جرّب بعد شوي" });
-        arr.push(Date.now()); supportGuestThrottle.set(ip, arr);
-    }
-    const lockKey = (uid || "") + "|" + (gt || "");
-    if (supportCreateLock.has(lockKey)) return res.status(429).json({ error: "لحظة، طلبك السابق قيد التنفيذ" });
-    supportCreateLock.add(lockKey);
-    try {
-    const idOr = [];
-    if (uid) idOr.push({ uid });
-    if (gt) idOr.push({ deviceToken: gt }, { guestToken: gt });
-    const open = await SupportTicket.countDocuments({ status: { $ne: "closed" }, $or: idOr });
-    if (open >= 1) return res.status(400).json({ error: "عندك تكت مفتوح على هذا الجهاز، لازم تسكّره أول عشان تقدر تفتح تكت جديد" });
-    const unrated = await SupportTicket.findOne({ status: "closed", ratingRequired: true, rating: null, $or: idOr }).select("_id").lean();
-    if (unrated) return res.status(400).json({ error: "لازم تقيّم تكتك السابق أول عشان تقدر تفتح تكت جديد", needRate: String(unrated._id) });
-    const last = await SupportTicket.findOne().sort({ no: -1 }).select("no").lean();
-    const category = SUPPORT_CATEGORIES.includes(b.category) ? b.category : "أخرى";
-    const place = category === "أخرى" ? "" : String(b.place || "").replace(/[<>]/g, "").trim().slice(0, 60);
-    const t = await SupportTicket.create({
-        no: ((last && last.no) || 1000) + 1,
-        uid, guestToken: uid ? null : gt, deviceToken: gt, name, category, place,
-        subject: (text || "صورة").slice(0, 60),
-        ua: String(req.get("user-agent") || "").slice(0, 160),
-        status: "ai",
-        messages: [Object.assign({ sender: "user", name, text }, await supportImageFields(image))],
-    });
-    res.json({ ok: true, id: String(t._id) });
-    supportEvent(t, "user", { kind: "new" });
-    supportRunAi(String(t._id));
-    } finally { supportCreateLock.delete(lockKey); }
-});
-
-app.get("/api/support/tickets", async (req, res) => {
-    const uid = req.user ? req.user.id : null;
-    const gt = supportGuestToken(req);
-    const or = [];
-    if (uid) or.push({ uid });
-    if (gt) or.push({ guestToken: gt, uid: null }, { deviceToken: gt });
-    if (!or.length) return res.json({ tickets: [] });
-    const banned = !!(await supportBanned(uid, gt));
-    const list = await SupportTicket.find({ $or: or }).sort({ updatedAt: -1 }).limit(50).select("-messages.image -messages.audio").lean();
-    res.json({ banned, tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadUser || 0, last: supportLastPreview(t, true) })) });
-});
-
-app.get("/api/support/badges", async (req, res) => {
-    const uid = req.user ? req.user.id : null;
-    const gt = supportGuestToken(req);
-    const or = [];
-    if (uid) or.push({ uid });
-    if (gt) or.push({ guestToken: gt, uid: null }, { deviceToken: gt });
-    const out = { user: 0, admin: null };
-    if (or.length) out.user = await SupportTicket.countDocuments({ $or: or, unreadUser: { $gt: 0 } });
-    if (uid && await isSupportAdmin(uid)) {
-        if (isSeniorAdmin(uid)) {
-            out.admin = {
-                waiting: await SupportTicket.countDocuments({ status: "waiting" }),
-                unread: await SupportTicket.countDocuments({ status: { $in: ["waiting", "active"] }, unreadAdmin: { $gt: 0 } }),
-            };
-        } else {
-            out.admin = {
-                waiting: await SupportTicket.countDocuments({ status: "waiting" }),
-                unread: await SupportTicket.countDocuments({ status: "active", adminUid: uid, unreadAdmin: { $gt: 0 } }),
-            };
-        }
-    }
-    res.json(out);
-});
-
-app.get("/api/support/tickets/:id", async (req, res) => {
-    const x = await supportLoad(req, res); if (!x) return;
-    const after = Math.max(0, parseInt(req.query.after, 10) || 0);
-    const { t, role } = x;
-    const sctx = supportCtx(x, req);
-    const msgs = t.messages.map((m, i) => supportPubMsg(m, i, sctx)).slice(after).filter(m => role === "admin" || m.sender !== "note");
-    if (role === "owner" && t.unreadUser) { t.unreadUser = 0; await t.save(); }
-    if (role === "admin" && t.unreadAdmin) { t.unreadAdmin = 0; await t.save(); }
-    const canInspect = role === "admin" && supportCanInspect(t, x.uid);
-    res.json({ ticket: supportPubTicket(t), role, msgs, n: t.messages.length, mver: t.mver || 0, shared: (role === "owner" || canInspect) ? (t.shared || []) : [], canInspect, typing: supportAiTypingSet.has(String(t._id)), peers: supportPeersFor(t, req) });
-});
-
-app.get("/api/support/tickets/:id/img/:i", async (req, res) => {
-    const x = await supportLoad(req, res); if (!x) return;
-    const m = x.t.messages[parseInt(req.params.i, 10)];
-    if (m && m.deleted && !supportCanSeeDeleted(m, supportCtx(x, req))) return res.status(404).end();
-    const mm = m && m.image ? /^data:(image\/[a-z]+);base64,(.+)$/.exec(m.image) : null;
-    if (!mm) return res.status(404).end();
-    res.set({ "Content-Type": mm[1], "Cache-Control": "private, max-age=86400" });
-    res.send(Buffer.from(mm[2], "base64"));
-});
-
-app.get("/api/support/tickets/:id/audio/:i", async (req, res) => {
-    const x = await supportLoad(req, res, true); if (!x) return;
-    const m = x.t.messages[parseInt(req.params.i, 10)];
-    if (!m) return res.status(404).end();
-    if (m.deleted && !supportCanSeeDeleted(m, supportCtx(x, req))) return res.status(404).end();
-    const hasDb = !!(m.audio && m.audio.length);
-    if (!hasDb) return res.status(404).end();
-    const buf = Buffer.from(m.audio);
-    const size = buf.length;
-    const h = { "Content-Type": m.audioMime || "audio/webm", "Accept-Ranges": "bytes", "Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff" };
-    const rg = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ""));
-    if (rg && (rg[1] || rg[2])) {
-        let start, end;
-        if (rg[1] === "") { start = Math.max(0, size - parseInt(rg[2], 10)); end = size - 1; }
-        else { start = parseInt(rg[1], 10); end = rg[2] ? Math.min(parseInt(rg[2], 10), size - 1) : size - 1; }
-        if (!(start <= end) || start >= size) { res.set("Content-Range", "bytes */" + size); return res.status(416).end(); }
-        res.status(206).set(Object.assign(h, { "Content-Range": "bytes " + start + "-" + end + "/" + size, "Content-Length": end - start + 1 }));
-        return res.end(buf.subarray(start, end + 1));
-    }
-    res.set(Object.assign(h, { "Content-Length": size }));
-    res.end(buf);
-});
-
-// رد المساعد الآلي على الرسالة الصوتية (ما يسمع الصوت)
-async function supportVoiceAiReply(id) {
-    try {
-        const t = await SupportTicket.findById(id).select("-messages.audio");
-        if (!t || t.status !== "ai") return;
-        supportAddMsg(t, { sender: "ai", name: "المساعد الآلي", text: "🎙️ وصلتني رسالتك الصوتية، بس أنا مساعد آلي وما أقدر أسمع الصوت. اكتب مشكلتك كتابة وأساعدك، أو اضغط «تحدث مع عضو حقيقي» عشان الإداري يسمع رسالتك.", suggest: true });
-        t.unreadUser += 1;
-        await t.save();
-        supportEvent(t, "ai");
-    } catch (e) { console.error("❌ supportVoiceAiReply:", e.message); }
-}
-
-const supportMsgThrottle = new Map();
-app.post("/api/support/tickets/:id/messages", async (req, res) => {
-    const x = await supportLoad(req, res); if (!x) return;
-    const { t, role, uid } = x;
-    if (t.status === "closed") return res.status(400).json({ error: "التكت مغلق" });
-    const key = String(t._id) + ":" + role;
-    if (Date.now() - (supportMsgThrottle.get(key) || 0) < 700) return res.status(429).json({ error: "على راحتك شوي" });
-    supportMsgThrottle.set(key, Date.now());
-    const audioIn = (req.body || {}).audio ? supportCleanAudio(req.body) : null;
-    if ((req.body || {}).audio && !audioIn) return res.status(400).json({ error: "الرسالة الصوتية غير صالحة أو حجمها كبير" });
-    const text = audioIn ? "" : String((req.body || {}).text || "").trim().slice(0, 1500);
-    const image = audioIn ? null : supportCleanImage((req.body || {}).image);
-    if (!audioIn && (req.body || {}).image && !image) return res.status(400).json({ error: "الصورة غير صالحة أو حجمها كبير" });
-    if (!text && !image && !audioIn) return res.status(400).json({ error: "اكتب رسالة أو أرفق صورة" });
-    if (audioIn && t.messages.filter(m => m.audioDuration || m.audioChannelId).length >= 5) return res.status(400).json({ error: "وصلت الحد الأقصى للرسائل الصوتية بهذا التكت" });
-    if (t.messages.length >= 250) return res.status(400).json({ error: "وصل التكت للحد الأقصى من الرسائل، افتح تكت جديد" });
-    if (image && t.messages.filter(m => m.image || m.imageChannelId).length >= 6) return res.status(400).json({ error: "وصلت الحد الأقصى للصور بهذا التكت" });
-    // رد على رسالة (اقتباس): لازم الرسالة موجودة وما تكون محذوفة أو ملاحظة داخلية للعضو
-    let replyTo = null;
-    const rpIn = (req.body || {}).replyTo;
-    if (rpIn !== undefined && rpIn !== null && rpIn !== "") {
-        const k = parseInt(rpIn, 10), q = t.messages[k];
-        const qOk = q && !q.deleted && q.sender !== "system" && !(q.sender === "note" && role !== "admin");
-        if (!(k >= 0 && qOk)) return res.status(400).json({ error: "الرسالة اللي تبي ترد عليها غير موجودة" });
-        replyTo = k;
-    }
-
-    if (role === "owner") {
-        if (await supportBanned(uid, supportGuestToken(req))) return res.status(403).json({ error: SUPPORT_BANNED_MSG });
-        supportAddMsg(t, Object.assign({ sender: "user", name: t.name, text, senderUid: uid || null, replyTo }, await supportImageFields(image), audioIn ? await supportAudioFields(audioIn) : {}));
-        if (t.status !== "ai") t.unreadAdmin += 1;
-        await t.save();
-        res.json({ ok: true });
-        supportEvent(t, "user");
-        if (t.status === "ai") { if (audioIn) supportVoiceAiReply(String(t._id)); else supportRunAi(String(t._id)); }
-    } else {
-        const senior = isSeniorAdmin(uid);
-        if (!senior && t.status !== "active") return res.status(400).json({ error: "استلم التكت أول عشان تقدر ترد" });
-        if (!senior && t.adminUid !== uid) return res.status(403).json({ error: "هذا التكت مستلمه " + (t.adminName || "إداري ثاني") });
-        if (senior && t.status === "ai") t.status = "waiting";
-        supportAddMsg(t, Object.assign({ sender: "admin", name: req.user.username, role: senior ? "senior" : "admin", text, senderUid: uid, replyTo }, await supportImageFields(image), audioIn ? await supportAudioFields(audioIn) : {}));
-        t.unreadUser += 1;
-        await t.save();
-        res.json({ ok: true });
-        supportEvent(t, "admin");
-    }
-});
-
-// ── خيارات الرسالة: تعديل (صاحبها) / حذف (صاحبها أو الكبار) / عرض المحذوف للعضو (الكبار) ──
-async function supportMsgLoad(req, res) {
-    const x = await supportLoad(req, res); if (!x) return null;
-    const i = parseInt(req.params.i, 10);
-    const m = x.t.messages[i];
-    if (!(i >= 0) || !m) { res.status(404).json({ error: "الرسالة غير موجودة" }); return null; }
-    x.i = i; x.m = m; x.senior = x.role === "admin" && isSeniorAdmin(x.uid);
-    return x;
-}
-app.post("/api/support/tickets/:id/messages/:i/edit", async (req, res) => {
-    const x = await supportMsgLoad(req, res); if (!x) return;
-    const { t, m } = x;
-    if (t.status === "closed") return res.status(400).json({ error: "التكت مغلق" });
-    if (m.deleted) return res.status(400).json({ error: "الرسالة محذوفة" });
-    if (m.sender !== "user" && m.sender !== "admin") return res.status(400).json({ error: "هذي الرسالة ما تنعدل" });
-    if (!supportIsOwnMsg(m, x.role, x.uid, req.user ? req.user.username : null)) return res.status(403).json({ error: "تعدّل رسايلك أنت بس" });
-    if (m.audio || m.audioChannelId || m.audioDuration) return res.status(400).json({ error: "الرسالة الصوتية ما تنعدل" });
-    const text = String((req.body || {}).text || "").trim().slice(0, 1500);
-    if (!text) return res.status(400).json({ error: "اكتب النص الجديد" });
-    if (text === (m.text || "")) return res.json({ ok: true });
-    if (!m.edits) m.edits = [];
-    m.edits.push({ text: m.text || "", at: new Date() });
-    if (m.edits.length > 20) m.edits = m.edits.slice(-20);
-    m.text = text; m.edited = true; m.editedAt = new Date();
-    t.mver = (t.mver || 0) + 1;
-    await t.save();
-    res.json({ ok: true });
-    supportEvent(t, x.role === "owner" ? "user" : "admin");
-});
-app.post("/api/support/tickets/:id/messages/:i/delete", async (req, res) => {
-    const x = await supportMsgLoad(req, res); if (!x) return;
-    const { t, m } = x;
-    if (m.deleted) return res.status(400).json({ error: "الرسالة محذوفة من قبل" });
-    if (m.sender === "system" || m.sender === "note") return res.status(400).json({ error: "هذي الرسالة ما تنحذف" });
-    const own = supportIsOwnMsg(m, x.role, x.uid, req.user ? req.user.username : null);
-    if (!own && !x.senior) return res.status(403).json({ error: "تحذف رسايلك أنت بس" });
-    if (t.status === "closed" && !x.senior) return res.status(400).json({ error: "التكت مغلق" });
-    const dn = x.role === "owner" ? (t.name || "العضو") : (stealthActor(x.uid) ? "كبار المسؤولين" : req.user.username);
-    m.deleted = true; m.deletedAt = new Date(); m.deletedByUid = x.uid || null; m.deletedByName = dn; m.revealed = false;
-    supportAddMsg(t, { sender: "system", name: dn, text: own ? (dn + " حذف رسالة") : (dn + " حذف رسالة " + (m.name || "")).trim() });
-    t.mver = (t.mver || 0) + 1;
-    await t.save();
-    res.json({ ok: true });
-    supportEvent(t, x.role === "owner" ? "user" : "admin");
-});
-app.post("/api/support/tickets/:id/messages/:i/reveal", async (req, res) => {
-    const x = await supportMsgLoad(req, res); if (!x) return;
-    const { t, m } = x;
-    if (!x.senior) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
-    if (!m.deleted) return res.status(400).json({ error: "هذي الرسالة مو محذوفة" });
-    m.revealed = !!(req.body || {}).show;
-    t.mver = (t.mver || 0) + 1;
-    await t.save();
-    res.json({ ok: true, revealed: m.revealed });
-    supportEvent(t, "admin");
-});
-
-app.post("/api/support/tickets/:id/human", async (req, res) => {
-    const x = await supportLoad(req, res); if (!x) return;
-    const { t, role } = x;
-    if (role !== "owner") return res.status(403).json({ error: "هذا الزر لصاحب التكت" });
-    if (t.status !== "ai") return res.status(400).json({ error: t.status === "closed" ? "التكت مغلق" : "طلبك وصل للإدارة من قبل" });
-    t.status = "waiting";
-    supportAddMsg(t, { sender: "system", name: "النظام", text: "📨 تم إرسال طلبك لفريق الإدارة، أول ما يدخل إداري بتوصلك رسالته هنا مباشرة." });
-    t.unreadAdmin += 1;
-    await t.save();
-    res.json({ ok: true });
-    supportEvent(t, "system", { kind: "human" });
-    supportNotifyDiscord(t);
-});
-
-app.post("/api/support/admin/tickets/:id/join", async (req, res) => {
-    if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
-    const x = await supportLoad(req, res); if (!x) return;
-    const { t } = x;
-    if (t.status === "closed") return res.status(400).json({ error: "التكت مغلق" });
-    if (t.status === "active" && t.adminUid && t.adminUid !== req.user.id) return res.status(400).json({ error: "هذا التكت مستلمه " + t.adminName });
-    if (t.status === "active" && t.adminUid === req.user.id) return res.json({ ok: true });
-    t.status = "active";
-    t.adminUid = req.user.id;
-    t.adminName = req.user.username;
-    supportAddMsg(t, { sender: "system", name: "النظام", text: "✅ دخل الإداري " + req.user.username + " للتكت" });
-    t.unreadUser += 1;
-    await t.save();
-    res.json({ ok: true });
-    supportEvent(t, "system", { kind: "join" });
-    supportDiscordJoined(t);
-});
-
-app.post("/api/support/tickets/:id/close", async (req, res) => {
-    const x = await supportLoad(req, res); if (!x) return;
-    const { t, role, uid } = x;
-    if (role !== "admin" && !(uid && isSeniorAdmin(uid))) return res.status(403).json({ error: "إغلاق التكت من الإدارة فقط" });
-    if (t.status === "closed") return res.json({ ok: true });
-    t.status = "closed";
-    t.ratingRequired = true;
-    t.closedByUid = uid; t.closedByName = req.user.username;
-    supportAddMsg(t, { sender: "system", name: "النظام", text: "🔒 تم إغلاق التكت بواسطة " + req.user.username });
-    t.unreadUser += 1;
-    await t.save();
-    res.json({ ok: true });
-    supportEvent(t, "system", { kind: "close" });
-});
-
-app.post("/api/support/tickets/:id/rate", async (req, res) => {
-    const x = await supportLoad(req, res); if (!x) return;
-    const { t, role } = x;
-    if (role !== "owner") return res.status(403).json({ error: "التقييم لصاحب التكت فقط" });
-    if (t.status !== "closed") return res.status(400).json({ error: "التكت لسا مفتوح" });
-    const stars = parseInt((req.body || {}).stars, 10);
-    if (!(stars >= 1 && stars <= 5)) return res.status(400).json({ error: "اختر من 1 إلى 5 نجوم" });
-    const comment = String((req.body || {}).comment || "").replace(/[<>]/g, "").trim().slice(0, 300);
-    const r = await SupportTicket.updateOne({ _id: t._id, rating: null }, { $set: { rating: stars, ratingComment: comment, ratedAt: new Date() } });
-    if (!(r.modifiedCount ?? r.nModified)) return res.status(400).json({ error: "سبق وقيّمت هذا التكت" });
-    const who = t.adminUid ? { uid: t.adminUid, name: t.adminName } : { uid: t.closedByUid || "none", name: t.closedByName || "غير محدد" };
-    await SupportRating.create({ ticketId: String(t._id), no: t.no, uid: t.uid, name: t.name, category: t.category, adminUid: who.uid, adminName: who.name, stars, comment });
-    res.json({ ok: true });
-    supportEvent(t, "user", { kind: "rate" });
-});
-
-app.get("/api/support/admin/ratings/:uid", async (req, res) => {
-    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
-    const list = await SupportRating.find({ adminUid: String(req.params.uid) }).sort({ at: -1 }).limit(200).lean();
-    res.json({ list: list.map(r => ({ ticketId: r.ticketId, no: r.no, name: r.name, category: r.category, stars: r.stars, comment: r.comment || "", at: r.at })) });
-});
-app.get("/api/support/admin/ratings", async (req, res) => {
-    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
-    const cnt = n => ({ $sum: { $cond: [{ $eq: ["$stars", n] }, 1, 0] } });
-    const admins = await SupportRating.aggregate([
-        { $group: { _id: "$adminUid", name: { $last: "$adminName" }, count: { $sum: 1 }, avg: { $avg: "$stars" }, s1: cnt(1), s2: cnt(2), s3: cnt(3), s4: cnt(4), s5: cnt(5) } },
-        { $sort: { avg: -1, count: -1 } },
-    ]);
-    const recent = await SupportRating.find({ comment: { $nin: [null, ""] } }).sort({ at: -1 }).limit(30).lean();
-    const total = admins.reduce((a, r) => a + r.count, 0);
-    const sum = admins.reduce((a, r) => a + r.avg * r.count, 0);
-    res.json({
-        total, avg: total ? sum / total : 0,
-        admins: admins.map(r => ({ uid: r._id, name: r.name || "-", count: r.count, avg: r.avg, dist: [r.s1, r.s2, r.s3, r.s4, r.s5] })),
-        recent: recent.map(r => ({ no: r.no, name: r.name, adminName: r.adminName, stars: r.stars, comment: r.comment, category: r.category, at: r.at })),
-    });
-});
-
-app.post("/api/support/tickets/:id/note", async (req, res) => {
-    const x = await supportLoad(req, res); if (!x) return;
-    const { t, role, uid } = x;
-    if (role !== "admin") return res.status(403).json({ error: "الملاحظات الداخلية للإدارة فقط" });
-    if (t.status === "closed") return res.status(400).json({ error: "التكت مغلق" });
-    const senior = isSeniorAdmin(uid);
-    if (!senior && t.adminUid !== uid) return res.status(403).json({ error: "استلم التكت أول" });
-    const text = String((req.body || {}).text || "").trim().slice(0, 1000);
-    if (!text) return res.status(400).json({ error: "اكتب الملاحظة" });
-    if (t.messages.length >= 250) return res.status(400).json({ error: "وصل التكت للحد الأقصى من الرسائل" });
-    supportAddMsg(t, { sender: "note", name: req.user.username, role: senior ? "senior" : "admin", text });
-    await t.save();
-    res.json({ ok: true });
-    sseBroadcast("ticket", { id: String(t._id), status: t.status, n: t.messages.length, from: "note" }, c => c.isAdmin);
-});
-
-async function supportCannedList() {
-    const s = await BankSettings.findOne();
-    if (!s.supportCanned || !s.supportCanned.length) {
-        s.supportCanned = SUPPORT_CANNED_SEEDS.map(r => ({ title: r.title, text: r.text }));
-        await s.save();
-    }
-    return s;
-}
-app.get("/api/support/admin/canned", async (req, res) => {
-    if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
-    const s = await supportCannedList();
-    res.json({ list: s.supportCanned.map(r => ({ id: String(r._id), title: r.title, text: r.text })) });
-});
-app.post("/api/support/admin/canned", async (req, res) => {
-    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
-    const title = String((req.body || {}).title || "").replace(/[<>]/g, "").trim().slice(0, 40);
-    const text = String((req.body || {}).text || "").replace(/[<>]/g, "").trim().slice(0, 500);
-    if (!title || !text) return res.status(400).json({ error: "اكتب العنوان والنص" });
-    const s = await supportCannedList();
-    if (s.supportCanned.length >= 30) return res.status(400).json({ error: "وصلت الحد الأقصى (30 رد)" });
-    s.supportCanned.push({ title, text });
-    await s.save();
-    res.json({ ok: true });
-});
-app.delete("/api/support/admin/canned/:rid", async (req, res) => {
-    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
-    const s = await supportCannedList();
-    const before = s.supportCanned.length;
-    s.supportCanned = s.supportCanned.filter(r => String(r._id) !== req.params.rid);
-    if (s.supportCanned.length === before) return res.status(404).json({ error: "غير موجود" });
-    await s.save();
-    res.json({ ok: true });
-});
-
-
-// ---------- فحص العضو داخل التكت (الإداري يختار كل خانة تظهر للعضو) ----------
-const SUPPORT_CATS = {
-    account: { title: "معلومات الحساب البنكي", keys: ["account.name", "account.number", "account.balance", "account.savings", "account.status", "account.created"] },
-    card: { title: "معلومات البطاقة", keys: ["card.status", "card.number", "card.holder", "card.expiry"] },
-    transfers: { title: "الحوالات", keys: ["tx.lastIn", "tx.lastOut", "tx.count"] },
-    loans: { title: "القروض", keys: ["loan.active", "loan.remaining", "loan.pending"] },
-    flash: { title: "معلومات فلاش", keys: ["flash.name", "flash.rank", "flash.unit"] },
-    log: { title: "آخر حركات الحساب", keys: [] },
-};
-const SUPPORT_FIXED_KEYS = [].concat(...Object.values(SUPPORT_CATS).map(c => c.keys));
-const SUPPORT_DYN_KEY = /^tx:[a-f0-9]{24}$/;
-function supportCanInspect(t, uid) {
-    return !!uid && (isSeniorAdmin(uid) || (t.status === "active" && t.adminUid === uid));
-}
-const TX_LABELS = { transfer: "حوالة", deposit: "إيداع", withdraw: "خصم", loan_receive: "استلام قرض", loan_pay: "سداد قرض", savings_deposit: "إيداع توفير", savings_withdraw: "سحب توفير", interest: "فائدة", transfer_fee: "رسوم تحويل", card_renewal_fee: "رسوم تجديد بطاقة", violation_payment: "سداد مخالفة" };
-async function supportCatRows(cat, uid, opts) {
-    const only = opts.only || null;
-    if (only) {
-        const has = cat === "log" ? Array.from(only).some(k => SUPPORT_DYN_KEY.test(k)) : SUPPORT_CATS[cat].keys.some(k => only.has(k));
-        if (!has) return [];
-    }
-    const R = (k, l, v) => ({ k, l, v: v == null || v === "" ? "—" : String(v) });
-    const D = (k, l, v) => ({ k, l, v: v ? new Date(v).toISOString() : "—", d: !!v });
-    const money = n => (Number(n) || 0).toLocaleString("en-US") + " $";
-    uid = String(uid);
-    let rows = [];
-    const acc = await Account.findOne({ discord: uid }).lean();
-    if (cat === "account") {
-        if (!acc) return [R("account.name", "الحساب", "ما له حساب بنكي")].filter(r => !only || only.has(r.k));
-        rows.push(R("account.name", "الاسم", acc.discordTag), R("account.number", "رقم الحساب", acc.accountNumber), R("account.balance", "الرصيد الحالي", money(acc.balance)),
-            R("account.savings", "رصيد التوفير", money(acc.savingsBalance)), R("account.status", "حالة الحساب", acc.isFrozen ? "مجمّد" : "نشط"), D("account.created", "تاريخ فتح الحساب", acc.createdAt));
-    } else if (cat === "card") {
-        const c = await CardRequest.findOne({ discord: uid, status: { $in: ["approved", "disabled"] } }).sort({ reviewedAt: -1 }).lean();
-        if (!c) return [R("card.status", "البطاقة", "ما عنده بطاقة مفعّلة")].filter(r => !only || only.has(r.k));
-        rows.push(R("card.status", "حالة البطاقة", c.status === "disabled" ? "معطّلة من الإدارة" : c.cardFrozen ? "مجمّدة" : "مفعّلة"), R("card.number", "رقم البطاقة", c.cardNumber), R("card.holder", "اسم حامل البطاقة", c.cardHolderName), D("card.expiry", "تاريخ الانتهاء", c.cardExpiry));
-    } else if (cat === "transfers") {
-        if (!acc) return [R("tx.count", "الحوالات", "ما له حساب")].filter(r => !only || only.has(r.k));
-        const [lastIn, lastOut, cnt] = await Promise.all([
-            Transaction.findOne({ type: "transfer", toAccount: acc.accountNumber }).sort({ createdAt: -1 }).lean(),
-            Transaction.findOne({ type: "transfer", fromAccount: acc.accountNumber }).sort({ createdAt: -1 }).lean(),
-            Transaction.countDocuments({ type: "transfer", $or: [{ fromAccount: acc.accountNumber }, { toAccount: acc.accountNumber }] }),
-        ]);
-        rows.push(R("tx.lastIn", "آخر حوالة واردة", lastIn ? money(lastIn.amount) + " — " + new Date(lastIn.createdAt).toISOString().slice(0, 10) : "ما فيه"), R("tx.lastOut", "آخر حوالة صادرة", lastOut ? money(lastOut.amount) + " — " + new Date(lastOut.createdAt).toISOString().slice(0, 10) : "ما فيه"), R("tx.count", "عدد الحوالات", cnt));
-    } else if (cat === "loans") {
-        const ls = await Loan.find({ discord: uid, status: { $in: ["pending", "approved"] } }).lean();
-        const act = ls.filter(l => l.status === "approved");
-        rows.push(R("loan.active", "قروض شغّالة", act.length), R("loan.remaining", "المتبقي عليه", money(act.reduce((a, l) => a + (l.remaining || 0), 0))), R("loan.pending", "طلبات قروض معلّقة", ls.filter(l => l.status === "pending").length));
-    } else if (cat === "flash") {
-        const fl = await FlashLink.findOne({ uid }).lean();
-        if (!fl) return [R("flash.name", "فلاش", "ما فيه بيانات")].filter(r => !only || only.has(r.k));
-        rows.push(R("flash.name", "الاسم في فلاش", fl.name), R("flash.rank", "الرتبة", fl.rank), R("flash.unit", "اليونت", fl.unit));
-    } else if (cat === "log") {
-        if (!acc) return [];
-        const ids = only ? Array.from(only).filter(k => SUPPORT_DYN_KEY.test(k)).map(k => k.slice(3)) : null;
-        const q = { $or: [{ fromAccount: acc.accountNumber }, { toAccount: acc.accountNumber }] };
-        const txs = await Transaction.find(ids ? { $and: [q, { _id: { $in: ids } }] } : q).sort({ createdAt: -1 }).limit(ids ? 400 : 60).lean();
-        txs.forEach(x => {
-            const out = x.fromAccount === acc.accountNumber;
-            rows.push({ k: "tx:" + x._id, l: (TX_LABELS[x.type] || x.type) + (out ? " (صادر)" : " (وارد)"), v: (money(x.amount) + (x.note ? " — " + x.note : "")).slice(0, 200), at: new Date(x.createdAt).toISOString() });
-        });
-        return rows;
-    }
-    return rows.filter(r => !only || only.has(r.k));
-}
-
-
-const supportPeerMap = new Map();
-function supportPeersFor(t, req) {
-    const pm = supportPeerMap.get(String(t._id)); if (!pm) return [];
-    const now = Date.now(), uid = req.user ? String(req.user.id) : null, gt = supportGuestToken(req);
-    const arr = [];
-    for (const [k, v] of pm) {
-        if (now - v.at > 5000) { pm.delete(k); continue; }
-        if ((uid && v.uid === uid) || (gt && v.gt === gt)) continue;
-        arr.push({ id: v.id, name: v.name, tag: v.tag, kind: v.kind });
-    }
-    return arr;
-}
-
-app.get("/api/support/admin/tickets/:id/inspect/:cat", async (req, res) => {
-    if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
-    const cat = req.params.cat;
-    if (!SUPPORT_CATS[cat]) return res.status(400).json({ error: "قسم غير معروف" });
-    const x = await supportLoad(req, res); if (!x) return;
-    const { t } = x;
-    if (!supportCanInspect(t, req.user.id)) return res.status(403).json({ error: "الفحص للإداري المستلم وكبار المسؤولين فقط" });
-    if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر، ما له حساب بالموقع" });
-    const rows = await supportCatRows(cat, t.uid, { staffUid: req.user.id });
-    const sh = new Set(t.shared || []);
-    res.json({ cat, title: SUPPORT_CATS[cat].title, rows: rows.map(r => Object.assign(r, { shown: sh.has(r.k) })) });
-});
-
-// اللي ظاهر للعضو حالياً (يشوفه العضو + الإداري المستلم + كبار المسؤولين فقط)
-app.get("/api/support/tickets/:id/info", async (req, res) => {
-    const x = await supportLoad(req, res); if (!x) return;
-    const { t, role, uid } = x;
-    if (role === "owner") {
-        if (!uid || uid !== t.uid) return res.status(403).json({ error: "سجّل دخولك بحسابك عشان تشوف المعلومات" });
-    } else if (!supportCanInspect(t, uid)) return res.status(403).json({ error: "هذي المعلومات للإداري المستلم وكبار المسؤولين فقط" });
-    if (!t.uid || !(t.shared || []).length) return res.json({ items: [] });
-    const only = new Set(t.shared);
-    const items = [];
-    for (const cat of Object.keys(SUPPORT_CATS)) {
-        const rows = await supportCatRows(cat, t.uid, { only });
-        if (rows.length) items.push({ cat, title: SUPPORT_CATS[cat].title, rows });
-    }
-    res.json({ items });
-});
-
-// إظهار / إخفاء خانات للعضو: body = { show: [keys], hide: [keys] }
-app.post("/api/support/admin/tickets/:id/share", async (req, res) => {
-    if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
-    const x = await supportLoad(req, res); if (!x) return;
-    const { t } = x;
-    if (!supportCanInspect(t, req.user.id)) return res.status(403).json({ error: "الفحص للإداري المستلم وكبار المسؤولين فقط" });
-    if (t.status === "closed") return res.status(400).json({ error: "التكت مغلق" });
-    if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر، ما له حساب بالموقع" });
-    const arr = v => Array.isArray(v) ? v.map(String).slice(0, 500) : [];
-    const show = arr((req.body || {}).show), hide = arr((req.body || {}).hide);
-    const fixed = new Set(SUPPORT_FIXED_KEYS);
-    const okShow = show.filter(k => fixed.has(k));
-    const dyn = show.filter(k => SUPPORT_DYN_KEY.test(k));
-    const txIds = Array.from(new Set(dyn.map(k => k.slice(3))));
-    if (txIds.length) {
-        const ac = await Account.findOne({ discord: String(t.uid) }, { accountNumber: 1 }).lean();
-        if (!ac || await Transaction.countDocuments({ _id: { $in: txIds }, $or: [{ fromAccount: ac.accountNumber }, { toAccount: ac.accountNumber }] }) !== txIds.length) return res.status(400).json({ error: "سجل غير صالح" });
-    }
-    const before = (t.shared || []).slice();
-    const cur = new Set(before);
-    hide.forEach(k => cur.delete(k));
-    okShow.concat(dyn).forEach(k => cur.add(k));
-    if (cur.size > 400) return res.status(400).json({ error: "كثير، خفّ بعض اللي ظاهر أول" });
-    const next = Array.from(cur);
-    if (next.join(",") === before.join(",")) return res.json({ ok: true, shared: next });
-    t.shared = next;
-    if (!before.length && next.length) {
-        supportAddMsg(t, { sender: "system", name: "النظام", text: "🔎 " + req.user.username + " عرض لك معلومات، تلقاها بأعلى التكت" });
-        t.unreadUser += 1;
-    }
-    await t.save();
-    res.json({ ok: true, shared: next });
-    supportEvent(t, "system", { kind: "share" });
-});
-
-// "فلان يكتب..." بين أطراف التكت (العضو والإداري المستلم وكبار المسؤولين)
-const supportPeerTypingThrottle = new Map();
-app.post("/api/support/tickets/:id/typing", async (req, res) => {
-    const x = await supportLoad(req, res); if (!x) return;
-    const { t, role, uid } = x;
-    if (t.status === "closed") return res.json({ ok: true });
-    const gt = supportGuestToken(req);
-    const key = String(t._id) + ":" + (uid || gt || "x");
-    const now = Date.now();
-    if (now - (supportPeerTypingThrottle.get(key) || 0) < 1500) return res.json({ ok: true });
-    supportPeerTypingThrottle.set(key, now);
-    if (supportPeerTypingThrottle.size > 3000) for (const [k, v] of supportPeerTypingThrottle) if (now - v > 60000) supportPeerTypingThrottle.delete(k);
-    const senior = role === "admin" && isSeniorAdmin(uid);
-    const payload = role === "owner"
-        ? { id: String(t._id), name: t.name || "عضو", tag: t.uid ? "عضو" : "زائر", kind: "owner" }
-        : { id: String(t._id), name: req.user.username, tag: senior ? "كبار المسؤولين" : "إدارة", kind: senior ? "senior" : "admin" };
-    let pm = supportPeerMap.get(String(t._id)); if (!pm) { pm = new Map(); supportPeerMap.set(String(t._id), pm); }
-    pm.set(String(uid || gt || "x"), Object.assign({}, payload, { at: now, uid: uid || null, gt: gt || null }));
-    res.json({ ok: true });
-});
-
-app.get("/api/support/admin/tickets", async (req, res) => {
-    if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
-    const q = isSeniorAdmin(req.user.id)
-        ? { status: ["ai", "waiting", "active", "closed"].includes(req.query.status) ? req.query.status : "waiting" }
-        : { $or: [{ status: "waiting" }, { status: "active", adminUid: req.user.id }] };
-    const hid = hiddenOwnerIds(req);
-    const list = await SupportTicket.find(hid.length ? { $and: [q, { uid: { $nin: hid } }] } : q).sort({ updatedAt: -1 }).limit(100).select("-messages.image -messages.audio").lean();
-    res.json({ tickets: list.map(t => Object.assign(supportPubTicket(t), { unread: t.unreadAdmin || 0, last: supportLastPreview(t) })) });
-});
-
-
-app.get("/api/support/admin/tickets/:id/person", async (req, res) => {
-    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "التعديل لكبار المسؤولين فقط" });
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
-    const t = await SupportTicket.findById(req.params.id).select("uid no").lean();
-    if (!t) return res.status(404).json({ error: "التكت غير موجود" });
-    if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر، ما له حساب بنكي" });
-    if (isOwnerUid(t.uid) && !isOwnerUid(req.user.id)) return res.status(404).json({ error: "التكت غير موجود" });
-    const a = await Account.findOne({ discord: String(t.uid) }).lean();
-    if (!a) return res.status(404).json({ error: "هذا الشخص ما عنده حساب بنكي" });
-    res.json({ name: a.discordTag || "", accountNumber: a.accountNumber, frozen: !!a.isFrozen, cardLimit: a.cardLimit, supportBanned: !!a.supportBanned });
-});
-app.post("/api/support/admin/tickets/:id/person", async (req, res) => {
-    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "التعديل لكبار المسؤولين فقط" });
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
-    const t = await SupportTicket.findById(req.params.id).select("uid no").lean();
-    if (!t) return res.status(404).json({ error: "التكت غير موجود" });
-    if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر، ما له حساب بنكي" });
-    if (isOwnerUid(t.uid) && !isOwnerUid(req.user.id)) return res.status(404).json({ error: "التكت غير موجود" });
-    const a = await Account.findOne({ discord: String(t.uid) });
-    if (!a) return res.status(404).json({ error: "هذا الشخص ما عنده حساب بنكي" });
-    const b = req.body || {};
-    const upd = {};
-    if (typeof b.name === "string" && b.name.trim() && b.name.trim() !== a.discordTag) upd.discordTag = b.name.trim().slice(0, 60);
-    if (typeof b.frozen === "boolean" && b.frozen !== !!a.isFrozen) upd.isFrozen = b.frozen;
-    if (b.cardLimit !== undefined && b.cardLimit !== null && b.cardLimit !== "") {
-        const n = parseInt(b.cardLimit, 10);
-        if (!(n >= -1 && n <= 50)) return res.status(400).json({ error: "حد البطاقات غير صحيح (-1 = حسب الإعداد العام)" });
-        if (n !== a.cardLimit) upd.cardLimit = n;
-    }
-    if (!Object.keys(upd).length) return res.status(400).json({ error: "ما تغيّر شي" });
-    await Account.updateOne({ _id: a._id }, { $set: upd });
-    if (upd.discordTag) await SupportTicket.updateOne({ _id: t._id }, { $set: { name: upd.discordTag } });
-    if (upd.isFrozen !== undefined) await Notification.create({ discord: a.discord, message: upd.isFrozen ? "🔒 تم تجميد حسابك البنكي من الإدارة." : "🔓 تم فك تجميد حسابك البنكي.", type: upd.isFrozen ? "warning" : "success" });
-    await logEvent({ action: "تعديل حساب من تكت", discordId: a.discord, discordTag: a.discordTag, actorId: req.user.id, actorTag: req.user.username, details: JSON.stringify(upd) + " — من تكت خدمة العملاء #" + t.no });
-    bumpActivity();
-    const f = await Account.findOne({ discord: String(t.uid) }).lean();
-    res.json({ ok: true, name: f.discordTag, frozen: !!f.isFrozen, cardLimit: f.cardLimit });
-});
-
-app.post("/api/support/admin/tickets/:id/ban", async (req, res) => {
-    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "الحظر لكبار المسؤولين فقط" });
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
-    const t = await SupportTicket.findById(req.params.id);
-    if (!t) return res.status(404).json({ error: "التكت غير موجود" });
-    if (t.uid && await isSupportAdmin(t.uid)) return res.status(400).json({ error: "ما تقدر تحظر إداري" });
-    if (isOwnerUid(t.uid)) return res.status(400).json({ error: "ما تقدر تحظر هذا الحساب" });
-    const reason = String((req.body || {}).reason || "").trim().slice(0, 200);
-    const devs = new Set();
-    if (t.deviceToken) devs.add(t.deviceToken);
-    if (t.guestToken) devs.add(t.guestToken);
-    if (t.uid) (await SupportTicket.distinct("deviceToken", { uid: t.uid })).forEach(d => d && devs.add(d));
-    const deviceTokens = [...devs];
-    const or = [];
-    if (t.uid) or.push({ uid: t.uid });
-    if (deviceTokens.length) or.push({ deviceTokens: { $in: deviceTokens } });
-    if (!or.length) return res.status(400).json({ error: "تعذر تحديد المستخدم" });
-    let ban = await SupportBan.findOne({ $or: or });
-    if (ban) {
-        ban.deviceTokens = [...new Set([...(ban.deviceTokens || []), ...deviceTokens])];
-        if (!ban.uid && t.uid) ban.uid = t.uid;
-        await ban.save();
-    } else {
-        ban = await SupportBan.create({ uid: t.uid || null, deviceTokens, name: t.name, reason, bannedBy: req.user.id, bannedByName: req.user.username });
-    }
-    const q = { status: { $ne: "closed" }, $or: [...(t.uid ? [{ uid: t.uid }] : []), { deviceToken: { $in: deviceTokens } }, { guestToken: { $in: deviceTokens } }] };
-    const opens = await SupportTicket.find(q);
-    for (const o of opens) {
-        o.status = "closed";
-        supportAddMsg(o, { sender: "system", name: "النظام", text: "🚫 " + SUPPORT_BANNED_MSG });
-        o.unreadUser += 1;
-        await o.save();
-        supportEvent(o, "system", { kind: "close" });
-    }
-    if (t.uid) await Account.updateOne({ discord: String(t.uid) }, { $set: { supportBanned: true } });
-    await logEvent({ action: "حظر من الدعم الفني", discordId: t.uid || null, actorId: req.user.id, actorTag: req.user.username, details: (t.name || "-") + (reason ? " — السبب: " + reason : "") });
-    res.json({ ok: true });
-});
-app.get("/api/support/admin/bans", async (req, res) => {
-    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
-    const list = await SupportBan.find().sort({ createdAt: -1 }).limit(200).lean();
-    res.json({ bans: list.map(b => ({ id: String(b._id), name: b.name, reason: b.reason, by: b.bannedByName, at: b.createdAt, guest: !b.uid })) });
-});
-app.delete("/api/support/admin/bans/:id", async (req, res) => {
-    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "لكبار المسؤولين فقط" });
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
-    const b = await SupportBan.findByIdAndDelete(req.params.id);
-    if (!b) return res.status(404).json({ error: "غير موجود" });
-    if (b.uid) await Account.updateOne({ discord: String(b.uid) }, { $set: { supportBanned: false } });
-    await logEvent({ action: "فك حظر من الدعم الفني", discordId: b.uid || null, actorId: req.user.id, actorTag: req.user.username, details: b.name || "-" });
-    res.json({ ok: true });
-});
-
-app.delete("/api/support/admin/tickets/:id", async (req, res) => {
-    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "هذا الإجراء لكبار المسؤولين فقط" });
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "التكت غير موجود" });
-    const t = await SupportTicket.findById(req.params.id).select("no name status uid guestToken deviceToken");
-    if (!t) return res.status(404).json({ error: "التكت غير موجود" });
-    if (t.status !== "closed") return res.status(400).json({ error: "تقدر تحذف التكتات المغلقة فقط" });
-    await SupportTicket.deleteOne({ _id: t._id, status: "closed" });
-    await logEvent({ action: "حذف تكت دعم", actorId: req.user.id, actorTag: req.user.username, details: "#" + t.no + " — " + (t.name || "-") });
-    res.json({ ok: true });
-    sseBroadcast("ticket", { id: String(t._id), status: "closed", n: 0, from: "system", kind: "deleted" },
-        c => c.isAdmin || (c.uid && t.uid === c.uid) || (c.gt && !t.uid && t.guestToken === c.gt) || (c.gt && t.deviceToken && t.deviceToken === c.gt));
-});
-app.delete("/api/support/admin/closed", async (req, res) => {
-    if (!req.isAuthenticated() || !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "هذا الإجراء لكبار المسؤولين فقط" });
-    const r = await SupportTicket.deleteMany({ status: "closed" });
-    await logEvent({ action: "حذف التكتات المغلقة", actorId: req.user.id, actorTag: req.user.username, details: "عدد المحذوف: " + (r.deletedCount || 0) });
-    res.json({ ok: true, deleted: r.deletedCount || 0 });
-    sseBroadcast("ticket", { id: "", status: "closed", n: 0, from: "system", kind: "deleted" }, c => c.isAdmin);
-});
-
-// إشعار العضو من التكت (للإدارة والكبار): "رد عليك الإداري على تكتك"
-const ticketNotifyThrottle = new Map();
-app.post("/api/support/admin/tickets/:id/notify", async (req, res) => {
-    if (!req.isAuthenticated() || !(await isSupportAdmin(req.user.id))) return res.status(403).json({ error: "للإدارة فقط" });
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ error: "رقم غير صحيح" });
-    const t = await SupportTicket.findById(req.params.id, { uid: 1, no: 1 }).lean();
-    if (!t) return res.status(404).json({ error: "التكت غير موجود" });
-    if (!t.uid) return res.status(400).json({ error: "هذا التكت لزائر بدون حساب، ما نقدر نرسل له إشعار" });
-    const k = String(t._id);
-    if (Date.now() - (ticketNotifyThrottle.get(k) || 0) < 15000) return res.status(429).json({ error: "تم إرسال إشعار قبل شوي" });
-    ticketNotifyThrottle.set(k, Date.now());
-    await Notification.create({ discord: String(t.uid), message: "🎧 رد عليك الإداري على تكتك #" + t.no + " ⚡", type: "info" });
-    res.json({ ok: true, sent: 1 });
-});
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 🔐 الرقم السري للبطاقة: يُخزَّن مشفّر (hash) ولا أحد يشوفه — لا العضو ولا الإدارة ولا المالك. العضو لازم يحفظه.
-// ═══════════════════════════════════════════════════════════════════════════
-const PIN_PEPPER = crypto.createHash('sha256').update('flash-bank-pin-v1|' + (process.env.PIN_PEPPER || 'norv-bank-pin-pepper')).digest();
-function hashPin(pin) {
-    const salt = crypto.randomBytes(16);
-    const h = crypto.scryptSync(String(pin), Buffer.concat([salt, PIN_PEPPER]), 32);
-    return salt.toString('hex') + ':' + h.toString('hex');
-}
-function verifyPin(pin, stored) {
-    try {
-        if (!stored || typeof stored !== 'string') return false;
-        const [s, h] = stored.split(':');
-        if (!s || !h) return false;
-        const calc = crypto.scryptSync(String(pin), Buffer.concat([Buffer.from(s, 'hex'), PIN_PEPPER]), 32);
-        const exp = Buffer.from(h, 'hex');
-        return calc.length === exp.length && crypto.timingSafeEqual(calc, exp);
-    } catch (e) { return false; }
-}
-// نسخة آمنة من البطاقة للإرسال: بدون الرقم السري أبداً (والـ CVV يُحذف عن الإدارة)
-function cardSafe(c, forStaff) {
-    const o = (c && c.toObject) ? c.toObject() : Object.assign({}, c);
-    delete o.cardPIN; delete o.cardPINHash;
-    if (forStaff) delete o.cardCVV;
-    return o;
-}
-// ترحيل: أي رقم سري قديم مخزّن كنص عادي يتحول لهاش
-async function migratePins() {
-    try {
-        const docs = await CardRequest.find({ cardPIN: { $nin: [null, ''] } });
-        for (const d of docs) await CardRequest.updateOne({ _id: d._id }, { $set: { cardPINHash: hashPin(d.cardPIN), cardPIN: null } });
-        if (docs.length) console.log('🔐 تم تشفير ' + docs.length + ' رقم سري قديم');
-    } catch (e) { console.log('❌ migratePins:', e.message); }
-}
-setTimeout(migratePins, 6000);
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 📜 سجل البنك: زر حذف اللوق الشامل لكبار المسؤولين (مرة وحدة ويختفي) + المالك يحذف سجل سجل بالسحب لليمين
-// ═══════════════════════════════════════════════════════════════════════════
-app.get('/api/superadmin/logs', isBankSuperAdmin, async (req, res) => {
-    try {
-        const hid = hiddenOwnerIds(req);
-        const logs = await BankLog.find(hid.length ? { targetDiscord: { $nin: hid } } : {}).sort({ createdAt: -1 }).limit(200).lean();
-        if (hid.length) logs.forEach(l => { if (l.performedBy && hid.includes(String(l.performedBy))) { l.performedByTag = 'كبار المسؤولين'; l.performedBy = null; } });
-        const s = await BankSettings.findOne();
-        res.json({ list: logs, logClearAvailable: !(s && s.logClearUsed), canDeleteEach: isOwnerUid(req.user.id) });
-    } catch (e) { res.json({ list: [], logClearAvailable: false, canDeleteEach: false }); }
-});
-app.post('/api/superadmin/logs/clear', isBankSuperAdmin, async (req, res) => {
-    try {
-        const r = await BankSettings.updateOne({ logClearUsed: { $ne: true } }, { $set: { logClearUsed: true } });
-        if (!(r.modifiedCount ?? r.nModified)) return res.json({ success: false, msg: 'تم استخدام زر حذف اللوق من قبل' });
-        await BankLog.deleteMany({});
-        await BankLog.create({ action: 'clear_log', description: 'حذف اللوق الشامل — تم حذف كل سجلات اللوق', performedBy: req.user.id, performedByTag: req.user.username });
-        bumpActivity();
-        res.json({ success: true });
-    } catch (e) { res.json({ success: false, msg: e.message }); }
-});
-app.delete('/api/superadmin/logs/:id', isBankSuperAdmin, async (req, res) => {
-    if (!isOwnerUid(req.user.id)) return res.status(403).json({ success: false, msg: 'غير مصرح' });
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, msg: 'معرف غير صالح' });
-    await BankLog.deleteOne({ _id: req.params.id });
-    res.json({ success: true });
-});
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 🗂️ الملفات البنكية (كبار المسؤولين): ابحث باسم → بطاقته، معلومات بطاقته، حوالاته، آخر وارد وصادر، حسابه الحين
-// ═══════════════════════════════════════════════════════════════════════════
-function escRx(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-app.get('/api/senior/profiles', isBankSuperAdmin, async (req, res) => {
-    try {
-        const q = String(req.query.q || '').trim().slice(0, 40);
-        if (q.length < 2) return res.json([]);
-        const hid = hiddenOwnerIds(req);
-        const rx = new RegExp(escRx(q), 'i');
-        const digits = q.replace(/[\s-]/g, '');
-        const uids = new Set();
-        const or = [{ discordTag: rx }, { accountNumber: rx }, { discord: rx }];
-        const fls = await FlashLink.find({ $or: [{ name: rx }, { rank: rx }, { unit: rx }] }, { uid: 1 }).limit(20).lean();
-        fls.forEach(f => uids.add(String(f.uid)));
-        if (/^\d{3,16}$/.test(digits)) {
-            const pat = digits.length > 4 ? digits.replace(/(\d{4})(?=\d)/g, '$1 ') : digits;
-            const cs = await CardRequest.find({ $or: [{ cardNumber: new RegExp(escRx(pat)) }, { militaryCardNumber: digits }] }, { discord: 1 }).limit(20).lean();
-            cs.forEach(c => uids.add(String(c.discord)));
-        }
-        if (uids.size) or.push({ discord: { $in: Array.from(uids) } });
-        const accs = await Account.find({ $and: [{ $or: or }, hid.length ? { discord: { $nin: hid } } : {}] }).limit(15).lean();
-        const links = await FlashLink.find({ uid: { $in: accs.map(a => a.discord) } }).lean();
-        const lm = {}; links.forEach(l => { lm[l.uid] = l; });
-        const cnt = await CardRequest.aggregate([{ $match: { discord: { $in: accs.map(a => a.discord) }, status: { $in: ['approved', 'disabled'] } } }, { $group: { _id: '$discord', n: { $sum: 1 } } }]);
-        const cm = {}; cnt.forEach(c => { cm[c._id] = c.n; });
-        res.json(accs.map(a => ({ uid: a.discord, name: a.discordTag, accountNumber: a.accountNumber, balance: a.balance, frozen: !!a.isFrozen, rank: (lm[a.discord] || {}).rank || '', unit: (lm[a.discord] || {}).unit || '', cards: cm[a.discord] || 0 })));
-    } catch (e) { res.json([]); }
-});
-app.get('/api/senior/profile/:uid', isBankSuperAdmin, async (req, res) => {
-    try {
-        const uid = String(req.params.uid);
-        if (ownerUids.has(uid) && !isOwnerUid(req.user.id)) return res.status(404).json({ success: false, msg: 'غير موجود' });
-        const acc = await Account.findOne({ discord: uid }).lean();
-        if (!acc) return res.status(404).json({ success: false, msg: 'ما له حساب بنكي' });
-        const hid = hiddenOwnerIds(req);
-        const [fl, cards, txs, loans, tAll, tOpen, unread, role, settings] = await Promise.all([
-            FlashLink.findOne({ uid }).lean(),
-            CardRequest.find({ discord: uid }).sort({ requestedAt: -1 }).lean(),
-            Transaction.find({ $or: [{ fromAccount: acc.accountNumber }, { toAccount: acc.accountNumber }] }).sort({ createdAt: -1 }).limit(60).lean(),
-            Loan.find({ discord: uid, status: { $in: ['pending', 'approved'] } }).sort({ requestedAt: -1 }).lean(),
-            SupportTicket.countDocuments({ uid }),
-            SupportTicket.countDocuments({ uid, status: { $ne: 'closed' } }),
-            Notification.countDocuments({ discord: uid, read: false }),
-            getBankRole(uid),
-            BankSettings.findOne().lean(),
-        ]);
-        const nums = new Set(); txs.forEach(t => { if (t.fromAccount) nums.add(t.fromAccount); if (t.toAccount) nums.add(t.toAccount); });
-        const peers = await Account.find({ accountNumber: { $in: Array.from(nums) } }, { accountNumber: 1, discordTag: 1, discord: 1 }).lean();
-        const pm = {}; peers.forEach(p => { pm[p.accountNumber] = hid.includes(String(p.discord)) ? 'حساب محمي' : p.discordTag; });
-        const mapTx = t => {
-            const out = t.fromAccount === acc.accountNumber, other = out ? t.toAccount : t.fromAccount;
-            return { id: String(t._id), type: t.type, dir: out ? 'out' : 'in', amount: t.amount, note: t.note || '', at: t.createdAt, otherAccount: other || '', otherName: other ? (pm[other] || '') : '' };
-        };
-        const list = txs.map(mapTx);
-        const lastIn = list.find(t => t.dir === 'in' && t.type === 'transfer') || null;
-        const lastOut = list.find(t => t.dir === 'out' && t.type === 'transfer') || null;
-        const agg = await Transaction.aggregate([{ $match: { type: 'transfer', $or: [{ fromAccount: acc.accountNumber }, { toAccount: acc.accountNumber }] } }, { $group: { _id: { $cond: [{ $eq: ['$fromAccount', acc.accountNumber] }, 'out', 'in'] }, total: { $sum: '$amount' }, n: { $sum: 1 } } }]);
-        const tot = { in: { total: 0, n: 0 }, out: { total: 0, n: 0 } };
-        agg.forEach(a => { tot[a._id] = { total: a.total, n: a.n }; });
-        const lim = acc.cardLimit !== -1 ? acc.cardLimit : (settings?.globalCardLimit ?? 1);
-        res.json({
-            success: true,
-            account: { uid, name: acc.discordTag, accountNumber: acc.accountNumber, balance: acc.balance, savings: acc.savingsBalance, frozen: !!acc.isFrozen, supportBanned: !!acc.supportBanned, cardLimit: acc.cardLimit, cardLimitEffective: lim, createdAt: acc.createdAt, role, unread },
-            flash: fl ? { name: fl.name, rank: fl.rank, unit: fl.unit, senior: !!fl.isSenior, updatedAt: fl.updatedAt } : null,
-            cards: cards.map(c => cardSafe(c, true)),
-            transfers: list, lastIn, lastOut, totals: tot,
-            loans: loans.map(l => ({ id: String(l._id), amount: l.amount, remaining: l.remaining, status: l.status, at: l.requestedAt, expiresAt: l.expiresAt || null })),
-            tickets: { total: tAll, open: tOpen }
-        });
-    } catch (e) { res.status(500).json({ success: false, msg: e.message }); }
-});
-
-// 🧹 مسح سجل الإشعارات كامل مرة وحدة (عند هذا التحديث) — بعدها صفحة الإشعارات فاضية عند الكل
-async function wipeNotificationsOnce() {
-    try {
-        const s = await BankSettings.findOne();
-        if (!s) return setTimeout(wipeNotificationsOnce, 5000);
-        if (s.notifWipeDone) return;
-        const r = await Notification.deleteMany({});
-        await BankSettings.updateOne({}, { $set: { notifWipeDone: true } });
-        bumpActivity();
-        console.log('🧹 تم مسح سجل الإشعارات كامل (' + (r.deletedCount || 0) + ')');
-    } catch (e) { console.log('❌ wipeNotificationsOnce:', e.message); }
-}
-setTimeout(wipeNotificationsOnce, 8000);
-
-
-
 app.delete('/api/superadmin/accounts/:id', isBankSuperAdmin, async (req, res) => {
     try {
         const account = await Account.findById(req.params.id);
@@ -2713,7 +2075,8 @@ app.delete('/api/superadmin/accounts/:id', isBankSuperAdmin, async (req, res) =>
         await Loan.deleteMany({ discord: userDiscordId });
         await Notification.deleteMany({ discord: userDiscordId });
         await CardRequest.deleteMany({ discord: userDiscordId });
-        await SupportTicket.deleteMany({ uid: userDiscordId });
+        await SupportTicket.deleteMany({ discord: userDiscordId });
+        await BankTicket.deleteMany({ uid: userDiscordId });
         await Transaction.deleteMany({ $or: [{ fromDiscord: userDiscordId }, { toDiscord: userDiscordId }] });
 
         bumpActivity();
@@ -2745,8 +2108,7 @@ app.get('/api/admin/account-search', isBankAdmin, async (req, res) => {
         const q = String(req.query.q || '').trim().slice(0, 40);
         if (q.length < 2) return res.json([]);
         const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-        const hid = hiddenOwnerIds(req);
-        const accs = await Account.find({ $and: [{ $or: [{ discordTag: rx }, { accountNumber: rx }] }, hid.length ? { discord: { $nin: hid } } : {}] }, { discord: 1, discordTag: 1, accountNumber: 1 }).limit(8).lean();
+        const accs = await Account.find({ $or: [{ discordTag: rx }, { accountNumber: rx }] }, { discord: 1, discordTag: 1, accountNumber: 1 }).limit(8).lean();
         res.json(accs.map(a => ({ uid: a.discord, name: a.discordTag, accountNumber: a.accountNumber })));
     } catch (e) { res.json([]); }
 });
@@ -2790,7 +2152,52 @@ app.get('/api/admin/stats', isBankAdmin, async (req, res) => {
     } catch (e) { res.json({}); }
 });
 
-// (سجل البنك: الـ API الجديد في قسم خدمة العملاء/السجل أسفل)
+// ── APIs السجل العام (كبار المسؤولين فقط) ─────────────────────────────────
+app.get('/api/superadmin/logs', isBankSuperAdmin, async (req, res) => {
+    try {
+        const owner = await isTrueOwner(req.user.id);
+        const logs = await BankLog.find().sort({ createdAt: -1 }).limit(200).lean();
+        const ownerIds = new Set();
+        for (const id of new Set(logs.map(l => l.performedBy).filter(Boolean))) if (await isTrueOwner(id)) ownerIds.add(String(id));
+        const list = logs.map(l => (!owner && ownerIds.has(String(l.performedBy))) ? Object.assign(l, { performedBy: null, performedByTag: 'كبار المسؤولين' }) : l);
+        const s = await BankSettings.findOne();
+        res.json({ list, logClearAvailable: !(s && s.logClearUsed), canSwipe: owner });
+    } catch (e) { res.json({ list: [], logClearAvailable: false, canSwipe: false }); }
+});
+// حذف اللوق كامل بضغطة زر (مرة وحدة، وبعدها الزر يختفي)
+app.post('/api/superadmin/logs/clear', isBankSuperAdmin, async (req, res) => {
+    const r = await BankSettings.updateOne({ logClearUsed: { $ne: true } }, { logClearUsed: true });
+    if (!(r.modifiedCount ?? r.nModified)) return res.json({ success: false, msg: 'تم استخدام زر حذف اللوق من قبل' });
+    await BankLog.deleteMany({});
+    await BankLog.create({ action: 'log_clear', description: 'حذف اللوق الشامل', performedBy: req.user.id, performedByTag: (await isTrueOwner(req.user.id)) ? 'كبار المسؤولين' : req.user.username });
+    res.json({ success: true });
+});
+// حذف سجل واحد (المالك فقط — بالسحب لليمين)
+app.delete('/api/superadmin/logs/:id', isBankSuperAdmin, async (req, res) => {
+    if (!(await isTrueOwner(req.user.id))) return res.status(403).json({ success: false, msg: 'غير مصرح' });
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.json({ success: false });
+    await BankLog.deleteOne({ _id: req.params.id });
+    res.json({ success: true });
+});
+
+// ── ملف العضو (كبار المسؤولين): بطاقته + حوالاته + حسابه في فلاش وفي البنك ──
+app.get('/api/superadmin/profile/:uid', isBankSuperAdmin, async (req, res) => {
+    try {
+        const uid = String(req.params.uid);
+        const acc = await Account.findOne({ discord: uid }).lean();
+        if (!acc) return res.json({ success: false, msg: 'ما له حساب بنكي' });
+        const cards = await CardRequest.find({ discord: uid }).select(CARD_ADMIN).sort({ requestedAt: -1 }).lean();
+        const pinState = await CardRequest.find({ discord: uid }, { pinSet: 1 }).lean();
+        const q = { $or: [{ fromAccount: acc.accountNumber }, { toAccount: acc.accountNumber }] };
+        const txs = await Transaction.find(q).sort({ createdAt: -1 }).limit(100).lean();
+        const lastIn = await Transaction.findOne({ type: 'transfer', toAccount: acc.accountNumber }).sort({ createdAt: -1 }).lean();
+        const lastOut = await Transaction.findOne({ type: 'transfer', fromAccount: acc.accountNumber }).sort({ createdAt: -1 }).lean();
+        const loans = await Loan.find({ discord: uid }).sort({ requestedAt: -1 }).limit(5).lean();
+        let flash = null; try { const d = await flashGet('/api/bank/member-card?uid=' + encodeURIComponent(uid)); if (d && d.success && d.found) flash = d; } catch (e) {}
+        const role = await getBankRole(uid);
+        res.json({ success: true, account: acc, cards, txs, lastIn, lastOut, loans, flash, role: role === 'super_admin' ? 'user' : role });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
 
 // ── APIs الموظفين ─────────────────────────────────────────────────────────
 // توظيف موظف أو إدارة (super_admin يوظف كليهما، admin يوظف staff فقط)
@@ -2903,8 +2310,7 @@ app.put('/api/superadmin/cards/:id/set-expiry', isBankSuperAdmin, async (req, re
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
 
-
-// ── API: polling للمستخدم (تحديث تلقائي) ──────────────────────────────
+// ── API: polling للمستخدم (تحديث تلقائي) ──
 app.get('/api/poll/user', checkMaintenance, async (req, res) => {
     if (!req.isAuthenticated()) return res.json({});
     try {
@@ -2914,15 +2320,625 @@ app.get('/api/poll/user', checkMaintenance, async (req, res) => {
         res.json({ balance: acc?.balance, savingsBalance: acc?.savingsBalance, isFrozen: acc?.isFrozen, unreadCount, latestUnreadId: latestUnread ? String(latestUnread._id) : null, lastActivity: lastBankActivity, lastTicketActivity });
     } catch (e) { res.json({}); }
 });
-
-// ── API: polling للأدمن (تحديث تلقائي) ─────────────────────────────────
 app.get('/api/poll/admin', isStaffOrAbove, async (req, res) => {
     try {
-        const openTickets = await SupportTicket.countDocuments({ status: 'waiting' });
+        const openTickets = await BankTicket.countDocuments({ status: 'waiting' });
         const pendingLoans = await Loan.countDocuments({ status: 'pending' });
         const pendingCards = await CardRequest.countDocuments({ status: 'pending' });
         res.json({ openTickets, pendingLoans, pendingCards, lastActivity: lastBankActivity, lastTicketActivity });
     } catch (e) { res.json({}); }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// 🎧 نظام خدمة العملاء (منقول من فلاش): مساعد آلي ← عضو حقيقي ← استلام ← إغلاق ← تقييم
+// ════════════════════════════════════════════════════════════════════════
+const SUPPORT_CATEGORIES = ['مشكلة في الحساب', 'التحويلات', 'القروض', 'البطاقة البنكية', 'التوفير', 'مخالفة / سداد', 'اقتراح', 'أخرى'];
+const SUPPORT_PLACES = {
+    'مشكلة في الحساب': ['الرصيد', 'الحساب مجمّد', 'كشف الحساب', 'رقم الحساب', 'أخرى'],
+    'التحويلات': ['حوالة ما وصلت', 'حوالة بالغلط', 'رسوم التحويل', 'تحويل ما يشتغل', 'أخرى'],
+    'القروض': ['طلب قرض', 'حالة الطلب', 'سداد القرض', 'انتهاء القرض', 'أخرى'],
+    'البطاقة البنكية': ['طلب بطاقة', 'الرقم السري', 'تجديد البطاقة', 'بطاقة مجمّدة / معطّلة', 'أخرى'],
+    'التوفير': ['إيداع', 'سحب', 'الفائدة', 'أخرى'],
+    'مخالفة / سداد': ['سداد مخالفة بالبطاقة', 'خُصم مبلغ غلط', 'أخرى'],
+    'اقتراح': ['التحويلات', 'البطاقات', 'القروض', 'أخرى']
+};
+const BankTicket = mongoose.model('BankTicket', new mongoose.Schema({
+    no: { type: Number, index: true },
+    uid: { type: String, index: true },
+    name: String, accountNumber: String,
+    category: String, place: String, subject: String,
+    status: { type: String, default: 'ai' }, // ai / waiting / active / closed
+    adminUid: { type: String, default: null }, adminName: { type: String, default: null },
+    unreadUser: { type: Number, default: 0 }, unreadAdmin: { type: Number, default: 0 },
+    ratingRequired: { type: Boolean, default: false },
+    rating: { type: Number, default: null }, ratingComment: { type: String, default: null }, ratedAt: { type: Date, default: null },
+    closedByUid: { type: String, default: null }, closedByName: { type: String, default: null },
+    shared: { type: [String], default: [] },
+    messages: [{
+        sender: String, name: String, text: String,
+        media: { type: String, default: null }, mediaKind: { type: String, default: null },
+        audioDuration: { type: Number, default: null },
+        suggest: Boolean, role: String, senderUid: { type: String, default: null },
+        replyTo: { type: Number, default: null },
+        edited: { type: Boolean, default: false }, editedAt: { type: Date, default: null },
+        edits: { type: [{ _id: false, text: String, at: Date }], default: [] },
+        deleted: { type: Boolean, default: false }, deletedAt: { type: Date, default: null }, deletedByName: { type: String, default: null },
+        revealed: { type: Boolean, default: false },
+        createdAt: { type: Date, default: Date.now }
+    }],
+    mver: { type: Number, default: 0 }
+}, { timestamps: true }));
+const TicketMedia = mongoose.model('TicketMedia', new mongoose.Schema({
+    ticket: { type: String, index: true }, kind: String, mime: String, data: Buffer, createdAt: { type: Date, default: Date.now }
+}));
+const SupportBan = mongoose.model('SupportBan', new mongoose.Schema({
+    uid: { type: String, index: true }, name: String, reason: String, byName: String, createdAt: { type: Date, default: Date.now }
+}));
+const SupportRating = mongoose.model('SupportRating', new mongoose.Schema({
+    ticketId: String, no: Number, uid: String, name: String, category: String,
+    adminUid: { type: String, index: true }, adminName: String, stars: Number, comment: String, at: { type: Date, default: Date.now }
+}));
+const SUPPORT_CANNED_SEEDS = [
+    { title: 'ترحيب', text: 'هلا والله 👋 معك إدارة البنك، كيف أقدر أخدمك؟' },
+    { title: 'نحتاج لقطة شاشة', text: 'ممكن ترسل لقطة شاشة توضح المشكلة؟' },
+    { title: 'جاري المراجعة', text: 'استلمنا طلبك وجاري المراجعة، لا تقفل التكت وبنرد عليك بأقرب وقت 🙏' },
+    { title: 'تم الحل', text: 'تم حل المشكلة ✅ لو احتجت أي شي ثاني افتح تكت جديد، وبنسكّر هذا التكت.' }
+];
+const SUPPORT_BANNED_MSG = 'تم حظرك من خدمة العملاء';
+const supTyping = new Map(); // ticketId -> { owner: ts, admin: { name, ts } }
+const supAiBusy = new Set();
+const supNotifyAt = new Map();
+
+async function supBanned(uid) {
+    if (await SupportBan.exists({ uid: String(uid) })) return true;
+    const a = await Account.findOne({ discord: String(uid) }, { supportBanned: 1 }).lean();
+    return !!(a && a.supportBanned);
+}
+// اسم الظهور: المالك دايماً مخفي باسم «كبار المسؤولين»
+async function supDisplayName(req) {
+    if (await isTrueOwner(req.user.id)) return 'كبار المسؤولين';
+    return req.user.username;
+}
+async function supAuth(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: 'يجب تسجيل الدخول' });
+    const role = await getBankRole(req.user.id);
+    req.sup = { uid: String(req.user.id), role, isAdmin: ['staff', 'management', 'admin', 'super_admin'].includes(role), senior: role === 'super_admin' };
+    next();
+}
+const supMw = [checkMaintenance, supAuth];
+function supAdminOnly(req, res, next) { if (!req.sup.isAdmin) return res.status(403).json({ error: 'للإدارة فقط' }); next(); }
+function supSeniorOnly(req, res, next) { if (!req.sup.senior) return res.status(403).json({ error: 'لكبار المسؤولين فقط' }); next(); }
+
+async function supLoad(req, res, full) {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) { res.status(404).json({ error: 'التكت غير موجود' }); return null; }
+    const t = await BankTicket.findById(req.params.id);
+    if (!t) { res.status(404).json({ error: 'التكت غير موجود' }); return null; }
+    const uid = req.sup.uid;
+    let role = null;
+    if (t.uid === uid) role = 'owner';
+    else if (req.sup.isAdmin) {
+        role = 'admin';
+        if (!req.sup.senior && !(t.status === 'waiting' || t.adminUid === uid)) { res.status(403).json({ error: 'هذا التكت مو من صلاحياتك' }); return null; }
+    }
+    if (!role) { res.status(403).json({ error: 'ما عندك صلاحية على هذا التكت' }); return null; }
+    return { t, role, uid, senior: role === 'admin' && req.sup.senior };
+}
+function supCanInspect(t, x) { return x.role === 'admin' && (x.senior || (t.status === 'active' && t.adminUid === x.uid)); }
+function supIsOwn(m, x) { return x.role === 'owner' ? m.sender === 'user' : (m.sender === 'admin' && m.senderUid === x.uid); }
+function supSeeDeleted(m, x) { return !!(x.senior || (x.role === 'owner' && m.revealed)); }
+function supPubMsg(m, i, x, msgs) {
+    if (m.deleted && !supSeeDeleted(m, x)) return { i, sender: m.sender, name: m.name, hid: true, at: m.createdAt };
+    const o = { i, sender: m.sender, name: m.name, text: m.text || '', media: m.media || null, mk: m.mediaKind || null, dur: m.audioDuration || 0, suggest: !!m.suggest, role: m.role || null, own: supIsOwn(m, x), ed: !!m.edited, edAt: m.editedAt || null, at: m.createdAt };
+    if (m.deleted) { o.del = true; o.delBy = m.deletedByName || ''; o.rev = !!m.revealed; }
+    if (typeof m.replyTo === 'number' && m.replyTo >= 0 && msgs[m.replyTo]) {
+        const q = msgs[m.replyTo];
+        const hidden = (q.sender === 'note' && x.role !== 'admin') || (q.deleted && !supSeeDeleted(q, x));
+        o.rp = m.replyTo; o.rpn = hidden ? '' : (q.name || '');
+        o.rpt = hidden ? 'رسالة محذوفة' : (q.text ? String(q.text).slice(0, 80) : (q.mediaKind === 'aud' ? '🎙️ رسالة صوتية' : (q.mediaKind === 'img' ? '📷 صورة' : '')));
+    }
+    if (x.senior && m.edits && m.edits.length) o.edits = m.edits.map(e => ({ text: e.text, at: e.at }));
+    return o;
+}
+function supPubTicket(t) {
+    return { id: String(t._id), no: t.no, name: t.name, category: t.category, place: t.place, subject: t.subject, status: t.status, adminName: t.adminName, updatedAt: t.updatedAt, createdAt: t.createdAt, rating: t.rating == null ? null : t.rating, needRate: !!(t.status === 'closed' && t.ratingRequired && t.rating == null) };
+}
+function supPreview(t, forUser) {
+    const arr = t.messages || [];
+    for (let i = arr.length - 1; i >= 0; i--) {
+        const m = arr[i];
+        if (!m.deleted && !(forUser && m.sender === 'note')) return (m.text || (m.mediaKind === 'aud' ? '🎙️ رسالة صوتية' : (m.mediaKind === 'img' ? '📷 صورة' : ''))).slice(0, 60);
+    }
+    return '';
+}
+function supAdd(t, m) { t.messages.push(Object.assign({ createdAt: new Date() }, m)); }
+async function supNotifyUser(t, msg, type) {
+    try { await Notification.create({ discord: t.uid, message: msg, type: type || 'info' }); } catch (e) {}
+}
+function supCleanImage(v) {
+    if (!v || typeof v !== 'string' || v.length > 1500000) return null;
+    const m = /^data:(image\/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+\/=]+)$/.exec(v);
+    return m ? { mime: m[1], buf: Buffer.from(m[2], 'base64') } : null;
+}
+function supCleanAudio(b) {
+    if (!b || typeof b.audio !== 'string') return null;
+    const mime = String(b.audioMime || '').split(';')[0].trim().toLowerCase();
+    if (!['audio/webm', 'audio/ogg', 'audio/mp4', 'audio/x-m4a', 'audio/mpeg'].includes(mime)) return null;
+    if (b.audio.length > 4000000 || !/^[A-Za-z0-9+\/=]+$/.test(b.audio)) return null;
+    const buf = Buffer.from(b.audio, 'base64');
+    if (buf.length < 200 || buf.length > 3 * 1024 * 1024) return null;
+    return { mime, buf, dur: Math.min(600, Math.max(1, Math.round(Number(b.audioDuration) || 1))) };
+}
+async function supMediaFields(t, img, aud) {
+    if (img) { const m = await TicketMedia.create({ ticket: String(t._id), kind: 'img', mime: img.mime, data: img.buf }); return { media: String(m._id), mediaKind: 'img' }; }
+    if (aud) { const m = await TicketMedia.create({ ticket: String(t._id), kind: 'aud', mime: aud.mime, data: aud.buf }); return { media: String(m._id), mediaKind: 'aud', audioDuration: aud.dur }; }
+    return {};
+}
+
+// ── المساعد الآلي (أسئلة شائعة + Claude اختياري لو ANTHROPIC_API_KEY مضبوط) ──
+function supNorm(s) {
+    return String(s || '').toLowerCase().replace(/[\u064B-\u065F\u0640]/g, '').replace(/[أإآ]/g, 'ا').replace(/ى/g, 'ي').replace(/ة/g, 'ه').replace(/[^\u0600-\u06FFa-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+const SUPPORT_FAQ = [
+    { id: 'human', keys: ['عضو حقيقي', 'شخص حقيقي', 'ابي اداري', 'ابغى اداري', 'اكلم اداري', 'موظف', 'مسؤول', 'بشري', 'مو بوت', 'اكلم احد'], human: true, a: 'أكيد 👍 اضغط زر «🧑‍💼 تحدث مع عضو حقيقي» فوق، وبيوصل طلبك لفريق البنك وأول ما يدخل أحد بيرد عليك هنا مباشرة.' },
+    { id: 'thanks', keys: ['شكرا', 'مشكور', 'يعطيك العافيه', 'تسلم', 'جزاك الله', 'ممنون'], bare: true, a: 'العفو 🌹 إذا عندك أي شي ثاني اكتبه لي، وإذا انحلت مشكلتك تقدر تسكّر التكت.' },
+    { id: 'hello', keys: ['السلام عليكم', 'سلام عليكم', 'هلا', 'مرحبا', 'اهلين', 'اهلا', 'هاي', 'صباح الخير', 'مساء الخير'], bare: true, a: 'هلا والله 👋 وش المشكلة اللي تواجهك في البنك؟ اكتب لي بالتفصيل، وتقدر ترفق صورة 📎' },
+    { id: 'transfer', keys: ['تحويل', 'حواله', 'حوالة', 'ما وصلت', 'ما وصل', 'حولت', 'رسوم التحويل'], a: 'للتحويل: افتح «💸 تحويل»، اكتب رقم الحساب (6 أرقام) والمبلغ. تأكد إن رصيدك يكفي المبلغ + الرسوم إن وجدت، وإن حسابك مو مجمّد وإن التحويل مو مقفول من الإدارة.\nتقدر تشوف كل حوالاتك في «📜 كشف حساب».' },
+    { id: 'loan', keys: ['قرض', 'القرض', 'سداد القرض', 'طلب قرض', 'اقتراض'], a: 'القروض تنراجع يدوياً من الإدارة. تقدم من صفحة «📋 القروض» (الحد الأقصى 1,000,000 $) وتجيك إشعار بالقرار. السداد من نفس الصفحة وقت ما تحب.' },
+    { id: 'savings', keys: ['توفير', 'التوفير', 'فائده', 'الفائده', 'ايداع', 'سحب'], a: 'حساب التوفير تقدر تودع فيه وتسحب منه من صفحة «💰 التوفير»، وتنحسب عليه فائدة حسب نسبة البنك.' },
+    { id: 'pin', keys: ['الرقم السري', 'رقم سري', 'pin', 'نسيت الرقم', 'كلمه المرور', 'باسورد'], a: 'الرقم السري للبطاقة (4 أرقام) أنت اللي تحدده أول مرة، وما أحد يقدر يشوفه حتى الإدارة. إذا نسيته اضغط «تحدث مع عضو حقيقي» وبيعيدون تعيينه لك لتحط رقم جديد. ⚠️ لا ترسله لأحد أبداً.', human: true },
+    { id: 'card', keys: ['بطاقه', 'بطاقتي', 'البطاقه', 'طلب بطاقه', 'فيزا', 'تجديد البطاقه', 'تجديد'], a: 'طلب البطاقة من «💳 بطاقاتي»: اكتب رقم بطاقتك العسكرية وبياناتك ووافق على التعهد، وتنراجع من الإدارة. بعد القبول تحدد رقمك السري. البطاقة المنتهية تقدر تجددها من نفس الصفحة (قد يكون فيه رسوم).' },
+    { id: 'frozen', keys: ['مجمد', 'مجمّد', 'تجميد', 'حسابي مجمد', 'فريز'], a: 'تجميد الحساب أو البطاقة قرار من الإدارة. إذا تبي تعرف السبب أو تعترض اضغط «تحدث مع عضو حقيقي».', human: true },
+    { id: 'fine', keys: ['مخالفه', 'مخالفة', 'سداد مخالفه', 'خصم', 'خصموا'], a: 'سداد المخالفات يتم من موقع فلاش بالبطاقة البنكية (رقم البطاقة + الرقم السري) ويُخصم من رصيدك ويوصلك إشعار. إذا انخصم مبلغ غلط اضغط «تحدث مع عضو حقيقي».', human: true },
+    { id: 'balance', keys: ['رصيدي', 'الرصيد', 'ما نزل', 'ما انضاف', 'راتب', 'راتبي'], a: 'رصيدك وحركاتك تشوفها في الرئيسية و«📜 كشف حساب». رواتب العساكر تنزل تلقائياً حسب جدول الرتب. إذا ناقص شي اضغط «تحدث مع عضو حقيقي».', human: true },
+    { id: 'complaint', keys: ['شكوى', 'اشتكي', 'ظلم', 'تعدي', 'سرقه', 'احتيال'], human: true, a: 'نأسف لهذا الشي، الشكاوى تتابعها الإدارة مباشرة. اضغط «🧑‍💼 تحدث مع عضو حقيقي» ووضّح القصة وأرفق أي إثبات.' }
+];
+function supFaqReply(t) {
+    const users = t.messages.filter(m => m.sender === 'user');
+    const last = users[users.length - 1] || {};
+    const prevAi = [...t.messages].reverse().find(m => m.sender === 'ai');
+    const aiCount = t.messages.filter(m => m.sender === 'ai').length;
+    const text = supNorm(last.text);
+    const out = (txt, human) => ({ text: txt + (human ? ' [[HUMAN]]' : ''), suggest: !!human });
+    if (!text) return out('وصلتنا الصورة 👍 اكتب لي وش المشكلة بالضبط؟ أو اضغط «تحدث مع عضو حقيقي».', users.length > 1);
+    let best = null, bs = 0;
+    for (const f of SUPPORT_FAQ) {
+        let sc = 0;
+        for (const k of f.keys) { const nk = supNorm(k); if (nk && text.indexOf(nk) !== -1) sc += nk.indexOf(' ') !== -1 ? 2 : 1; }
+        if (f.bare && text.split(' ').length > 6) sc = 0;
+        if (sc > bs) { best = f; bs = sc; }
+    }
+    if (best) {
+        const tail = ['hello', 'thanks', 'human'].includes(best.id) ? '' : '\n\nإذا ما انحلت مشكلتك اضغط «تحدث مع عضو حقيقي» 👇';
+        if (prevAi && prevAi.text && prevAi.text.indexOf(best.a.slice(0, 40)) !== -1 && !['hello', 'thanks'].includes(best.id)) return out('شكلي كررت عليك نفس الجواب 😅 اضغط «تحدث مع عضو حقيقي» وبيتابع معك أحد من الإدارة.', true);
+        return out(best.a + tail, !!best.human);
+    }
+    if (aiCount >= 2 || (prevAi && prevAi.suggest)) return out('ما قدرت أحدد مشكلتك بالضبط 🙏 اضغط «تحدث مع عضو حقيقي» وبيساعدك أحد من الإدارة.', true);
+    return out('ما فهمت مشكلتك بالضبط، ممكن توضح لي أكثر؟\n• وش القسم (تحويل، قرض، بطاقة...)؟\n• وش اللي صار بالضبط؟\n• هل ظهرت رسالة خطأ؟ (اكتبها أو أرفق صورة 📎)', false);
+}
+async function supAskClaude(t) {
+    const key = process.env.ANTHROPIC_API_KEY;
+    if (!key || typeof fetch !== 'function') return null;
+    const convo = t.messages.filter(m => !m.deleted && (m.sender === 'user' || m.sender === 'ai') && m.text).slice(-14);
+    const msgs = [];
+    convo.forEach(m => { const role = m.sender === 'user' ? 'user' : 'assistant'; const last = msgs[msgs.length - 1]; if (last && last.role === role) last.content += '\n' + m.text; else msgs.push({ role, content: m.text }); });
+    while (msgs.length && msgs[0].role !== 'user') msgs.shift();
+    if (!msgs.length) return null;
+    const acc = await Account.findOne({ discord: t.uid }).lean();
+    const ctx = 'العضو: ' + t.name + (acc ? '، رقم الحساب ' + acc.accountNumber + '، الحساب ' + (acc.isFrozen ? 'مجمّد' : 'نشط') : '') + '. تصنيف التكت: ' + (t.category || '-') + (t.place ? ' — ' + t.place : '') + '.';
+    const sys = ['أنت مساعد خدمة عملاء «بنك فلاش» — بنك داخل لعبة أدوار (ماين كرافت/محاكاة) ولا يمت للواقع بصلة.', 'البنك فيه: تحويلات بين الحسابات برقم 6 أرقام، حساب توفير بفائدة، قروض بموافقة الإدارة، بطاقات بنكية برقم سري، رواتب عساكر، سداد مخالفات من فلاش.', 'أسلوبك: لهجة سعودية بيضاء بسيطة ومحترمة، ردود قصيرة (٢–٥ أسطر). اسأل سؤال واحد فقط كل مرة إذا المشكلة غير واضحة.', 'ممنوع: تخترع ميزات أو وعود، أو تغيّر أرصدة أو قرارات. لا تطلب أبداً الرقم السري أو رقم البطاقة أو الـ CVV.', 'إذا تحتاج إدارة قل له يضغط زر «تحدث مع عضو حقيقي» وأضف في آخر ردك [[HUMAN]] بدون شرح.', ctx].join('\n');
+    const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), 30000);
+    try {
+        const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', signal: ctrl.signal, headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: process.env.SUPPORT_AI_MODEL || 'claude-sonnet-4-6', max_tokens: 600, system: sys, messages: msgs }) });
+        const d = await r.json();
+        if (!r.ok) throw new Error((d && d.error && d.error.message) || ('HTTP ' + r.status));
+        return (d.content || []).filter(x => x.type === 'text').map(x => x.text).join('\n').trim() || null;
+    } finally { clearTimeout(timer); }
+}
+async function supRunAi(id) {
+    if (supAiBusy.has(id)) return;
+    supAiBusy.add(id);
+    try {
+        let t = await BankTicket.findById(id);
+        if (!t || t.status !== 'ai') return;
+        let text = null;
+        if (t.messages.filter(m => m.sender === 'ai').length < 40) {
+            try { text = await supAskClaude(t); } catch (e) { console.error('❌ مساعد الدعم:', e.message); }
+            if (!text) text = supFaqReply(t).text;
+        }
+        t = await BankTicket.findById(id);
+        if (!t || t.status !== 'ai') return;
+        let suggest = false;
+        if (!text) { text = 'ما قدرت أرد عليك الحين 🙏 اضغط «تحدث مع عضو حقيقي».'; suggest = true; }
+        else if (text.indexOf('[[HUMAN]]') !== -1) { text = text.split('[[HUMAN]]').join('').trim(); suggest = true; }
+        supAdd(t, { sender: 'ai', name: 'المساعد الآلي', text: text.slice(0, 1800), suggest });
+        t.unreadUser += 1;
+        await t.save();
+        bumpTicketActivity();
+    } catch (e) { console.error('❌ supRunAi:', e.message); }
+    finally { supAiBusy.delete(id); }
+}
+
+// ── التكتات: إنشاء / قائمة / عرض ──
+app.get('/api/support/meta', supMw, (req, res) => res.json({ cats: SUPPORT_CATEGORIES, places: SUPPORT_PLACES }));
+app.post('/api/support/tickets', supMw, async (req, res) => {
+    try {
+        const settings = await BankSettings.findOne();
+        if (settings && settings.disableSupport) return res.status(403).json({ error: settings.disableSupportReason || '🔒 خدمة العملاء موقوفة حالياً.' });
+        const uid = req.sup.uid;
+        if (await supBanned(uid)) return res.status(403).json({ error: SUPPORT_BANNED_MSG });
+        const b = req.body || {};
+        const text = String(b.text || '').trim().slice(0, 1500);
+        const img = supCleanImage(b.image);
+        if (b.image && !img) return res.status(400).json({ error: 'الصورة غير صالحة أو حجمها كبير' });
+        if (!text && !img) return res.status(400).json({ error: 'اكتب وصف المشكلة' });
+        if (await BankTicket.countDocuments({ uid, status: { $ne: 'closed' } }) >= 1) return res.status(400).json({ error: 'عندك تكت مفتوح، لازم يتسكّر أول عشان تفتح تكت جديد' });
+        const unrated = await BankTicket.findOne({ uid, status: 'closed', ratingRequired: true, rating: null }).select('_id').lean();
+        if (unrated) return res.status(400).json({ error: 'لازم تقيّم تكتك السابق أول', needRate: String(unrated._id) });
+        const last = await BankTicket.findOne().sort({ no: -1 }).select('no').lean();
+        const category = SUPPORT_CATEGORIES.includes(b.category) ? b.category : 'أخرى';
+        const place = category === 'أخرى' ? '' : String(b.place || '').replace(/[<>]/g, '').trim().slice(0, 60);
+        const acc = await Account.findOne({ discord: uid }).lean();
+        const t = new BankTicket({ no: ((last && last.no) || 1000) + 1, uid, name: req.user.username, accountNumber: acc ? acc.accountNumber : '', category, place, subject: (text || 'صورة').slice(0, 60), status: 'ai' });
+        supAdd(t, Object.assign({ sender: 'user', name: req.user.username, text, senderUid: uid }, await supMediaFields(t, img, null)));
+        await t.save();
+        bumpTicketActivity();
+        res.json({ ok: true, id: String(t._id) });
+        supRunAi(String(t._id));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/support/tickets', supMw, async (req, res) => {
+    const list = await BankTicket.find({ uid: req.sup.uid }).sort({ updatedAt: -1 }).limit(50).lean();
+    res.json({ banned: await supBanned(req.sup.uid), tickets: list.map(t => Object.assign(supPubTicket(t), { unread: t.unreadUser || 0, last: supPreview(t, true) })) });
+});
+app.get('/api/support/badges', supMw, async (req, res) => {
+    const out = { user: await BankTicket.countDocuments({ uid: req.sup.uid, unreadUser: { $gt: 0 } }), admin: null };
+    if (req.sup.isAdmin) {
+        out.admin = { waiting: await BankTicket.countDocuments({ status: 'waiting' }), unread: await BankTicket.countDocuments(req.sup.senior ? { status: { $in: ['waiting', 'active'] }, unreadAdmin: { $gt: 0 } } : { status: 'active', adminUid: req.sup.uid, unreadAdmin: { $gt: 0 } }) };
+    }
+    res.json(out);
+});
+app.get('/api/support/tickets/:id', supMw, async (req, res) => {
+    const x = await supLoad(req, res); if (!x) return;
+    const { t, role } = x;
+    const after = Math.max(0, parseInt(req.query.after, 10) || 0);
+    const msgs = t.messages.map((m, i) => supPubMsg(m, i, x, t.messages)).slice(after).filter(m => role === 'admin' || m.sender !== 'note');
+    if (role === 'owner' && t.unreadUser) { t.unreadUser = 0; await BankTicket.updateOne({ _id: t._id }, { $set: { unreadUser: 0 } }); }
+    if (role === 'admin' && t.unreadAdmin) { await BankTicket.updateOne({ _id: t._id }, { $set: { unreadAdmin: 0 } }); }
+    const ty = supTyping.get(String(t._id)) || {};
+    const typing = role === 'owner' ? (ty.admin && Date.now() - ty.admin.ts < 4500 ? ty.admin.name : null) : (ty.owner && Date.now() - ty.owner < 4500 ? t.name : null);
+    const can = supCanInspect(t, x);
+    res.json({ ticket: supPubTicket(t), role, msgs, n: t.messages.length, mver: t.mver || 0, shared: (role === 'owner' || can) ? (t.shared || []) : [], canInspect: can, senior: x.senior, typing, aiTyping: t.status === 'ai' && supAiBusy.has(String(t._id)) });
+});
+app.get('/api/support/tickets/:id/media/:mid', supMw, async (req, res) => {
+    const x = await supLoad(req, res); if (!x) return;
+    const m = x.t.messages.find(q => q.media === req.params.mid);
+    if (!m || (m.deleted && !supSeeDeleted(m, x))) return res.status(404).end();
+    if (!mongoose.Types.ObjectId.isValid(req.params.mid)) return res.status(404).end();
+    const d = await TicketMedia.findById(req.params.mid).lean();
+    if (!d) return res.status(404).end();
+    const buf = Buffer.from(d.data.buffer ? d.data.buffer : d.data); const size = buf.length;
+    const h = { 'Content-Type': d.mime, 'Cache-Control': 'private, max-age=86400', 'X-Content-Type-Options': 'nosniff', 'Accept-Ranges': 'bytes' };
+    const rg = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ''));
+    if (rg && (rg[1] || rg[2])) {
+        let s, e;
+        if (rg[1] === '') { s = Math.max(0, size - parseInt(rg[2], 10)); e = size - 1; } else { s = parseInt(rg[1], 10); e = rg[2] ? Math.min(parseInt(rg[2], 10), size - 1) : size - 1; }
+        if (!(s <= e) || s >= size) { res.set('Content-Range', 'bytes */' + size); return res.status(416).end(); }
+        res.status(206).set(Object.assign(h, { 'Content-Range': 'bytes ' + s + '-' + e + '/' + size, 'Content-Length': e - s + 1 }));
+        return res.end(buf.subarray(s, e + 1));
+    }
+    res.set(Object.assign(h, { 'Content-Length': size })); res.end(buf);
+});
+
+// ── الرسائل ──
+const supMsgThrottle = new Map();
+app.post('/api/support/tickets/:id/messages', supMw, async (req, res) => {
+    const x = await supLoad(req, res); if (!x) return;
+    const { t, role, uid } = x;
+    if (t.status === 'closed') return res.status(400).json({ error: 'التكت مغلق' });
+    const key = String(t._id) + ':' + role;
+    if (Date.now() - (supMsgThrottle.get(key) || 0) < 600) return res.status(429).json({ error: 'على راحتك شوي' });
+    supMsgThrottle.set(key, Date.now());
+    const b = req.body || {};
+    const aud = b.audio ? supCleanAudio(b) : null;
+    if (b.audio && !aud) return res.status(400).json({ error: 'الرسالة الصوتية غير صالحة أو كبيرة' });
+    const text = aud ? '' : String(b.text || '').trim().slice(0, 1500);
+    const img = aud ? null : supCleanImage(b.image);
+    if (!aud && b.image && !img) return res.status(400).json({ error: 'الصورة غير صالحة أو حجمها كبير' });
+    if (!text && !img && !aud) return res.status(400).json({ error: 'اكتب رسالة أو أرفق صورة' });
+    if (t.messages.length >= 300) return res.status(400).json({ error: 'وصل التكت للحد الأقصى من الرسائل، افتح تكت جديد' });
+    if (img && t.messages.filter(m => m.mediaKind === 'img').length >= 10) return res.status(400).json({ error: 'وصلت الحد الأقصى للصور' });
+    if (aud && t.messages.filter(m => m.mediaKind === 'aud').length >= 25) return res.status(400).json({ error: 'وصلت الحد الأقصى للرسائل الصوتية' });
+    let replyTo = null;
+    if (b.replyTo !== undefined && b.replyTo !== null && b.replyTo !== '') {
+        const k = parseInt(b.replyTo, 10), q = t.messages[k];
+        if (!(k >= 0 && q && !q.deleted && q.sender !== 'system' && !(q.sender === 'note' && role !== 'admin'))) return res.status(400).json({ error: 'الرسالة اللي تبي ترد عليها غير موجودة' });
+        replyTo = k;
+    }
+    if (role === 'owner') {
+        if (await supBanned(uid)) return res.status(403).json({ error: SUPPORT_BANNED_MSG });
+        supAdd(t, Object.assign({ sender: 'user', name: t.name, text, senderUid: uid, replyTo }, await supMediaFields(t, img, aud)));
+        if (t.status !== 'ai') t.unreadAdmin += 1;
+        await t.save(); bumpTicketActivity(); res.json({ ok: true });
+        if (t.status === 'ai') {
+            if (aud) { const t2 = await BankTicket.findById(t._id); supAdd(t2, { sender: 'ai', name: 'المساعد الآلي', text: '🎙️ وصلتني رسالتك الصوتية، بس أنا مساعد آلي وما أقدر أسمع الصوت. اكتب مشكلتك كتابة، أو اضغط «تحدث مع عضو حقيقي».', suggest: true }); t2.unreadUser += 1; await t2.save(); }
+            else supRunAi(String(t._id));
+        }
+    } else {
+        if (!x.senior && t.status !== 'active') return res.status(400).json({ error: 'استلم التكت أول عشان تقدر ترد' });
+        if (!x.senior && t.adminUid !== uid) return res.status(403).json({ error: 'هذا التكت مستلمه ' + (t.adminName || 'إداري ثاني') });
+        if (x.senior && t.status === 'ai') t.status = 'waiting';
+        supAdd(t, Object.assign({ sender: 'admin', name: await supDisplayName(req), role: x.senior ? 'senior' : 'admin', text, senderUid: uid, replyTo }, await supMediaFields(t, img, aud)));
+        t.unreadUser += 1;
+        await t.save(); bumpTicketActivity(); res.json({ ok: true });
+        const k2 = String(t._id); if (Date.now() - (supNotifyAt.get(k2) || 0) > 60000) { supNotifyAt.set(k2, Date.now()); supNotifyUser(t, '💬 ردّ فريق الدعم على تكتك #' + t.no, 'info'); }
+    }
+});
+async function supMsgLoad(req, res) {
+    const x = await supLoad(req, res); if (!x) return null;
+    const i = parseInt(req.params.i, 10), m = x.t.messages[i];
+    if (!(i >= 0) || !m) { res.status(404).json({ error: 'الرسالة غير موجودة' }); return null; }
+    x.i = i; x.m = m; return x;
+}
+app.post('/api/support/tickets/:id/messages/:i/edit', supMw, async (req, res) => {
+    const x = await supMsgLoad(req, res); if (!x) return;
+    const { t, m } = x;
+    if (t.status === 'closed') return res.status(400).json({ error: 'التكت مغلق' });
+    if (m.deleted) return res.status(400).json({ error: 'الرسالة محذوفة' });
+    if (m.sender !== 'user' && m.sender !== 'admin') return res.status(400).json({ error: 'هذي الرسالة ما تنعدل' });
+    if (!supIsOwn(m, x)) return res.status(403).json({ error: 'تعدّل رسايلك أنت بس' });
+    if (m.mediaKind === 'aud') return res.status(400).json({ error: 'الرسالة الصوتية ما تنعدل' });
+    const text = String((req.body || {}).text || '').trim().slice(0, 1500);
+    if (!text) return res.status(400).json({ error: 'اكتب النص الجديد' });
+    if (text === (m.text || '')) return res.json({ ok: true });
+    m.edits.push({ text: m.text || '', at: new Date() }); if (m.edits.length > 20) m.edits = m.edits.slice(-20);
+    m.text = text; m.edited = true; m.editedAt = new Date(); t.mver = (t.mver || 0) + 1;
+    await t.save(); bumpTicketActivity(); res.json({ ok: true });
+});
+app.post('/api/support/tickets/:id/messages/:i/delete', supMw, async (req, res) => {
+    const x = await supMsgLoad(req, res); if (!x) return;
+    const { t, m } = x;
+    if (m.deleted) return res.status(400).json({ error: 'الرسالة محذوفة من قبل' });
+    if (m.sender === 'system' || m.sender === 'note') return res.status(400).json({ error: 'هذي الرسالة ما تنحذف' });
+    const own = supIsOwn(m, x);
+    if (!own && !x.senior) return res.status(403).json({ error: 'تحذف رسايلك أنت بس' });
+    if (t.status === 'closed' && !x.senior) return res.status(400).json({ error: 'التكت مغلق' });
+    const dn = x.role === 'owner' ? (t.name || 'العضو') : await supDisplayName(req);
+    m.deleted = true; m.deletedAt = new Date(); m.deletedByName = dn; m.revealed = false;
+    supAdd(t, { sender: 'system', name: dn, text: own ? (dn + ' حذف رسالة') : (dn + ' حذف رسالة ' + (m.name || '')).trim() });
+    t.mver = (t.mver || 0) + 1; await t.save(); bumpTicketActivity(); res.json({ ok: true });
+});
+app.post('/api/support/tickets/:id/messages/:i/reveal', supMw, async (req, res) => {
+    const x = await supMsgLoad(req, res); if (!x) return;
+    if (!x.senior) return res.status(403).json({ error: 'لكبار المسؤولين فقط' });
+    if (!x.m.deleted) return res.status(400).json({ error: 'هذي الرسالة مو محذوفة' });
+    x.m.revealed = !!(req.body || {}).show; x.t.mver = (x.t.mver || 0) + 1; await x.t.save(); bumpTicketActivity();
+    res.json({ ok: true, revealed: x.m.revealed });
+});
+app.post('/api/support/tickets/:id/typing', supMw, async (req, res) => {
+    const x = await supLoad(req, res); if (!x) return;
+    const k = String(x.t._id); const cur = supTyping.get(k) || {};
+    if (x.role === 'owner') cur.owner = Date.now(); else cur.admin = { name: await supDisplayName(req), ts: Date.now() };
+    supTyping.set(k, cur);
+    if (supTyping.size > 2000) for (const [a, v] of supTyping) if (Date.now() - Math.max(v.owner || 0, (v.admin && v.admin.ts) || 0) > 60000) supTyping.delete(a);
+    res.json({ ok: true });
+});
+
+// ── تحويل لإداري / استلام / إغلاق / تقييم / ملاحظات ──
+app.post('/api/support/tickets/:id/human', supMw, async (req, res) => {
+    const x = await supLoad(req, res); if (!x) return;
+    const { t, role } = x;
+    if (role !== 'owner') return res.status(403).json({ error: 'هذا الزر لصاحب التكت' });
+    if (t.status !== 'ai') return res.status(400).json({ error: t.status === 'closed' ? 'التكت مغلق' : 'طلبك وصل للإدارة من قبل' });
+    t.status = 'waiting';
+    supAdd(t, { sender: 'system', name: 'النظام', text: '📨 تم إرسال طلبك لفريق البنك، أول ما يدخل إداري بتوصلك رسالته هنا مباشرة.' });
+    t.unreadAdmin += 1; await t.save(); bumpTicketActivity(); res.json({ ok: true });
+});
+app.post('/api/support/admin/tickets/:id/join', supMw, supAdminOnly, async (req, res) => {
+    const x = await supLoad(req, res); if (!x) return;
+    const { t } = x;
+    if (t.status === 'closed') return res.status(400).json({ error: 'التكت مغلق' });
+    if (t.status === 'active' && t.adminUid && t.adminUid !== x.uid) return res.status(400).json({ error: 'هذا التكت مستلمه ' + t.adminName });
+    if (t.status === 'active' && t.adminUid === x.uid) return res.json({ ok: true });
+    const dn = await supDisplayName(req);
+    t.status = 'active'; t.adminUid = x.uid; t.adminName = dn;
+    supAdd(t, { sender: 'system', name: 'النظام', text: '✅ دخل ' + dn + ' للتكت' });
+    t.unreadUser += 1; await t.save(); bumpTicketActivity(); res.json({ ok: true });
+    supNotifyUser(t, '✅ تم استلام تكتك #' + t.no + ' من فريق البنك', 'success');
+});
+app.post('/api/support/tickets/:id/close', supMw, supAdminOnly, async (req, res) => {
+    const x = await supLoad(req, res); if (!x) return;
+    const { t } = x;
+    if (t.status === 'closed') return res.json({ ok: true });
+    const dn = await supDisplayName(req);
+    t.status = 'closed'; t.ratingRequired = true; t.closedByUid = x.uid; t.closedByName = dn;
+    supAdd(t, { sender: 'system', name: 'النظام', text: '🔒 تم إغلاق التكت بواسطة ' + dn });
+    t.unreadUser += 1; await t.save(); bumpTicketActivity(); res.json({ ok: true });
+    supNotifyUser(t, '🔒 تم إغلاق تكتك #' + t.no + ' — قيّم الخدمة من «خدمة العملاء»', 'info');
+});
+app.post('/api/support/tickets/:id/rate', supMw, async (req, res) => {
+    const x = await supLoad(req, res); if (!x) return;
+    const { t, role } = x;
+    if (role !== 'owner') return res.status(403).json({ error: 'التقييم لصاحب التكت فقط' });
+    if (t.status !== 'closed') return res.status(400).json({ error: 'التكت لسا مفتوح' });
+    const stars = parseInt((req.body || {}).stars, 10);
+    if (!(stars >= 1 && stars <= 5)) return res.status(400).json({ error: 'اختر من 1 إلى 5 نجوم' });
+    const comment = String((req.body || {}).comment || '').replace(/[<>]/g, '').trim().slice(0, 300);
+    const r = await BankTicket.updateOne({ _id: t._id, rating: null }, { $set: { rating: stars, ratingComment: comment, ratedAt: new Date() } });
+    if (!(r.modifiedCount ?? r.nModified)) return res.status(400).json({ error: 'سبق وقيّمت هذا التكت' });
+    const who = t.adminUid ? { uid: t.adminUid, name: t.adminName } : { uid: t.closedByUid || 'none', name: t.closedByName || 'غير محدد' };
+    await SupportRating.create({ ticketId: String(t._id), no: t.no, uid: t.uid, name: t.name, category: t.category, adminUid: who.uid, adminName: who.name, stars, comment });
+    bumpTicketActivity(); res.json({ ok: true });
+});
+app.get('/api/support/admin/ratings/:uid', supMw, supSeniorOnly, async (req, res) => {
+    const list = await SupportRating.find({ adminUid: String(req.params.uid) }).sort({ at: -1 }).limit(200).lean();
+    res.json({ list: list.map(r => ({ ticketId: r.ticketId, no: r.no, name: r.name, category: r.category, stars: r.stars, comment: r.comment || '', at: r.at })) });
+});
+app.get('/api/support/admin/ratings', supMw, supSeniorOnly, async (req, res) => {
+    const cnt = n => ({ $sum: { $cond: [{ $eq: ['$stars', n] }, 1, 0] } });
+    const admins = await SupportRating.aggregate([{ $group: { _id: '$adminUid', name: { $last: '$adminName' }, count: { $sum: 1 }, avg: { $avg: '$stars' }, s1: cnt(1), s2: cnt(2), s3: cnt(3), s4: cnt(4), s5: cnt(5) } }, { $sort: { avg: -1, count: -1 } }]);
+    const recent = await SupportRating.find({ comment: { $nin: [null, ''] } }).sort({ at: -1 }).limit(30).lean();
+    const total = admins.reduce((a, r) => a + r.count, 0), sum = admins.reduce((a, r) => a + r.avg * r.count, 0);
+    res.json({ total, avg: total ? sum / total : 0, admins: admins.map(r => ({ uid: r._id, name: r.name || '-', count: r.count, avg: r.avg, dist: [r.s1, r.s2, r.s3, r.s4, r.s5] })), recent: recent.map(r => ({ no: r.no, name: r.name, adminName: r.adminName, stars: r.stars, comment: r.comment, category: r.category, at: r.at })) });
+});
+app.post('/api/support/tickets/:id/note', supMw, supAdminOnly, async (req, res) => {
+    const x = await supLoad(req, res); if (!x) return;
+    const { t } = x;
+    if (t.status === 'closed') return res.status(400).json({ error: 'التكت مغلق' });
+    if (!x.senior && t.adminUid !== x.uid) return res.status(403).json({ error: 'استلم التكت أول' });
+    const text = String((req.body || {}).text || '').trim().slice(0, 1000);
+    if (!text) return res.status(400).json({ error: 'اكتب الملاحظة' });
+    supAdd(t, { sender: 'note', name: await supDisplayName(req), role: x.senior ? 'senior' : 'admin', text });
+    await t.save(); res.json({ ok: true });
+});
+
+// ── الردود الجاهزة ──
+async function supCanned() {
+    let s = await BankSettings.findOne();
+    if (!s.supportCanned || !s.supportCanned.length) { s.supportCanned = SUPPORT_CANNED_SEEDS.map(r => ({ title: r.title, text: r.text })); await s.save(); }
+    return s;
+}
+app.get('/api/support/admin/canned', supMw, supAdminOnly, async (req, res) => { const s = await supCanned(); res.json({ list: s.supportCanned.map(r => ({ id: String(r._id), title: r.title, text: r.text })) }); });
+app.post('/api/support/admin/canned', supMw, supSeniorOnly, async (req, res) => {
+    const title = String((req.body || {}).title || '').replace(/[<>]/g, '').trim().slice(0, 40), text = String((req.body || {}).text || '').replace(/[<>]/g, '').trim().slice(0, 500);
+    if (!title || !text) return res.status(400).json({ error: 'اكتب العنوان والنص' });
+    const s = await supCanned(); if (s.supportCanned.length >= 30) return res.status(400).json({ error: 'وصلت الحد الأقصى (30 رد)' });
+    s.supportCanned.push({ title, text }); await s.save(); res.json({ ok: true });
+});
+app.delete('/api/support/admin/canned/:rid', supMw, supSeniorOnly, async (req, res) => {
+    const s = await supCanned(); const b = s.supportCanned.length;
+    s.supportCanned = s.supportCanned.filter(r => String(r._id) !== req.params.rid);
+    if (s.supportCanned.length === b) return res.status(404).json({ error: 'غير موجود' });
+    await s.save(); res.json({ ok: true });
+});
+
+// ── فحص العضو (الإداري المستلم/الكبار يختارون اللي يظهر للعضو) ──
+const SUP_CATS = {
+    account: { title: 'معلومات الحساب البنكي', keys: ['acc.name', 'acc.number', 'acc.balance', 'acc.savings', 'acc.state', 'acc.created'] },
+    card: { title: 'البطاقة البنكية', keys: ['card.status', 'card.last4', 'card.expiry', 'card.frozen', 'card.pin'] },
+    transfers: { title: 'الحوالات', keys: ['tx.lastIn', 'tx.lastOut'] },
+    loan: { title: 'القروض', keys: ['loan.state', 'loan.amount', 'loan.remaining'] },
+    flash: { title: 'معلومات فلاش', keys: ['fl.name', 'fl.rank', 'fl.unit', 'fl.sector', 'fl.card'] }
+};
+const SUP_FIXED = [].concat(...Object.values(SUP_CATS).map(c => c.keys));
+const SUP_DYN = /^tx:[a-f0-9]{24}$/;
+async function supRows(cat, uid, only) {
+    if (only) { const has = cat === 'transfers' ? Array.from(only).some(k => SUP_DYN.test(k) || SUP_CATS.transfers.keys.includes(k)) : SUP_CATS[cat].keys.some(k => only.has(k)); if (!has) return []; }
+    const R = (k, l, v) => ({ k, l, v: v == null || v === '' ? '—' : String(v) });
+    const D = (k, l, v) => ({ k, l, v: v ? new Date(v).toISOString() : '—', d: !!v });
+    let rows = [];
+    const acc = await Account.findOne({ discord: uid }).lean();
+    if (cat === 'account') {
+        if (!acc) return [R('acc.name', 'الحساب', 'ما له حساب بنكي')].filter(r => !only || only.has(r.k));
+        rows.push(R('acc.name', 'الاسم', acc.discordTag), R('acc.number', 'رقم الحساب', acc.accountNumber), R('acc.balance', 'الرصيد الجاري', (acc.balance || 0).toLocaleString() + ' $'), R('acc.savings', 'رصيد التوفير', (acc.savingsBalance || 0).toLocaleString() + ' $'), R('acc.state', 'حالة الحساب', acc.isFrozen ? 'مجمّد' : 'نشط'), D('acc.created', 'تاريخ فتح الحساب', acc.createdAt));
+    } else if (cat === 'card') {
+        const c = await CardRequest.findOne({ discord: uid, status: { $in: ['approved', 'disabled', 'pending'] } }).sort({ requestedAt: -1 }).lean();
+        if (!c) return [R('card.status', 'البطاقة', 'ما عنده بطاقة')].filter(r => !only || only.has(r.k));
+        const st = { pending: 'قيد المراجعة', approved: 'مفعّلة', disabled: 'معطّلة' }[c.status] || c.status;
+        rows.push(R('card.status', 'حالة البطاقة', st), R('card.last4', 'آخر 4 أرقام', c.cardNumber ? c.cardNumber.slice(-4) : '—'), D('card.expiry', 'تاريخ الانتهاء', c.cardExpiry), R('card.frozen', 'التجميد', c.cardFrozen ? 'مجمّدة' : 'غير مجمّدة'), R('card.pin', 'الرقم السري', c.pinSet ? 'معيّن (ما أحد يشوفه)' : 'لم يُعيَّن'));
+    } else if (cat === 'transfers') {
+        if (!acc) return [];
+        const base = { type: 'transfer' };
+        const [lin, lout] = await Promise.all([Transaction.findOne({ ...base, toAccount: acc.accountNumber }).sort({ createdAt: -1 }).lean(), Transaction.findOne({ ...base, fromAccount: acc.accountNumber }).sort({ createdAt: -1 }).lean()]);
+        const f = t => t ? ((t.amount || 0).toLocaleString() + ' $ — ' + new Date(t.createdAt).toISOString().slice(0, 16).replace('T', ' ')) : null;
+        rows.push(R('tx.lastIn', 'آخر حوالة واردة', f(lin)), R('tx.lastOut', 'آخر حوالة صادرة', f(lout)));
+        const ids = only ? Array.from(only).filter(k => SUP_DYN.test(k)).map(k => k.slice(3)) : null;
+        const q = { $or: [{ fromAccount: acc.accountNumber }, { toAccount: acc.accountNumber }] };
+        const txs = await Transaction.find(ids ? { $and: [q, { _id: { $in: ids } }] } : q).sort({ createdAt: -1 }).limit(ids ? 200 : 30).lean();
+        txs.forEach(t => rows.push({ k: 'tx:' + t._id, l: (t.fromAccount === acc.accountNumber ? '📤 صادرة' : '📥 واردة') + ' — ' + (t.type || ''), v: (t.amount || 0).toLocaleString() + ' $' + (t.note ? ' — ' + String(t.note).slice(0, 60) : ''), at: new Date(t.createdAt).toISOString() }));
+    } else if (cat === 'loan') {
+        const l = await Loan.findOne({ discord: uid }).sort({ requestedAt: -1 }).lean();
+        if (!l) return [R('loan.state', 'القرض', 'ما عنده قروض')].filter(r => !only || only.has(r.k));
+        rows.push(R('loan.state', 'حالة آخر قرض', { pending: 'قيد المراجعة', approved: 'معتمد', rejected: 'مرفوض', paid: 'مسدّد', expired: 'منتهي' }[l.status] || l.status), R('loan.amount', 'المبلغ', (l.amount || 0).toLocaleString() + ' $'), R('loan.remaining', 'المتبقي', (l.remaining || 0).toLocaleString() + ' $'));
+    } else if (cat === 'flash') {
+        let d = null; try { d = await flashGet('/api/bank/member-card?uid=' + encodeURIComponent(uid)); } catch (e) {}
+        if (!d || !d.success || !d.found) return [R('fl.name', 'فلاش', 'غير متاح')].filter(r => !only || only.has(r.k));
+        rows.push(R('fl.name', 'الاسم المسجّل', d.name), R('fl.rank', 'الرتبة', d.rank), R('fl.unit', 'اليونت', d.unit), R('fl.sector', 'القطاع', d.sector), R('fl.card', 'رقم البطاقة العسكرية', d.cardNumber));
+    }
+    return rows.filter(r => !only || only.has(r.k));
+}
+app.get('/api/support/admin/tickets/:id/inspect/:cat', supMw, supAdminOnly, async (req, res) => {
+    if (!SUP_CATS[req.params.cat]) return res.status(400).json({ error: 'قسم غير معروف' });
+    const x = await supLoad(req, res); if (!x) return;
+    if (!supCanInspect(x.t, x)) return res.status(403).json({ error: 'الفحص للإداري المستلم وكبار المسؤولين فقط' });
+    const rows = await supRows(req.params.cat, x.t.uid, null);
+    const sh = new Set(x.t.shared || []);
+    res.json({ cat: req.params.cat, title: SUP_CATS[req.params.cat].title, rows: rows.map(r => Object.assign(r, { shown: sh.has(r.k) })) });
+});
+app.get('/api/support/tickets/:id/info', supMw, async (req, res) => {
+    const x = await supLoad(req, res); if (!x) return;
+    if (x.role === 'admin' && !supCanInspect(x.t, x)) return res.status(403).json({ error: 'غير مصرح' });
+    if (!(x.t.shared || []).length) return res.json({ items: [] });
+    const only = new Set(x.t.shared), items = [];
+    for (const cat of Object.keys(SUP_CATS)) { const rows = await supRows(cat, x.t.uid, only); if (rows.length) items.push({ cat, title: SUP_CATS[cat].title, rows }); }
+    res.json({ items });
+});
+app.post('/api/support/admin/tickets/:id/share', supMw, supAdminOnly, async (req, res) => {
+    const x = await supLoad(req, res); if (!x) return;
+    const { t } = x;
+    if (!supCanInspect(t, x)) return res.status(403).json({ error: 'الفحص للإداري المستلم وكبار المسؤولين فقط' });
+    if (t.status === 'closed') return res.status(400).json({ error: 'التكت مغلق' });
+    const arr = v => Array.isArray(v) ? v.map(String).slice(0, 500) : [];
+    const show = arr((req.body || {}).show), hide = arr((req.body || {}).hide);
+    const fixed = new Set(SUP_FIXED);
+    const okShow = show.filter(k => fixed.has(k) || SUP_DYN.test(k));
+    const ids = okShow.filter(k => SUP_DYN.test(k)).map(k => k.slice(3));
+    if (ids.length) {
+        const acc = await Account.findOne({ discord: t.uid }).lean();
+        if (!acc || await Transaction.countDocuments({ _id: { $in: ids }, $or: [{ fromAccount: acc.accountNumber }, { toAccount: acc.accountNumber }] }) !== ids.length) return res.status(400).json({ error: 'سجل غير صالح' });
+    }
+    const before = (t.shared || []).slice(), cur = new Set(before);
+    hide.forEach(k => cur.delete(k)); okShow.forEach(k => cur.add(k));
+    if (cur.size > 400) return res.status(400).json({ error: 'كثير، خفّ بعض اللي ظاهر أول' });
+    const next = Array.from(cur);
+    if (next.join(',') === before.join(',')) return res.json({ ok: true, shared: next });
+    t.shared = next;
+    if (!before.length && next.length) { supAdd(t, { sender: 'system', name: 'النظام', text: '🔎 ' + (await supDisplayName(req)) + ' عرض لك معلومات، تلقاها بأعلى التكت' }); t.unreadUser += 1; }
+    await t.save(); bumpTicketActivity(); res.json({ ok: true, shared: next });
+});
+
+// ── قوائم الإدارة / الحظر / الحذف ──
+app.get('/api/support/admin/tickets', supMw, supAdminOnly, async (req, res) => {
+    const q = req.sup.senior ? { status: ['ai', 'waiting', 'active', 'closed'].includes(req.query.status) ? req.query.status : 'waiting' } : { $or: [{ status: 'waiting' }, { status: 'active', adminUid: req.sup.uid }] };
+    const list = await BankTicket.find(q).sort({ updatedAt: -1 }).limit(100).lean();
+    res.json({ tickets: list.map(t => Object.assign(supPubTicket(t), { unread: t.unreadAdmin || 0, last: supPreview(t) })) });
+});
+app.post('/api/support/admin/tickets/:id/ban', supMw, supSeniorOnly, async (req, res) => {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: 'التكت غير موجود' });
+    const t = await BankTicket.findById(req.params.id);
+    if (!t) return res.status(404).json({ error: 'التكت غير موجود' });
+    if (['staff', 'management', 'admin', 'super_admin'].includes(await getBankRole(t.uid))) return res.status(400).json({ error: 'ما تقدر تحظر إداري' });
+    const reason = String((req.body || {}).reason || '').trim().slice(0, 200);
+    if (!(await SupportBan.exists({ uid: t.uid }))) await SupportBan.create({ uid: t.uid, name: t.name, reason, byName: await supDisplayName(req) });
+    const opens = await BankTicket.find({ uid: t.uid, status: { $ne: 'closed' } });
+    for (const o of opens) { o.status = 'closed'; supAdd(o, { sender: 'system', name: 'النظام', text: '🚫 ' + SUPPORT_BANNED_MSG }); o.unreadUser += 1; await o.save(); }
+    await BankLog.create({ action: 'support_ban', description: 'حظر ' + t.name + ' من خدمة العملاء' + (reason ? ' — ' + reason : ''), performedBy: req.user.id, performedByTag: await supDisplayName(req), targetDiscord: t.uid, targetTag: t.name });
+    bumpTicketActivity(); res.json({ ok: true });
+});
+app.get('/api/support/admin/bans', supMw, supSeniorOnly, async (req, res) => {
+    const list = await SupportBan.find().sort({ createdAt: -1 }).limit(200).lean();
+    res.json({ bans: list.map(b => ({ id: String(b._id), name: b.name, reason: b.reason, by: b.byName, at: b.createdAt })) });
+});
+app.delete('/api/support/admin/bans/:id', supMw, supSeniorOnly, async (req, res) => {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: 'غير موجود' });
+    const b = await SupportBan.findByIdAndDelete(req.params.id);
+    if (!b) return res.status(404).json({ error: 'غير موجود' });
+    await Account.updateOne({ discord: b.uid }, { supportBanned: false });
+    res.json({ ok: true });
+});
+app.delete('/api/support/admin/closed', supMw, supSeniorOnly, async (req, res) => {
+    const ids = (await BankTicket.find({ status: 'closed' }).select('_id').lean()).map(t => String(t._id));
+    await TicketMedia.deleteMany({ ticket: { $in: ids } });
+    const r = await BankTicket.deleteMany({ status: 'closed' });
+    await BankLog.create({ action: 'delete_tickets', description: 'حذف التكتات المغلقة — العدد: ' + (r.deletedCount || 0), performedBy: req.user.id, performedByTag: await supDisplayName(req) });
+    bumpTicketActivity(); res.json({ ok: true, deleted: r.deletedCount || 0 });
+});
+app.delete('/api/support/admin/tickets/:id', supMw, supSeniorOnly, async (req, res) => {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: 'التكت غير موجود' });
+    const t = await BankTicket.findById(req.params.id).select('no status');
+    if (!t) return res.status(404).json({ error: 'التكت غير موجود' });
+    if (t.status !== 'closed') return res.status(400).json({ error: 'تقدر تحذف التكتات المغلقة فقط' });
+    await TicketMedia.deleteMany({ ticket: String(t._id) }); await BankTicket.deleteOne({ _id: t._id });
+    bumpTicketActivity(); res.json({ ok: true });
 });
 
 // ── الصفحة الرئيسية ─────────────────────────────────────────────────────────
@@ -2943,6 +2959,19 @@ app.use(async (req, res) => {
             window.fetch = function (u, o) {
                 if (typeof u === 'string' && u.charAt(0) === '/' && u.charAt(1) !== '/' && u.indexOf(B + '/') !== 0) u = B + u;
                 return f.call(this, u, o);
+            };
+        })();
+        (function () {
+            var f0 = window.fetch;
+            window.fetch = function (u, o) {
+                o = o || {};
+                if (!o.signal && typeof AbortController !== 'undefined') {
+                    var c = new AbortController(); o = Object.assign({}, o, { signal: c.signal });
+                    var big = o.body && String(o.body).length > 300000;
+                    var t = setTimeout(function () { try { c.abort(); } catch (e) {} }, big ? 90000 : 35000);
+                    return f0.call(this, u, o).finally(function () { clearTimeout(t); });
+                }
+                return f0.call(this, u, o);
             };
         })();
     </script>
@@ -3190,201 +3219,6 @@ app.use(async (req, res) => {
         @keyframes dgShake { 0%,100% { transform: rotate(0); } 25% { transform: rotate(-9deg); } 75% { transform: rotate(9deg); } }
         @keyframes ntIn { from { opacity: 0; transform: translateX(60px); } to { opacity: 1; transform: none; } }
 
-            /* ═══ خدمة العملاء (من فلاش) + بطاقة جديدة + ملفات بنكية ═══ */
-        :root { --bg1: #0a1628; --bg2: #0d1f3c; --panel: rgba(255,255,255,0.04); --border: rgba(59,130,246,0.25); --gold: #3b82f6; --gold-soft: #60a5fa; --green: #1d4ed8; --green2: #3b82f6; --red: #ef4444; --amber: #eab308; --text: #e2e8f0; --muted: #64748b; }
-        .btn.sm { padding: 0.4rem 0.9rem; font-size: 0.8rem; }
-        .btn.sm:not(.danger):not(.gray) { background: linear-gradient(135deg, #1d4ed8, #3b82f6); }
-        .btn.danger { background: #ef4444; }
-        .btn.gray { background: rgba(255,255,255,0.08); border: 1px solid rgba(59,130,246,0.25); color: #94a3b8; }
-        #spa-body .sp-msgs { max-height: 52vh; }
-        html.sp-lock, html.sp-lock body { overflow: hidden !important; }
-        html.sp-lock #sp-fab, html.sp-lock #admin-fab-btn { display: none !important; }
-        .prof-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; background: rgba(255,255,255,0.05); border: 1px solid rgba(59,130,246,0.2); border-radius: 10px; padding: 10px 12px; margin-top: 8px; cursor: pointer; }
-        .prof-row:hover { border-color: #3b82f6; background: rgba(59,130,246,0.12); }
-        .prof-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
-        .prof-stat { background: rgba(255,255,255,0.04); border: 1px solid rgba(59,130,246,0.2); border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 3px; }
-        .prof-stat small { color: #64748b; font-size: 0.72rem; } .prof-stat b { font-size: 1.05rem; } .prof-stat em { color: #64748b; font-size: 0.72rem; font-style: normal; }
-        .prof-last { border: 1px solid; border-radius: 12px; padding: 10px; background: rgba(255,255,255,0.03); display: flex; flex-direction: column; gap: 3px; }
-        .prof-last small { color: #94a3b8; }
-        .prof-tx { display: flex; justify-content: space-between; gap: 10px; padding: 8px 0; border-top: 1px dashed rgba(59,130,246,0.2); font-size: 0.85rem; }
-        .prof-cardinfo { display: flex; flex-direction: column; gap: 3px; font-size: 0.82rem; color: #94a3b8; margin-top: 10px; }
-        .prof-cardinfo b { color: #e2e8f0; font-weight: 700; }
-        /* بطاقة بنك فلاش */
-        .fbc-wrap { perspective: 1100px; max-width: 390px; width: 100%; margin-top: 12px; direction: ltr; font-family: 'Tajawal', sans-serif; }
-        .fbc { position: relative; width: 100%; aspect-ratio: 1.586 / 1; transform-style: preserve-3d; transition: transform 0.7s cubic-bezier(.2,.8,.2,1); cursor: pointer; -webkit-tap-highlight-color: transparent; }
-        .fbc.flip { transform: rotateY(180deg); }
-        .fbc-face { position: absolute; inset: 0; border-radius: 20px; padding: 16px 20px; color: #fff; backface-visibility: hidden; -webkit-backface-visibility: hidden; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between; box-shadow: 0 14px 34px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(255,255,255,0.18); background: radial-gradient(circle at 85% 0%, rgba(255,255,255,0.22), transparent 45%), linear-gradient(135deg, var(--c1), var(--c2)); }
-        .fbc-face::before { content: ''; position: absolute; width: 260px; height: 260px; border-radius: 50%; right: -90px; bottom: -130px; background: rgba(255,255,255,0.06); }
-        .fbc-face::after { content: ''; position: absolute; width: 200px; height: 200px; border-radius: 50%; left: -80px; top: -110px; background: rgba(255,255,255,0.05); }
-        .fbc-shine { position: absolute; inset: 0; background: linear-gradient(115deg, transparent 35%, rgba(255,255,255,0.14) 48%, transparent 60%); pointer-events: none; }
-        .fbc-back { transform: rotateY(180deg); padding: 0 0 14px; }
-        .fbc-top { display: flex; justify-content: space-between; align-items: center; position: relative; z-index: 1; }
-        .fbc-brand { display: flex; align-items: center; gap: 8px; }
-        .fbc-brand b { display: block; letter-spacing: 2px; font-size: 0.9rem; line-height: 1.1; }
-        .fbc-brand small { display: block; color: var(--ac); font-size: 0.72rem; }
-        .fbc-chip { display: flex; align-items: center; gap: 10px; position: relative; z-index: 1; }
-        .fbc-chip span { font-size: 0.6rem; letter-spacing: 2px; color: var(--ac); border: 1px solid var(--ac); border-radius: 5px; padding: 1px 6px; }
-        .fbc-num { font-family: 'Courier New', monospace; font-size: 1.28rem; letter-spacing: 3px; text-shadow: 0 2px 4px rgba(0,0,0,0.5); position: relative; z-index: 1; }
-        .fbc-bot { display: flex; justify-content: space-between; align-items: flex-end; gap: 10px; position: relative; z-index: 1; }
-        .fbc-bot small { display: block; font-size: 0.55rem; letter-spacing: 1px; color: var(--ac); }
-        .fbc-bot div > div { font-size: 0.86rem; text-transform: uppercase; }
-        .fbc-hn { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .fbc-frozen { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.65); color: #fca5a5; font-size: 0.7rem; padding: 3px 10px; border-radius: 8px; z-index: 2; }
-        .fbc-strip { height: 38px; background: #0b0b0f; margin-top: 18px; position: relative; z-index: 1; }
-        .fbc-sign { display: flex; align-items: center; gap: 10px; padding: 0 20px; margin-top: 4px; position: relative; z-index: 1; }
-        .fbc-sigbox { flex: 1; height: 34px; border-radius: 6px; background: repeating-linear-gradient(45deg, #f1f5f9, #f1f5f9 6px, #e2e8f0 6px, #e2e8f0 12px); color: #475569; font-size: 0.7rem; display: flex; align-items: center; justify-content: flex-end; padding: 0 10px; letter-spacing: 2px; }
-        .fbc-cvv { background: #fff; color: #0f172a; border-radius: 6px; padding: 3px 12px; text-align: center; }
-        .fbc-cvv small { display: block; font-size: 0.5rem; color: #64748b; } .fbc-cvv b { font-family: 'Courier New', monospace; font-size: 1rem; }
-        .fbc-note { font-size: 0.7rem; line-height: 1.6; padding: 0 20px; color: var(--ac); direction: rtl; text-align: center; position: relative; z-index: 1; }
-        .fbc-tap { font-size: 0.6rem; text-align: center; color: rgba(255,255,255,0.45); position: relative; z-index: 1; }
-
-        #wf-overlay { display: none; position: fixed; inset: 0; z-index: 10600; background: rgba(0,0,0,0.75); align-items: center; justify-content: center; padding: 20px; overflow-y: auto; }
-        #wf-overlay.open { display: flex; }
-        .wf-box { background: #0d1f3c; border: 1px solid var(--gold); border-radius: 14px; padding: 22px; max-width: 380px; width: 100%; text-align: center; max-height: 85vh; overflow-y: auto; margin: auto; }
-        .wf-box h3 { margin-bottom: 14px; color: var(--gold-soft); }
-        .wf-box.wf-big { max-width: 520px; padding: 28px 24px; }
-        .wf-choice-row { display: flex; gap: 10px; margin-top: 6px; }
-        .wf-choice-row button { flex: 1; padding: 14px 8px; border-radius: 10px; font-family: inherit; font-size: 14px; cursor: pointer; border: 1px solid var(--border); background: rgba(255,255,255,0.04); color: #fff; }
-        .wf-choice-row button.wf-warning:hover { border-color: #f87171; background: rgba(248,113,113,0.12); }
-        .wf-choice-row button.wf-notice:hover { border-color: #fbbf24; background: rgba(251,191,36,0.12); }
-        .wf-box textarea { width: 100%; min-height: 90px; margin-top: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 8px; color: #fff; padding: 10px; font-family: inherit; font-size: 14px; resize: vertical; }
-        .wf-actions { display: flex; gap: 8px; margin-top: 14px; }
-        .wf-actions button { flex: 1; }
-        #sp-fab { position: fixed; bottom: 22px; left: 22px; z-index: 5300; width: 54px; height: 54px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.2); background: linear-gradient(135deg, #1d4ed8, #3b82f6); color: #fff; font-size: 24px; cursor: pointer; box-shadow: 0 6px 22px rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; }
-        #sp-fab:active { transform: scale(0.94); }
-        .sp-badge { background: #ef4444; color: #fff; border-radius: 10px; min-width: 18px; height: 18px; padding: 0 5px; font-size: 11px; font-weight: bold; display: inline-flex; align-items: center; justify-content: center; margin-inline-start: 6px; }
-        #sp-fab .sp-badge { position: absolute; top: -4px; right: -4px; margin: 0; }
-        #sp-modal { position: fixed; top: 0; left: 0; right: 0; height: 100%; background: #060d1a; z-index: 4000; display: none; align-items: flex-end; justify-content: center; overscroll-behavior: contain; }
-        #sp-modal.kb { align-items: stretch; }
-        #sp-modal.kb #sp-box { height: 100%; border-radius: 0; }
-        #sp-modal.open { display: flex; }
-        #sp-box { background-color: #0a1628; background-image: linear-gradient(160deg, #0d1f3c, #0a1628); transform: translateZ(0); -webkit-transform: translateZ(0); isolation: isolate; border: 1px solid var(--border); border-radius: 16px 16px 0 0; width: 100%; max-width: 560px; height: min(86%, 720px); display: flex; flex-direction: column; box-shadow: 0 -10px 40px rgba(0,0,0,0.6); padding-bottom: env(safe-area-inset-bottom, 0px); }
-        @media (min-width: 700px) { #sp-modal { align-items: center; } #sp-box { border-radius: 16px; } }
-        #sp-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--border); font-weight: bold; color: var(--gold-soft); }
-        #sp-head button { background: rgba(255,255,255,0.08); border: none; color: var(--text); width: 32px; height: 32px; border-radius: 8px; cursor: pointer; font-size: 16px; }
-        #sp-body { flex: 1; min-height: 0; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; overscroll-behavior: contain; }
-        .sp-btn { background: linear-gradient(135deg, var(--green), var(--green2)); color: #fff; border: none; border-radius: 8px; padding: 10px 16px; font-size: 14px; font-weight: bold; cursor: pointer; font-family: inherit; }
-        .sp-btn.alt { background: rgba(255,255,255,0.08); color: var(--text); }
-        .sp-btn.warn { background: linear-gradient(135deg, #b45309, #f59e0b); }
-        .sp-btn.red { background: rgba(239,68,68,0.18); color: #fca5a5; border: 1px solid rgba(239,68,68,0.4); }
-        .sp-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        .sp-btn.pulse { animation: spPulse 1.4s infinite; }
-        @keyframes spPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(245,158,11,0.6); } 50% { box-shadow: 0 0 0 8px rgba(245,158,11,0); } }
-        .sp-field { width: 100%; background: #14223d; border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px 12px; font-size: 16px; margin-bottom: 10px; font-family: inherit; }
-        .sp-field:focus { outline: none; border-color: var(--gold-soft); }
-        .sp-lbl { display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }
-        .sp-row { background: #101d36; border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-bottom: 10px; cursor: pointer; }
-        .sp-row:hover { border-color: var(--gold-soft); }
-        .sp-row .t1 { display: flex; justify-content: space-between; gap: 8px; font-weight: bold; font-size: 14px; }
-        .sp-row .t2 { color: var(--muted); font-size: 12px; margin-top: 4px; }
-        .sp-chip { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: bold; white-space: nowrap; }
-        .sp-chip.ai { background: rgba(59,130,246,0.2); color: #93c5fd; }
-        .sp-chip.waiting { background: rgba(245,158,11,0.2); color: #fcd34d; }
-        .sp-chip.active { background: rgba(34,197,94,0.2); color: #86efac; }
-        .sp-chip.closed { background: rgba(148,163,184,0.2); color: #cbd5e1; }
-        .sp-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
-        .sp-tab { background: #16243f; border: 1px solid var(--border); color: var(--text); border-radius: 18px; padding: 6px 14px; font-size: 13px; cursor: pointer; font-family: inherit; }
-        .sp-tab.on { background: var(--green2); border-color: var(--green2); color: #fff; font-weight: bold; }
-        .sp-chat { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-        .sp-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
-        .sp-link { background: none; border: none; color: var(--gold-soft); cursor: pointer; font-size: 14px; font-family: inherit; padding: 4px; }
-        .sp-title { font-weight: bold; font-size: 14px; text-align: center; flex: 1; }
-        .sp-state { background: #121f38; border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; font-size: 13px; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
-        .sp-msgs { flex: 1; min-height: 120px; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
-        .sp-msg { display: flex; flex-direction: column; max-width: 82%; }
-        .sp-msg.me { align-self: flex-start; }
-        .sp-msg.other { align-self: flex-end; }
-        .sp-msg.sys { align-self: center; max-width: 94%; }
-        .sp-who { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
-        .sp-b { padding: 8px 12px; border-radius: 12px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
-        .sp-msg.me .sp-b { background: linear-gradient(135deg, var(--green), var(--green2)); color: #fff; border-top-right-radius: 4px; }
-        .sp-msg.other .sp-b { background: #1c2b48; border-top-left-radius: 4px; }
-        .sp-msg.ai .sp-b { background: #2a1f52; border: 1px solid #5b4a99; }
-        .sp-msg.admin .sp-b { background: #12402c; border: 1px solid #1f7a4d; }
-        .sp-msg.sys .sp-b { background: #33290f; color: #fcd34d; font-size: 12.5px; text-align: center; border-radius: 10px; }
-        .sp-time { font-size: 10px; color: var(--muted); margin-top: 2px; }
-        .sp-role { display: inline-block; font-size: 10px; font-weight: bold; padding: 1px 7px; border-radius: 8px; margin-inline-start: 6px; vertical-align: middle; }
-        .sp-role.senior { background: #3d3410; color: #fde047; border: 1px solid #8a7414; }
-        .sp-role.admin { background: #12294d; color: #93c5fd; border: 1px solid #2b5aa8; }
-        .sp-role.member { background: #123524; color: #86efac; border: 1px solid #2f7a4d; }
-        .sp-peers { display: flex; flex-direction: column; gap: 4px; padding: 2px 4px; }
-        .sp-peer { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-        .sp-peer-n { color: var(--text); font-weight: bold; }
-        .sp-peer .sp-dots { display: inline-flex; align-items: center; }
-        .sp-info { background: #0f1a30; border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; margin-bottom: 8px; max-height: 34vh; overflow-y: auto; }
-        .sp-info-h { display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
-        .sp-info-c { border-top: 1px dashed var(--border); padding-top: 6px; margin-top: 6px; }
-        .sp-info-t { font-size: 12px; color: var(--gold-soft); font-weight: bold; margin-bottom: 4px; }
-        .sp-info-r { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; padding: 2px 0; }
-        .sp-info-r b { font-weight: normal; text-align: left; word-break: break-word; }
-        .sp-ins-list { max-height: 46vh; overflow-y: auto; }
-        .sp-ins-r { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 0; border-top: 1px dashed var(--border); }
-        .sp-ins-r.on { background: rgba(34,197,94,0.07); }
-        .sp-img { max-width: 220px; max-height: 220px; border-radius: 10px; margin-top: 6px; display: block; cursor: zoom-in; background: rgba(255,255,255,0.05); }
-        .sp-dots span { display: inline-block; width: 6px; height: 6px; margin: 0 2px; border-radius: 50%; background: #a78bfa; animation: spDot 1s infinite; }
-        .sp-dots span:nth-child(2) { animation-delay: 0.15s; } .sp-dots span:nth-child(3) { animation-delay: 0.3s; }
-        @keyframes spDot { 0%,60%,100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-4px); opacity: 1; } }
-        .sp-compose { display: flex; align-items: flex-end; gap: 8px; margin-top: 10px; }
-        .sp-compose textarea { flex: 1; resize: none; max-height: 110px; margin: 0; }
-        .sp-attach { background: #1c2b48; border-radius: 8px; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 18px; flex-shrink: 0; }
-        .sp-cin { display: flex; align-items: flex-end; gap: 8px; flex: 1; min-width: 0; }
-        .sp-mic { background: #1c2b48; border: none; color: inherit; border-radius: 8px; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 18px; flex-shrink: 0; }
-        .sp-mic:hover { background: #26395e; }
-        .sp-vbar { display: none; align-items: center; gap: 10px; flex: 1; min-width: 0; background: #1c2b48; border-radius: 24px; padding: 4px 6px; direction: ltr; }
-        .sp-vb-ic { background: transparent; border: none; color: #fca5a5; font-size: 18px; cursor: pointer; width: 36px; height: 36px; border-radius: 50%; flex-shrink: 0; }
-        .sp-vb-ic:hover { background: rgba(239,68,68,0.18); }
-        .sp-vb-stop { background: #ef4444; border: none; color: #fff; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; font-size: 14px; flex-shrink: 0; }
-        .sp-rec-dot { width: 10px; height: 10px; border-radius: 50%; background: #ef4444; flex-shrink: 0; animation: spRecPulse 1s infinite; }
-        @keyframes spRecPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
-        .sp-rec-time { font-size: 13px; min-width: 34px; font-variant-numeric: tabular-nums; flex-shrink: 0; }
-        .sp-wave { display: flex; align-items: center; gap: 2px; height: 32px; flex: 1; min-width: 0; overflow: hidden; direction: ltr; }
-        .sp-wave i { display: block; flex: 1; max-width: 4px; min-width: 2px; min-height: 4px; border-radius: 2px; background: rgba(255,255,255,0.4); }
-        .sp-wave i.on { background: #fff; }
-        .sp-vbar .sp-wave i { background: #7c8db0; }
-        .sp-vbar .sp-wave i.on { background: #fff; }
-        .sp-vm { display: flex; align-items: center; gap: 8px; width: 270px; max-width: 100%; direction: ltr; }
-        .sp-vm-play { width: 36px; height: 36px; border-radius: 50%; border: none; background: #fff; color: #0a1628; cursor: pointer; flex-shrink: 0; font-size: 13px; display: flex; align-items: center; justify-content: center; padding: 0; }
-        .sp-vm-wave { cursor: pointer; }
-        .sp-vm-dur { font-size: 12px; min-width: 32px; text-align: center; font-variant-numeric: tabular-nums; flex-shrink: 0; }
-        .sp-vm-speed { background: rgba(255,255,255,0.18); border: none; color: inherit; border-radius: 10px; padding: 3px 7px; font-size: 11px; cursor: pointer; flex-shrink: 0; font-family: inherit; }
-        .sp-mic.on { background: #92400e; }
-        #sp-in.note-mode { border-color: #f59e0b; background: #2a2310; }
-        .sp-msg.note { align-self: center; max-width: 94%; }
-        .sp-msg.note .sp-b { background: #2a2310; border: 1px dashed #f59e0b; color: #fde68a; }
-        .sp-msg[data-i] .sp-b { -webkit-touch-callout: none; }
-        .sp-msg[data-i] img { -webkit-touch-callout: none; }
-        .sp-msg.del .sp-b { background: rgba(127,29,29,0.55) !important; border: 1px solid #ef4444 !important; color: #fecaca !important; }
-        .sp-del-tag { font-size: 11px; color: #fca5a5; font-weight: 800; margin-bottom: 4px; }
-        .sp-quote { border-right: 3px solid #60a5fa; background: rgba(255,255,255,0.08); border-radius: 6px; padding: 4px 8px; margin-bottom: 6px; font-size: 12px; color: #cbd5e1; cursor: pointer; white-space: normal; overflow: hidden; max-height: 48px; }
-        .sp-quote b { display: block; color: #93c5fd; font-size: 11px; }
-        .sp-ed { font-size: 10px; color: var(--muted); margin-inline-start: 5px; }
-        .sp-msg.sp-flash .sp-b { outline: 2px solid #60a5fa; transition: outline 0.2s; }
-        .sp-ctxbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; background: rgba(59,130,246,0.14); border-right: 3px solid #60a5fa; border-radius: 8px; padding: 6px 10px; margin: 0 2px 6px; font-size: 12.5px; color: #cbd5e1; }
-        .sp-ctxbar span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        #sp-mm-ov { position: fixed; inset: 0; z-index: 7200; background: rgba(2,6,15,0.62); display: flex; align-items: flex-end; justify-content: center; }
-        #sp-mm-sheet { width: 100%; background: #0d1f3c; border-top: 1px solid rgba(59,130,246,0.45); border-radius: 20px 20px 0 0; padding: 8px 14px calc(14px + env(safe-area-inset-bottom, 0px)); box-shadow: 0 -12px 40px rgba(0,0,0,0.6); animation: spMmUp 0.18s ease-out; max-height: 78%; overflow-y: auto; }
-        @keyframes spMmUp { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
-        .sp-mm-grip { width: 44px; height: 4px; border-radius: 4px; background: rgba(255,255,255,0.25); margin: 4px auto 10px; }
-        .sp-mm-prev { font-size: 12.5px; color: var(--muted); background: rgba(255,255,255,0.05); border-radius: 10px; padding: 8px 10px; margin-bottom: 8px; white-space: pre-wrap; word-break: break-word; max-height: 64px; overflow: hidden; }
-        .sp-mm-it { display: flex; align-items: center; gap: 12px; width: 100%; background: transparent; border: none; border-top: 1px solid rgba(255,255,255,0.07); color: #e5edff; font-family: inherit; font-size: 15px; padding: 13px 6px; cursor: pointer; text-align: right; }
-        .sp-mm-it span { font-size: 19px; width: 26px; text-align: center; }
-        .sp-mm-it.danger { color: #fca5a5; }
-        .sp-mm-it.cancel { justify-content: center; color: var(--muted); }
-        .sp-mm-info { font-size: 13px; line-height: 1.9; color: #cbd5e1; }
-        .sp-mm-info b { color: #e5edff; }
-        .sp-mm-info .ed { background: rgba(255,255,255,0.05); border-radius: 8px; padding: 5px 8px; margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
-        .sp-canned { background: #0f1a30; border: 1px solid var(--border); border-radius: 10px; margin-top: 8px; max-height: 40vh; overflow-y: auto; }
-        .sp-canned-h { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; }
-        .sp-canned-r { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px dashed var(--border); cursor: pointer; }
-        .sp-canned-r:hover { background: rgba(59,130,246,0.12); }
-        .sp-rate { background: #0f1a30; border: 1px solid var(--gold-soft); border-radius: 12px; padding: 12px; margin-top: 10px; text-align: center; }
-        .sp-stars { display: flex; justify-content: center; gap: 6px; margin: 8px 0; direction: ltr; }
-        .sp-stars button { background: none; border: none; font-size: 32px; cursor: pointer; color: #475569; padding: 0 2px; }
-        .sp-stars button.on { color: #facc15; }
-        .sp-prev { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; color: var(--muted); }
-        .sp-prev img { height: 46px; border-radius: 6px; }
-        #sp-lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 6000; display: none; align-items: center; justify-content: center; padding: 14px; }
-        #sp-lightbox img { max-width: 100%; max-height: 100%; border-radius: 8px; }
     </style>
 </head>
 <body>
@@ -3462,7 +3296,7 @@ app.use(async (req, res) => {
                 <li><button onclick="goPage('history')" id="nav-history">📜 كشف حساب</button></li>
                 <li><button onclick="goPage('notifications')" id="nav-notifications">🔔 <span id="notif-count"></span>إشعارات</button></li>
                 <li><button onclick="goPage('cards')" id="nav-cards">💳 بطاقاتي</button></li>
-                <li><button onclick="spOpen()" id="nav-support" class="sp-nav-user">🎧 خدمة العملاء</button></li>
+                <li><button onclick="openSupportModal()" id="nav-support">🎧 خدمة العملاء</button></li>
             </ul>
             <div id="auth-section"></div>
         </nav>
@@ -3477,7 +3311,7 @@ app.use(async (req, res) => {
             <button onclick="mobileGoPage('history')" id="mnav-history">📜 كشف حساب</button>
             <button onclick="mobileGoPage('notifications')" id="mnav-notifications">🔔 <span id="mnav-notif-count"></span>إشعارات</button>
             <button onclick="mobileGoPage('cards')" id="mnav-cards">💳 بطاقاتي</button>
-            <button class="sp-nav-user" onclick="spOpen(); closeMobileMenu()">🎧 خدمة العملاء</button>
+            <button onclick="openSupportModal(); closeMobileMenu()">🎧 خدمة العملاء</button>
         </div>
 
         <div id="page-dashboard" class="page active">
@@ -3601,7 +3435,7 @@ app.use(async (req, res) => {
     <div id="pinPadModal" class="custom-modal">
         <div class="modal-content" style="max-width:340px; text-align:center;">
             <p style="color:#e2e8f0; font-weight:bold; margin-bottom:6px;">🔐 أدخل الرقم السري</p>
-            <p style="color:#64748b; font-size:0.8rem; margin-bottom:16px;">4 أرقام — احفظه في ذاكرتك، ما يظهر على البطاقة ولا يعرفه أحد</p>
+            <p style="color:#64748b; font-size:0.8rem; margin-bottom:16px;">4 أرقام فقط</p>
             <div id="pinpad-dots" style="display:flex; justify-content:center; gap:14px; margin-bottom:22px;">
                 <span class="pinpad-dot" data-i="0"></span>
                 <span class="pinpad-dot" data-i="1"></span>
@@ -3627,15 +3461,15 @@ app.use(async (req, res) => {
         </div>
     </div>
 
-    <button id="sp-fab" onclick="spOpen()" title="خدمة العملاء">🎧<span class="sp-badge" id="sp-fab-badge" style="display:none;"></span></button>
-    <div id="sp-modal" onclick="if(event.target===this) spClose()">
-        <div id="sp-box">
-            <div id="sp-head"><span>🎧 خدمة العملاء</span><button onclick="spClose()">✕</button></div>
+    <div id="supportModal" class="custom-modal">
+        <div class="modal-content" style="max-width:650px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; border-bottom:2px solid #3b82f6; padding-bottom:10px;">
+                <h2 style="color:#60a5fa; margin:0; border:0; padding:0;">🎧 خدمة العملاء</h2>
+                <button onclick="closeSupportModal()" style="background:none; border:none; color:white; font-size:24px; cursor:pointer;">✕</button>
+            </div>
             <div id="sp-body"></div>
         </div>
     </div>
-    <div id="sp-lightbox" onclick="this.style.display='none'"><img id="sp-lightbox-img" src=""></div>
-    <div id="wf-overlay"><div class="wf-box" id="wf-box"></div></div>
 
     <div id="adminModal" class="custom-modal">
         <div class="modal-content">
@@ -3649,12 +3483,12 @@ app.use(async (req, res) => {
                 <button id="atab-loans" class="tab-btn" onclick="switchAdminTab('loans')">📋 القروض</button>
                 <button id="atab-cards" class="tab-btn" onclick="switchAdminTab('cards')">💳 البطاقات</button>
                 <button id="atab-card-control" class="tab-btn" style="display:none;" onclick="switchAdminTab('card-control')">🕹️ تحكم البطاقات</button>
-                <button id="atab-support" class="tab-btn sp-nav-admin" onclick="switchAdminTab('support')">🎧 الدعم</button>
+                <button id="atab-support" class="tab-btn" onclick="switchAdminTab('support')">🎧 الدعم</button>
+                <button id="atab-profile" class="tab-btn" style="display:none;" onclick="switchAdminTab('profile')">🔎 ملف عضو</button>
                 <button id="atab-staff" class="tab-btn" onclick="switchAdminTab('staff')">👔 الموظفون</button>
                 <button id="atab-locks" class="tab-btn" onclick="switchAdminTab('locks')">🔒 إيقاف الميزات</button>
                 <button id="atab-settings" class="tab-btn" style="display:none;" onclick="switchAdminTab('settings')">👑 إعدادات كبار المسؤولين</button>
                 <button id="atab-military-salary" class="tab-btn" style="display:none;" onclick="switchAdminTab('military-salary')">🎖️ رواتب العساكر</button>
-                <button id="atab-profiles" class="tab-btn" style="display:none;" onclick="switchAdminTab('profiles')">🗂️ الملفات البنكية</button>
                 <button id="atab-bank-log" class="tab-btn" style="display:none;" onclick="switchAdminTab('bank-log')">📜 سجل البنك</button>
             </div>
             
@@ -3678,8 +3512,8 @@ app.use(async (req, res) => {
                 <div id="card-control-container">جاري التحميل...</div>
             </div>
 
-            <div id="atab-profiles-section" style="display:none;">
-                <div id="profiles-container">جاري التحميل...</div>
+            <div id="atab-profile-section" style="display:none;">
+                <div id="profile-container"></div>
             </div>
 
             <div id="atab-staff-section" style="display:none;">
@@ -3843,6 +3677,7 @@ app.use(async (req, res) => {
         </div>
     </div>
 
+    <style>${BANK_EXT_CSS}</style>
     <script>
         let currentUser = null;
         let currentRole = 'user', currentIsOwner = false;
@@ -4286,8 +4121,6 @@ app.use(async (req, res) => {
             currentUser = data.user;
             currentRole = data.role;
             currentIsOwner = !!data.isOwner;
-            currentRealOwner = !!data.realOwner;
-            ME = { isSeniorAdmin: data.role === 'super_admin', isAdmin: ['staff','management','admin','super_admin'].indexOf(data.role) >= 0, isOwner: !!data.realOwner };
 
             if (!data.hasAccount) {
                 // ما فيه حساب = ما دخل من فلاش (الحساب يتفتح تلقائياً عند الدخول من زر البنك في فلاش)
@@ -4311,14 +4144,14 @@ app.use(async (req, res) => {
                     // موظف: القروض + البطاقات + الدعم فقط
                     document.getElementById('admin-fab-btn').innerText = '⚙️ لوحة الموظف';
                     document.getElementById('admin-panel-title').innerText = "لوحة الموظف 👤";
-                    ['atab-stats','atab-accounts','atab-card-control','atab-tickets-log','atab-staff','atab-locks'].forEach(id => {
+                    ['atab-stats','atab-accounts','atab-card-control','atab-profile','atab-staff','atab-locks'].forEach(id => {
                         const b = document.getElementById(id); if (b) b.style.display = 'none';
                     });
                 } else if (currentRole === 'management') {
                     // إداري: القروض + البطاقات + الدعم + الحسابات
                     document.getElementById('admin-fab-btn').innerText = '⚙️ لوحة الإداري';
                     document.getElementById('admin-panel-title').innerText = "لوحة الإداري 🏢";
-                    ['atab-stats','atab-card-control','atab-tickets-log','atab-staff','atab-locks'].forEach(id => {
+                    ['atab-stats','atab-card-control','atab-profile','atab-staff','atab-locks'].forEach(id => {
                         const b = document.getElementById(id); if (b) b.style.display = 'none';
                     });
                 }
@@ -4326,8 +4159,8 @@ app.use(async (req, res) => {
                 if(currentRole === 'super_admin') {
                     document.getElementById('atab-settings').style.display = 'block';
                     document.getElementById('atab-bank-log').style.display = 'block';
-                    document.getElementById('atab-profiles').style.display = 'block';
                     document.getElementById('atab-card-control').style.display = 'block';
+                    document.getElementById('atab-profile').style.display = 'block';
                     document.getElementById('atab-military-salary').style.display = 'block';
                     document.getElementById('superadmin-only-locks').style.display = 'block';
                     document.getElementById('admin-panel-title').innerText = "لوحة كبار مسؤولي البنك 👑";
@@ -4335,8 +4168,6 @@ app.use(async (req, res) => {
             }
             await loadDashboard();
             loadNotifCount();
-            spBadges();
-            spDeepLink();
             startUserPolling();
             if (['staff','management','admin','super_admin'].includes(currentRole)) startAdminPolling();
         }
@@ -4525,7 +4356,7 @@ app.use(async (req, res) => {
         }
 
         function switchAdminTab(tab) {
-            ['stats','accounts','loans','cards','support','staff','locks','settings','card-control','bank-log','military-salary','profiles'].forEach(t => {
+            ['stats','accounts','loans','cards','support','tickets-log','staff','locks','settings','card-control','bank-log','military-salary'].forEach(t => {
                 const btn = document.getElementById(\`atab-\${t}\`);
                 const sec = document.getElementById(\`atab-\${t}-section\`);
                 if(btn) btn.classList.remove('active');
@@ -4541,7 +4372,6 @@ app.use(async (req, res) => {
             if(tab === 'loans') loadAdminLoans();
             if(tab === 'cards') loadAdminCards();
             if(tab === 'support') loadAdminSupport();
-            if(tab === 'profiles') loadProfilesPanel();
             if(tab === 'staff') loadStaff();
             if(tab === 'locks') loadLockSettingsPanel();
             if(tab === 'settings') { loadBankSettingsPanel(); loadFeesPanel(); }
@@ -4858,55 +4688,6 @@ app.use(async (req, res) => {
             uiToast(m, type, progress ? 2000 : 0);
         }
 
-        async function loadMyCards() {
-            loadMilitaryOptions();
-            const res = await fetch('/api/account/cards');
-            const cards = await res.json();
-            const container = document.getElementById('cards-list-container');
-            if (!cards.length) { container.innerHTML = '<div class="card" style="text-align:center; color:#64748b;">لا توجد بطاقات بعد.</div>'; return; }
-            const statusMap = { pending: '⏳ قيد المراجعة', approved: '✅ مفعّلة', rejected: '❌ مرفوضة', disabled: '🚫 معطّلة من الإدارة', expired: '⌛ منتهية الصلاحية' };
-            const colorMap = { pending: '#fde047', approved: '#4ade80', rejected: '#fca5a5', disabled: '#ef4444', expired: '#94a3b8' };
-            container.innerHTML = cards.map(c => {
-                const isExpired = c.cardExpiry && new Date(c.cardExpiry) < new Date() && c.status === 'approved';
-                const status = isExpired ? 'expired' : c.status;
-                const expiryStr = c.cardExpiry ? new Date(c.cardExpiry).toLocaleDateString('en-US', { month: '2-digit', year: '2-digit' }) : '--/--';
-                const colorThemes = {
-                    blue:   { bg: 'linear-gradient(135deg,#1a3a6b,#0f2044)', border: '#3b82f6', accent: '#60a5fa' },
-                    green:  { bg: 'linear-gradient(135deg,#14532d,#052e16)', border: '#22c55e', accent: '#4ade80' },
-                    red:    { bg: 'linear-gradient(135deg,#7f1d1d,#450a0a)', border: '#ef4444', accent: '#fca5a5' },
-                    gold:   { bg: 'linear-gradient(135deg,#78350f,#451a03)', border: '#eab308', accent: '#fde047' },
-                    purple: { bg: 'linear-gradient(135deg,#4c1d95,#2e1065)', border: '#a78bfa', accent: '#c4b5fd' },
-                    black:  { bg: 'linear-gradient(135deg,#1e293b,#000000)', border: '#475569', accent: '#94a3b8' }
-                };
-                const theme = colorThemes[c.cardColor] || colorThemes.blue;
-                const needsPin = c.status === 'approved' && c.cardNumber && !c.pinSet;
-                const realCard = (c.status === 'approved' && c.cardNumber && c.pinSet) ? bankCardHtml(c, { expired: isExpired, expiryStr: expiryStr }) + (isExpired ? '<p style="color:#fca5a5; font-size:0.78rem; margin-top:10px;">⌛ البطاقة منتهية — يمكنك طلب التجديد أدناه</p>' : '') + '<p style="color:#64748b; font-size:0.75rem; margin-top:8px;">🔒 الرقم السري ما يظهر لأحد، لازم تحفظه.</p>' : '';
-                const pinSetupCard = needsPin ? \`
-                    <div style="background:#0f1420; border:2px solid #ef4444; border-radius:16px; padding:20px 22px; margin-top:12px; position:relative; overflow:hidden; min-width:280px; max-width:380px; text-align:center;">
-                        <div style="font-size:3.5rem; color:#ef4444; line-height:1; margin-bottom:10px;">✕</div>
-                        <p style="color:#fca5a5; font-weight:bold; margin-bottom:6px;">🔐 عيّن رقمك السري لتفعيل البطاقة</p><p style="color:#94a3b8; font-size:0.78rem; margin-bottom:10px;">⚠️ احفظه في ذاكرتك: ما يظهر بعدها لأحد، ولا تقدر ترجع تشوفه.</p>
-                        <input id="pin-input-\${c._id}" type="text" autocomplete="off" readonly maxlength="4" inputmode="numeric" placeholder="ضع رقم سري مكون من 4 أرقام" style="text-align:center; letter-spacing:6px; font-size:1.1rem; margin-bottom:8px; cursor:pointer; -webkit-text-security:disc; text-security:disc;" onclick="openPinPad('\${c._id}')" />
-                        <button class="btn btn-red" style="width:100%;" onclick="openPinPad('\${c._id}')">✅ حفظ الرقم السري</button>
-                        <div id="pin-msg-\${c._id}" style="margin-top:8px;"></div>
-                    </div>
-                \` : '';
-                return \`
-                    <div class="card" style="margin-bottom:14px; border-color:\${colorMap[status] || '#3b82f6'};">
-                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-                            <div>
-                                <b style="color:\${colorMap[status]};">\${statusMap[status] || status}</b>
-                                <p style="color:#94a3b8; font-size:0.85rem; margin-top:4px;">\${c.militaryRank ? ('الرتبة: ' + c.militaryRank + ' | القطاع: ' + (c.militarySector || '—') + ' | اليونت: ' + (c.militaryUnit || '—')) : ('المسمى: ' + (c.jobTitle || '—') + ' | جهة العمل: ' + (c.employerName || '—'))}</p>
-                                \${c.adminNote ? \`<p style="color:#60a5fa; font-size:0.83rem; margin-top:4px;">ملاحظة الإدارة: \${c.adminNote}</p>\` : ''}
-                                \${c.cardExpiry && !isExpired && c.status === 'approved' ? \`<p style="color:#94a3b8; font-size:0.78rem; margin-top:3px;">⏳ تنتهي في: \${new Date(c.cardExpiry).toLocaleDateString('ar-SA')}</p>\` : ''}
-                            </div>
-                        </div>
-                        \${realCard}\${pinSetupCard}
-                        \${status === 'disabled' ? '<p style="color:#ef4444; font-size:0.82rem; margin-top:8px;">⚠️ تم تعطيل هذه البطاقة من الإدارة. تواصل مع خدمة العملاء.</p>' : ''}
-                        \${isExpired ? \`<button class="btn btn-yellow" style="margin-top:10px;" onclick="renewCard('\${c._id}')">🔄 تجديد البطاقة</button>\` : ''}
-                    </div>
-                \`;
-            }).join('');
-        }
 
         let pinPadValue = '';
         let pinPadCardId = null;
@@ -5391,31 +5172,6 @@ app.use(async (req, res) => {
             if(data.success) loadAdminCards();
         }
 
-        // ─── دوال خدمة العملاء (Support) ──────────────────────────────────────
-
-        let currentTicketId = null;
-        const botQuestions = [
-            { q: '❓ ما نوع مشكلتك؟', options: ['💳 مشكلة في البطاقة', '💸 مشكلة في التحويل', '📋 مشكلة في القرض', '⚙️ مشكلة أخرى'] },
-            { q: '⏰ متى بدأت المشكلة؟', options: ['اليوم', 'هذا الأسبوع', 'قبل أسبوع أو أكثر'] },
-            { q: '📊 مستوى أهمية المشكلة؟', options: ['🔴 عاجل جداً', '🟡 متوسط', '🟢 غير مستعجل'] }
-        ];
-        let botAnswers = [];
-        let currentBotQ = 0;
-
-
-
-
-
-
-
-
-
-        // ─── أدمن: دوال الدعم ──────────────────────────────────────────────────
-
-
-
-
-        // ─── دوال قائمة الموبايل ──────────────────────────────────────────────
         function toggleMobileMenu() {
             const m = document.getElementById('mobile-menu');
             if(!m) return;
@@ -5453,34 +5209,6 @@ app.use(async (req, res) => {
             }
         });
 
-        async function loadCardControlPanel() {
-            const res = await fetch('/api/superadmin/cards/control');
-            const cards = await res.json();
-            const container = document.getElementById('card-control-container');
-            if (!cards.length) { container.innerHTML = '<p style="color:#64748b; text-align:center; padding:20px;">لا توجد بطاقات مفعّلة حالياً.</p>'; return; }
-            const colorNames = { blue:'أزرق', green:'أخضر', red:'أحمر', gold:'ذهبي', purple:'بنفسجي', black:'أسود' };
-            container.innerHTML = cards.map(c => \`
-                <div class="card" style="margin-bottom:10px; \${c.cardFrozen ? 'border-color:#475569; opacity:0.85;' : 'border-color:#3b82f6;'}">
-                    <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:8px;">
-                        <div>
-                            <b>\${c.discordTag}</b> <span style="color:#64748b; font-size:0.8rem;">\${c.discord}</span>
-                            <p style="margin-top:5px; color:#94a3b8; font-size:0.85rem;">رقم البطاقة: \${c.cardNumber || '---'}</p>
-                            <p style="color:#94a3b8; font-size:0.85rem;">اللون: \${colorNames[c.cardColor] || c.cardColor}</p>
-                            <p style="color:#94a3b8; font-size:0.85rem;">الرقم السري: \${c.pinSet ? '<span style="color:#fde047;">🔒 معيّن — مخفي (ما أحد يعرفه)</span>' : '<span style="color:#64748b;">لم يُعيَّن بعد</span>'}</p>
-                            \${c.cardFrozen ? '<p style="color:#fca5a5; font-size:0.82rem;">🔒 البطاقة مجمّدة حالياً</p>' : ''}
-                        </div>
-                        <div style="display:flex; gap:6px; flex-direction:column; min-width:220px;">
-                            <button class="btn btn-yellow" style="padding:5px 10px;" onclick="ccResetPin('\${c._id}')">🔄 إعادة تعيين الرقم السري</button>
-                            <div style="display:flex; gap:6px;">
-                                <button class="btn \${c.cardFrozen ? 'btn-green' : 'btn-yellow'}" style="padding:5px 10px; flex:1;" onclick="ccToggleFreeze('\${c._id}')">\${c.cardFrozen ? '🔓 فك التجميد' : '🔒 تجميد'}</button>
-                                <button class="btn btn-red" style="padding:5px 10px;" onclick="ccDeleteCard('\${c._id}')">🗑️ حذف</button>
-                            </div>
-                            <div id="cc-msg-\${c._id}"></div>
-                        </div>
-                    </div>
-                </div>
-            \`).join('');
-        }
 
 
         async function ccToggleFreeze(id) {
@@ -5512,1390 +5240,9 @@ app.use(async (req, res) => {
         // كل عملية (تحويل، إيداع، قرض، بطاقة، تذكرة...) تبعث "إشارة نشاط" من
         // السيرفر، وكل طرف مفتوح على الموقع (الشخص، الطرف الثاني، الأدمن)
         // يلتقطها بأقرب دورة بولنق (كل ثانيتين) ويحدّث شاشته تلقائياً.
-        let pollInterval = null;
-        let adminPollInterval = null;
-        let lastUnreadCount = 0;
-        let lastSeenActivity = 0;      // آخر إشارة نشاط عامة شافها المستخدم
-        let lastSeenTicketActivity = 0; // آخر إشارة نشاط خاصة بالتذاكر
-        let lastSeenAdminActivity = 0;
-        let lastSeenAdminTicketActivity = 0;
-        let activePollingTicketId = null; // ID التذكرة المفتوحة حالياً للمستخدم
-        let adminActivePollingTicketId = null; // للأدمن
 
 
         let pendingSilentRefresh = false;
-        document.addEventListener('visibilitychange', function() { if (!document.hidden && pendingSilentRefresh) silentRefreshCurrentPage(); });
-
-
-        // تغليف openTicketChat لتفعيل polling
-
-
-
-
-        // ═══════════ خدمة العملاء (منقولة من فلاش) — طبقة التوافق مع واجهة البنك ═══════════
-        var ME = null;
-        var currentRealOwner = false;
-        function toast(m) { uiToast(m, 'info'); }
-        function confirmModal(msg) { return uiConfirm(msg, { okText: 'متأكد' }); }
-        function promptModal(msg, def) {
-            return uiForm({ title: msg, fields: [{ name: 'v', label: 'اكتب هنا', type: 'text', value: def || '' }], okText: 'تأكيد' }).then(function (r) { return r ? r.v : null; });
-        }
-        function _fmOpen(msg, o) { return (o && o.isPrompt) ? promptModal(msg) : confirmModal(msg); }
-        function csHtml(id, options, current, opts) {
-            opts = opts || {};
-            var h = '<select id="' + id + '"' + (opts.onpick ? ' onchange="var value=this.value;' + opts.onpick + '"' : '') + '>';
-            options.forEach(function (o) { h += '<option value="' + spEsc(o[0]) + '"' + (o[0] === current ? ' selected' : '') + '>' + spEsc(o[1]) + '</option>'; });
-            return h + '</select>';
-        }
-        function exFull(t) {
-            if (!t) return '—';
-            try {
-                var d = new Date(t);
-                var a = d.toLocaleDateString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
-                var b = d.toLocaleTimeString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', hour: 'numeric', minute: '2-digit', second: '2-digit' });
-                return 'يوم ' + a + ' الساعة ' + b;
-            } catch (e) { return '—'; }
-        }
-        function closeWarnForm() {
-            document.getElementById('wf-overlay').classList.remove('open');
-            document.getElementById('wf-box').innerHTML = '';
-        }
-        async function spNotifyUser() {
-            var c = SP.cur; if (!c) return;
-            try { await spApi('/api/support/admin/tickets/' + c.id + '/notify', { method: 'POST', body: '{}' }); toast('🔔 انرسل إشعار للعضو'); }
-            catch (e) { toast(e.message); }
-        }
-        // نفس نوافذ فلاش لكن تشتغل على نوافذ البنك
-        function openSupportModal() { spOpen(); }
-        function closeSupportModal() { spClose(); }
-        function loadAdminSupport() {
-            var box = document.getElementById('admin-support-container'); if (!box) return;
-            SP.cur = null; SP.img = null;
-            box.innerHTML = '<div class="sp-tabs" id="spa-tabs"></div><div id="spa-body" style="display:flex;flex-direction:column;min-height:420px;"></div>';
-            spaShowList();
-        }
-        // التحديث اللحظي (بولنق): المحادثة المفتوحة كل ثانيتين ونص، والقوائم والعدادات كل ٦ ثواني
-        setInterval(function () { if (ME && SP.cur) spLoadNew(); }, 2500);
-        setInterval(function () {
-            if (!ME) return;
-            spBadges();
-            if (!SP.cur) {
-                if (document.getElementById('sp-list')) spLoadList();
-                if (document.getElementById('spa-list')) spaLoadList();
-            }
-        }, 6000);
-        // الذكاء الآلي يكتب: نعرضها فور ما يرد السيرفر بحالة الكتابة
-        function spPendingTicket() {
-            var id = null;
-            try {
-                id = new URLSearchParams(location.search).get('ticket');
-                if (id && /^[a-f0-9]{24}$/.test(id)) { sessionStorage.setItem('sp_pending_ticket', id); history.replaceState(null, '', location.pathname); }
-                else id = null;
-            } catch (e) { id = null; }
-            if (id) return id;
-            try { var v = sessionStorage.getItem('sp_pending_ticket'); return v && /^[a-f0-9]{24}$/.test(v) ? v : null; } catch (e) { return null; }
-        }
-        function spDeepLink() {
-            try {
-                var id = spPendingTicket();
-                if (!id || !ME) return;
-                try { sessionStorage.removeItem('sp_pending_ticket'); } catch (e) {}
-                if (ME.isAdmin) { openAdminPanel(); switchAdminTab('support'); setTimeout(function () { spOpenTicket(id, 'admin', 'spa-body'); }, 300); }
-                else spOpen(id);
-            } catch (e) {}
-        }
-        // ── فحص العضو: أقسام البنك ──
-        var SP_INS_CATS = [['account', '🏦 معلومات الحساب'], ['card', '💳 معلومات البطاقة'], ['transfers', '💸 الحوالات'], ['loans', '📋 القروض'], ['flash', '⚡ معلومات فلاش'], ['log', '📜 آخر حركات الحساب']];
-        function spCatOf(k) {
-            return k.indexOf('account.') === 0 ? 'account' : k.indexOf('card.') === 0 ? 'card' : k.indexOf('tx.') === 0 ? 'transfers' : k.indexOf('loan.') === 0 ? 'loans' : k.indexOf('flash.') === 0 ? 'flash' : 'log';
-        }
-        async function spEditPerson() {
-            var c = SP.cur; if (!c) return;
-            var d;
-            try { d = await spApi('/api/support/admin/tickets/' + c.id + '/person'); }
-            catch (e) { toast(e.message); return; }
-            var box = document.getElementById('wf-box');
-            box.innerHTML =
-                '<h3>✏️ تعديل الحساب البنكي</h3>' +
-                '<p style="font-size:12px;color:var(--muted);margin:0 0 8px;">رقم الحساب: ' + spEsc(d.accountNumber) + '</p>' +
-                '<label style="font-size:13px;color:var(--muted);">الاسم</label>' +
-                '<input id="ep-name" value="' + spEsc(d.name) + '">' +
-                '<label style="font-size:13px;color:var(--muted);">حد البطاقات (-1 = حسب الإعداد العام)</label>' +
-                '<input id="ep-limit" type="number" value="' + spEsc(d.cardLimit) + '">' +
-                '<label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:14px;"><input type="checkbox" id="ep-frozen" style="width:auto;margin:0;"' + (d.frozen ? ' checked' : '') + '> الحساب مجمّد</label>' +
-                '<div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button><button class="btn sm" onclick="spSavePerson()">حفظ</button></div>';
-            document.getElementById('wf-overlay').classList.add('open');
-        }
-        async function spSavePerson() {
-            var c = SP.cur; if (!c) return;
-            var body = { name: document.getElementById('ep-name').value, cardLimit: document.getElementById('ep-limit').value, frozen: document.getElementById('ep-frozen').checked };
-            try {
-                var r = await spApi('/api/support/admin/tickets/' + c.id + '/person', { method: 'POST', body: JSON.stringify(body) });
-                toast('✅ تم التعديل — ' + r.name + (r.frozen ? ' (مجمّد)' : ''));
-                closeWarnForm();
-                await spLoadNew();
-            } catch (e) { toast(e.message); }
-        }
-
-        // ───── كود التكتات المنقول من فلاش ─────
-        var SP = { cur: null, es: null, esOk: false, img: null, lastLive: 0, liveT: null, badgeT: null, loading: false, again: false, atab: 'waiting' };
-        var SP_CATS = ['مشكلة في الحساب البنكي', 'تحويل / رصيد', 'قرض', 'البطاقة البنكية', 'رواتب العساكر', 'اقتراح', 'أخرى'];
-        var SP_PLACE_MAP = {
-            'مشكلة في الحساب البنكي': ['الدخول للبنك', 'الرئيسية', 'كشف الحساب', 'الإشعارات', 'تجميد الحساب', 'أخرى'],
-            'تحويل / رصيد': ['تحويل ما وصل', 'خصم ما أعرفه', 'رسوم التحويل', 'رصيد ناقص', 'التوفير', 'أخرى'],
-            'قرض': ['طلب قرض جديد', 'سداد القرض', 'حالة الطلب', 'انتهاء القرض', 'أخرى'],
-            'البطاقة البنكية': ['طلب بطاقة', 'الرقم السري', 'تجديد البطاقة', 'سداد المخالفات بالبطاقة', 'تجميد البطاقة', 'أخرى'],
-            'رواتب العساكر': ['الراتب ما نزل', 'مبلغ الراتب غلط', 'الرتبة', 'أخرى'],
-            'اقتراح': ['الرئيسية', 'التحويل', 'القروض', 'البطاقات', 'لوحة الإدارة', 'أخرى']
-        };
-        var SP_PLACE_Q = {
-            'مشكلة في الحساب البنكي': 'وين المشكلة في حسابك البنكي؟',
-            'تحويل / رصيد': 'وش نوع مشكلة التحويل أو الرصيد؟',
-            'قرض': 'وين المشكلة في القرض؟',
-            'البطاقة البنكية': 'وين المشكلة في البطاقة؟',
-            'رواتب العساكر': 'وش مشكلة الراتب؟',
-            'اقتراح': 'لأي قسم الاقتراح؟'
-        };
-        function spCatChanged(cat) {
-            var wrap = document.getElementById('spn-place-wrap'); if (!wrap) return;
-            var list = SP_PLACE_MAP[cat];
-            if (!list) { wrap.style.display = 'none'; document.getElementById('spn-place-box').innerHTML = ''; return; }
-            wrap.style.display = '';
-            document.getElementById('spn-place-q').textContent = SP_PLACE_Q[cat] || 'وين المشكلة؟';
-            document.getElementById('spn-place-box').innerHTML = csHtml('spn-place', list.map(function (x) { return [x, x]; }), list[0]);
-            try { csEnhanceAll(); } catch (e) {}
-        }
-        var SP_ST = { ai: '🤖 مساعد ذكي', waiting: '⏳ بانتظار إداري', active: '✅ مع إداري', closed: '🔒 مغلق' };
-        function spEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
-        function spTime(d) { try { return new Date(d).toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } }
-        function spGuestToken() {
-            var t = null;
-            try { t = localStorage.getItem('moi_guest_token'); } catch (e) {}
-            if (!t || t.length !== 32) {
-                var a = new Uint8Array(16); crypto.getRandomValues(a);
-                t = Array.prototype.map.call(a, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
-                try { localStorage.setItem('moi_guest_token', t); } catch (e) {}
-            }
-            return t;
-        }
-        async function spApi(url, opts) {
-            var o = Object.assign({ headers: { 'Content-Type': 'application/json', 'x-guest-token': spGuestToken() } }, opts || {});
-            var r = await fetch(url, o);
-            var d = await r.json().catch(function () { return {}; });
-            if (!r.ok) throw new Error(d.error || 'خطأ');
-            return d;
-        }
-
-        function spBadges() {
-            if (SP.badgeT) return;
-            SP.badgeT = setTimeout(async function () {
-                SP.badgeT = null;
-                try {
-                    var b = await spApi('/api/support/badges');
-                    var u = b.user || 0;
-                    var a = b.admin ? (b.admin.waiting + b.admin.unread) : 0;
-                    SP.nu = u; SP.na = a;
-                    spPaintBadges();
-                } catch (e) {}
-            }, 250);
-        }
-        function spPaintBadges() {
-            var fb = document.getElementById('sp-fab-badge');
-            var total = (SP.nu || 0) + (SP.na || 0);
-            if (fb) { fb.style.display = total ? 'inline-flex' : 'none'; fb.textContent = total; }
-            document.querySelectorAll('.sp-nav-user').forEach(function (el) { el.querySelectorAll('.sp-badge').forEach(function (x) { x.remove(); }); if (SP.nu) el.insertAdjacentHTML('beforeend', '<span class="sp-badge">' + SP.nu + '</span>'); });
-            document.querySelectorAll('.sp-nav-admin').forEach(function (el) { el.querySelectorAll('.sp-badge').forEach(function (x) { x.remove(); }); if (SP.na) el.insertAdjacentHTML('beforeend', '<span class="sp-badge">' + SP.na + '</span>'); });
-        }
-
-        function spFitViewport() {
-            var m = document.getElementById('sp-modal');
-            if (!m || !m.classList.contains('open')) return;
-            var vv = window.visualViewport;
-            if (!vv) return;
-            var wasKb = m.classList.contains('kb');
-            var kb = vv.height < window.innerHeight - 120;
-            m.style.top = vv.offsetTop + 'px';
-            m.style.height = vv.height + 'px';
-            m.classList.toggle('kb', kb);
-            if (kb !== wasKb) { var mb = document.getElementById('sp-msgs'); if (mb) mb.scrollTop = mb.scrollHeight; }
-        }
-        if (window.visualViewport) {
-            window.visualViewport.addEventListener('resize', spFitViewport);
-            window.visualViewport.addEventListener('scroll', spFitViewport);
-        }
-        function spOpen(tid) {
-            var m = document.getElementById('sp-modal');
-            if (!m.classList.contains('open')) SP.scrollY = window.pageYOffset || 0;
-            m.classList.add('open');
-            document.documentElement.classList.add('sp-lock');
-            if (!SP.focusBound) {
-                SP.focusBound = true;
-                m.addEventListener('focusout', function () {
-                    setTimeout(function () { window.scrollTo(0, SP.scrollY || 0); spFitViewport(); }, 120);
-                });
-            }
-            spFitViewport();
-            if (tid) spOpenTicket(tid, 'user', 'sp-body'); else spShowList();
-        }
-        function spClose() {
-            var m = document.getElementById('sp-modal');
-            try { if (document.activeElement && m.contains(document.activeElement)) document.activeElement.blur(); } catch (e) {}
-            m.classList.remove('open', 'kb');
-            m.style.top = ''; m.style.height = '';
-            document.documentElement.classList.remove('sp-lock');
-            window.scrollTo(0, SP.scrollY || 0);
-            if (SP.cur && SP.cur.box === 'sp-body') SP.cur = null;
-            SP.img = null;
-            spBadges();
-        }
-        function spShowList() {
-            SP.cur = null; SP.img = null;
-            document.getElementById('sp-body').innerHTML =
-                '<button class="sp-btn" id="sp-newbtn" onclick="spShowNew()" style="margin-bottom:12px;">+ تكت جديد</button>' +
-                '<div id="sp-list"><div style="color:var(--muted);text-align:center;padding:20px;">جارِ التحميل...</div></div>';
-            spLoadList();
-        }
-        async function spLoadList() {
-            var box = document.getElementById('sp-list'); if (!box) return;
-            try {
-                var d = await spApi('/api/support/tickets');
-                var unrated = d.tickets.filter(function (t) { return t.needRate; })[0];
-                if (unrated && !d.banned) { spOpenTicket(unrated.id, 'user', 'sp-body'); return; }
-                var hasOpen = d.tickets.some(function (t) { return t.status !== 'closed'; });
-                var nb = document.getElementById('sp-newbtn');
-                if (nb) {
-                    nb.disabled = hasOpen || !!d.banned; nb.style.opacity = (hasOpen || d.banned) ? '0.55' : '';
-                    nb.textContent = d.banned ? '🚫 تم حظرك من خدمة الدعم الفني' : hasOpen ? '🔒 عندك تكت مفتوح، لين تقفله الإدارة ما تقدر تفتح جديد' : '+ تكت جديد';
-                }
-                if (!d.tickets.length) { box.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px;">ما عندك تكتات، افتح تكت جديد وبنساعدك 👌</div>'; return; }
-                box.innerHTML = d.tickets.map(function (t) {
-                    return '<div class="sp-row" onclick="spOpenTicket(&quot;' + t.id + '&quot;,&quot;user&quot;,&quot;sp-body&quot;)">' +
-                        '<div class="t1"><span>#' + t.no + ' — ' + spEsc(t.category) + (t.unread ? '<span class="sp-badge">' + t.unread + '</span>' : '') + '</span><span class="sp-chip ' + t.status + '">' + SP_ST[t.status] + '</span></div>' +
-                        '<div class="t2">' + spEsc(t.last || '') + '</div></div>';
-                }).join('');
-            } catch (e) { box.innerHTML = '<div style="color:#fca5a5;">' + spEsc(e.message) + '</div>'; }
-        }
-        function spShowNew() {
-            SP.cur = null; SP.img = null;
-            var guest = !ME;
-            document.getElementById('sp-body').innerHTML =
-                '<button class="sp-link" onclick="spShowList()" style="align-self:flex-start;margin-bottom:8px;">‹ رجوع</button>' +
-                (guest ? '<label class="sp-lbl">اسمك</label><input id="spn-name" class="sp-field" maxlength="40" placeholder="اكتب اسمك">' : '') +
-                '<label class="sp-lbl">نوع المشكلة</label>' + csHtml('spn-cat', SP_CATS.map(function (c) { return [c, c]; }), SP_CATS[0], { onpick: 'spCatChanged(value)' }) +
-                '<div id="spn-place-wrap"><label class="sp-lbl" id="spn-place-q"></label><div id="spn-place-box"></div></div>' +
-                '<label class="sp-lbl">اشرح المشكلة</label><textarea id="spn-text" class="sp-field" rows="4" maxlength="1500" placeholder="وش اللي صار؟ وش الزر اللي ضغطته؟ وش الخطأ اللي ظهر؟"></textarea>' +
-                '<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;"><label class="sp-attach">📎<input type="file" accept="image/*" style="display:none" onchange="spPick(this)"></label><div id="spn-prev" class="sp-prev" style="margin:0;"></div></div>' +
-                '<button class="sp-btn" id="spn-go" onclick="spCreate()">فتح التكت</button>';
-            spCatChanged(SP_CATS[0]);
-            try { csEnhanceAll(); } catch (e) {}
-        }
-        async function spCreate() {
-            var b = document.getElementById('spn-go');
-            var text = document.getElementById('spn-text').value.trim();
-            var nm = document.getElementById('spn-name');
-            if (nm && nm.value.trim().length < 2) return toast('اكتب اسمك');
-            if (!text && !SP.img) return toast('اشرح المشكلة أو أرفق صورة');
-            b.disabled = true;
-            try {
-                var d = await spApi('/api/support/tickets', { method: 'POST', body: JSON.stringify({
-                    name: nm ? nm.value.trim() : undefined,
-                    category: document.getElementById('spn-cat').value,
-                    place: (document.getElementById('spn-place-wrap').style.display !== 'none' && document.getElementById('spn-place')) ? document.getElementById('spn-place').value : '',
-                    text: text, image: SP.img
-                }) });
-                SP.img = null;
-                spOpenTicket(d.id, 'user', 'sp-body');
-            } catch (e) { toast(e.message); b.disabled = false; }
-        }
-
-        function spPick(inp) {
-            var f = inp.files && inp.files[0]; inp.value = '';
-            if (!f) return;
-            if (f.type.indexOf('image/') !== 0) return toast('اختر صورة فقط');
-            var fr = new FileReader();
-            fr.onload = function () {
-                var im = new Image();
-                im.onload = function () {
-                    var max = 1280, w = im.width, h = im.height;
-                    if (w > max || h > max) { var k = Math.min(max / w, max / h); w = Math.round(w * k); h = Math.round(h * k); }
-                    var cv = document.createElement('canvas'); cv.width = w; cv.height = h;
-                    cv.getContext('2d').drawImage(im, 0, 0, w, h);
-                    var q = 0.8, out = cv.toDataURL('image/jpeg', q);
-                    while (out.length > 1500000 && q > 0.35) { q -= 0.15; out = cv.toDataURL('image/jpeg', q); }
-                    SP.img = out;
-                    spPaintPrev();
-                };
-                im.onerror = function () { toast('تعذر قراءة الصورة'); };
-                im.src = fr.result;
-            };
-            fr.readAsDataURL(f);
-        }
-        function spPaintPrev() {
-            var p = document.getElementById('sp-prev') || document.getElementById('spn-prev');
-            if (!p) return;
-            p.innerHTML = SP.img ? '<img src="' + SP.img + '"><button class="sp-link" onclick="SP.img=null;spPaintPrev()">✕ إزالة</button>' : '';
-        }
-        function spViewImg(src) {
-            document.getElementById('sp-lightbox-img').src = src;
-            document.getElementById('sp-lightbox').style.display = 'flex';
-        }
-
-        async function spOpenTicket(id, mode, box) {
-            spVoiceReset(); spVmStopAll(); SP.noteMode = false;
-            SP.cur = { id: id, mode: mode, box: box, n: 0, t: null, role: null, typing: false };
-            SP.img = null; SP.edit = null; SP.reply = null; spMmClose();
-            var el = document.getElementById(box);
-            el.innerHTML =
-                '<div class="sp-chat">' +
-                '<div class="sp-bar"><button class="sp-link" onclick="spBack()">‹ رجوع</button><div class="sp-title" id="sp-title">...</div><button class="sp-link" id="sp-edit" onclick="spEditPerson()" style="color:#fbbf24;display:none;">✏️ تعديل</button><button class="sp-link" id="sp-inspect" onclick="spInspect()" style="color:#86efac;display:none;">🔍 فحص</button><button class="sp-link" id="sp-notify" onclick="spNotifyUser()" style="color:#93c5fd;display:none;">🔔 إشعار</button><button class="sp-link" id="sp-close" onclick="spCloseTicket()" style="color:#fca5a5;">إغلاق</button><button class="sp-link" id="sp-del" onclick="spDeleteTicket()" style="color:#fca5a5;display:none;">🗑️ حذف</button><button class="sp-link" id="sp-ban" onclick="spBanUser()" style="color:#fca5a5;display:none;">🚫 حظر</button></div>' +
-                '<div class="sp-state" id="sp-state"></div>' +
-                '<div class="sp-info" id="sp-info" style="display:none;"></div>' +
-                '<div class="sp-msgs" id="sp-msgs"></div>' +
-                '<div id="sp-rate" class="sp-rate" style="display:none;"></div>' +
-                '<div id="sp-prev" class="sp-prev"></div>' +
-                '<div id="sp-ctxbar" class="sp-ctxbar" style="display:none;"></div>' +
-                '<div class="sp-compose" id="sp-compose">' +
-                    '<div class="sp-cin" id="sp-cin">' +
-                        '<label class="sp-attach">📎<input type="file" accept="image/*" style="display:none" onchange="spPick(this)"></label>' +
-                        '<button class="sp-mic" id="sp-mic" title="رسالة صوتية" onclick="spVoiceStart()">🎙️</button>' +
-                        (mode === 'admin' ? '<button class="sp-mic" id="sp-note-btn" title="ملاحظة داخلية (للإدارة فقط)" onclick="spNoteToggle()">📝</button><button class="sp-mic" title="ردود جاهزة" onclick="spCannedOpen()">⚡</button>' : '') +
-                        '<textarea id="sp-in" class="sp-field" rows="1" placeholder="اكتب رسالتك..."></textarea>' +
-                        '<button class="sp-btn" id="sp-send" onclick="spSend()">➤</button>' +
-                    '</div>' +
-                    '<div class="sp-vbar" id="sp-vbar"></div>' +
-                '</div></div>';
-            var ta = document.getElementById('sp-in');
-            ta.onkeydown = function (e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); spSend(); } };
-            ta.oninput = function () { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 110) + 'px'; spTypingPing(); };
-            spWireMsgs();
-            await spLoadNew(true);
-        }
-        function spBack() {
-            spVoiceReset(); spVmStopAll(); SP.noteMode = false;
-            SP.cur = null; SP.img = null; SP.edit = null; SP.reply = null; spMmClose();
-            if (document.getElementById('spa-body')) spaShowList(); else spShowList();
-        }
-        async function spLoadNew(first) {
-            var c = SP.cur; if (!c) return;
-            if (SP.loading) { SP.again = true; return; }
-            SP.loading = true;
-            try {
-                var d = await spApi('/api/support/tickets/' + c.id + '?after=' + c.n);
-                if (SP.cur !== c) return;
-                c.t = d.ticket; c.role = d.role; c.canInspect = !!d.canInspect;
-                if (d.typing) c.typing = true;
-                (d.peers || []).forEach(function (p) { spPeerTyping({ id: c.id, name: p.name, tag: p.tag, kind: p.kind }); });
-                var skNew = (d.shared || []).join(','), skChanged = (c.sharedKey !== skNew);
-                c.sharedKey = skNew; c.shared = d.shared || [];
-                var box = document.getElementById('sp-msgs');
-                if (!box) return;
-                if (c.mver === undefined) c.mver = d.mver;
-                else if (d.mver !== undefined && d.mver !== c.mver) {
-                    // انعدلت أو انحذفت رسالة قديمة: نعيد رسم الرسايل كلها من الأول
-                    c.mver = d.mver; c.n = 0; c.mm = {}; c.keepScroll = box.scrollTop; box.innerHTML = '';
-                    SP.again = true;
-                    return;
-                }
-                var near = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
-                var tp = document.getElementById('sp-typing'); if (tp) tp.remove();
-                var pp = document.getElementById('sp-peers'); if (pp) pp.remove();
-                d.msgs.forEach(function (m) {
-                    if (c.peers) Object.keys(c.peers).forEach(function (k) { var q = c.peers[k]; if ((m.sender === 'user' && q.kind === 'owner') || (m.sender === 'admin' && q.kind !== 'owner' && q.name === m.name)) delete c.peers[k]; });
-                    box.insertAdjacentHTML('beforeend', spMsgHtml(m));
-                    if (m.sender === 'ai') { c.typing = false; c.suggest = !!m.suggest; }
-                    if (m.sender === 'user') c.suggest = false;
-                });
-                c.n = d.n;
-                spShowTyping();
-                spShowPeers();
-                spPaintState();
-                if (skChanged) spLoadInfo();
-                if (first || near || d.msgs.some(function (m) { return m.sender === (c.mode === 'admin' ? 'admin' : 'user'); })) box.scrollTop = box.scrollHeight;
-                if (c.keepScroll != null) { box.scrollTop = c.keepScroll; c.keepScroll = null; }
-                if (d.msgs.length) spBadges();
-            } catch (e) {
-                if (first) { var el = document.getElementById(c.box); if (el) el.innerHTML = '<div style="color:#fca5a5;padding:14px;">' + spEsc(e.message) + '</div>'; }
-                else if (SP.cur === c && /غير موجود/.test(e.message)) { toast('هذا التكت انحذف'); spBack(); }
-            } finally {
-                SP.loading = false;
-                if (SP.again) { SP.again = false; spLoadNew(); }
-            }
-        }
-        function spMsgHtml(m) {
-            if (m.hid) return '';
-            var c = SP.cur;
-            if (c) { if (!c.mm) c.mm = {}; c.mm[m.i] = m; }
-            if (m.sender === 'note') {
-                var rt = m.role === 'senior' ? '<span class="sp-role senior">كبار المسؤولين</span>' : '<span class="sp-role admin">إداري</span>';
-                return '<div class="sp-msg note" data-i="' + m.i + '"><div class="sp-who">📝 ملاحظة داخلية (ما تظهر للعضو) — ' + spEsc(m.name || '') + rt + '</div><div class="sp-b">' + spEsc(m.text || '') + '</div><div class="sp-time">' + spTime(m.at) + '</div></div>';
-            }
-            var mine = c.mode === 'admin' ? m.sender === 'admin' : m.sender === 'user';
-            var cls = m.sender === 'system' ? 'sys' : (mine ? 'me' : 'other') + (m.sender === 'ai' ? ' ai' : '') + (m.sender === 'admin' && !mine ? ' admin' : '') + (m.del ? ' del' : '');
-            var gt = spGuestToken();
-            var roleTag = m.sender === 'admin' ? (m.role === 'senior' ? '<span class="sp-role senior">كبار المسؤولين</span>' : '<span class="sp-role admin">إداري</span>') : '';
-            var who = m.sender === 'system' ? '' : '<div class="sp-who">' + (m.sender === 'ai' ? '🤖 ' : m.sender === 'admin' ? '🛡️ ' : '') + spEsc(m.name || '') + roleTag + '</div>';
-            var img = m.img ? '<img class="sp-img" loading="lazy" src="/api/support/tickets/' + c.id + '/img/' + m.i + '?gt=' + gt + '" onclick="spViewImg(this.src)">' : '';
-            var body = (m.text ? spEsc(m.text) : '');
-            if (m.aud) body += spVoiceHtml(m, c);
-            var quote = m.rp != null ? '<div class="sp-quote" onclick="spJumpTo(' + m.rp + ')"><b>' + spEsc(m.rpn || '') + '</b>' + spEsc(m.rpt || '') + '</div>' : '';
-            var delTag = m.del ? '<div class="sp-del-tag">🗑️ ' + (c.mode === 'admin' ? 'محذوفة — حذفها ' + spEsc(m.delBy || '') + (m.rev ? ' • معروضة للعضو' : ' • مخفية عن العضو') : 'رسالة محذوفة (عرضتها لك الإدارة)') + '</div>' : '';
-            var data = m.sender === 'system' ? '' : ' data-i="' + m.i + '"';
-            return '<div class="sp-msg ' + cls + '"' + data + '>' + who + '<div class="sp-b">' + delTag + quote + body + img + '</div>' + (m.sender === 'system' ? '' : '<div class="sp-time">' + spTime(m.at) + (m.ed ? '<span class="sp-ed">• معدّلة</span>' : '') + '</div>') + '</div>';
-        }
-        // ===== قائمة خيارات الرسالة (تطلع من تحت بعرض الشاشة) =====
-        function spIsSenior() { return !!(ME && ME.isSeniorAdmin && SP.cur && SP.cur.mode === 'admin'); }
-        function spMmClose() { var e = document.getElementById('sp-mm-ov'); if (e) e.remove(); }
-        function spMsgMenuOpen(i) {
-            var c = SP.cur; if (!c || !c.mm || !c.mm[i]) return;
-            var m = c.mm[i], t = c.t || {}, closed = t.status === 'closed', senior = spIsSenior();
-            var isMsg = m.sender !== 'note' && m.sender !== 'system';
-            var items = [];
-            if (m.text) items.push(['copy', '📋', 'نسخ الرسالة']);
-            if (isMsg && !m.del && !closed) items.push(['reply', '↩️', 'رد على الرسالة']);
-            if (isMsg && m.own && !m.del && !closed && !m.aud) items.push(['edit', '✏️', 'تعديل الرسالة']);
-            if (isMsg && !m.del && (m.own || senior) && (!closed || senior)) items.push(['del', '🗑️', 'حذف الرسالة', 'danger']);
-            if (senior && m.del) items.push(['reveal', m.rev ? '🙈' : '👁️', m.rev ? 'إخفاء الرسالة عن العضو' : 'عرض الرسالة للعضو']);
-            if (senior && isMsg) items.push(['info', 'ℹ️', 'تفاصيل الرسالة']);
-            if (!items.length) return;
-            spMmRender(m, items);
-        }
-        function spMmRender(m, items) {
-            spMmClose();
-            var ov = document.createElement('div');
-            ov.id = 'sp-mm-ov';
-            ov.onclick = function (e) { if (e.target === ov) spMmClose(); };
-            var prev = (m.text || (m.aud ? '🎙️ رسالة صوتية' : (m.img ? '📷 صورة' : ''))).slice(0, 90);
-            var h = '<div id="sp-mm-sheet"><div class="sp-mm-grip"></div><div class="sp-mm-prev">' + spEsc(prev) + '</div>';
-            items.forEach(function (it) { h += '<button class="sp-mm-it ' + (it[3] || '') + '" data-a="' + it[0] + '"><span>' + it[1] + '</span>' + it[2] + '</button>'; });
-            h += '<button class="sp-mm-it cancel" data-a="x">إغلاق</button></div>';
-            ov.innerHTML = h;
-            ov.addEventListener('click', function (e) { var b = e.target.closest ? e.target.closest('.sp-mm-it') : null; if (b) spMsgAct(b.getAttribute('data-a'), m.i); });
-            document.body.appendChild(ov);
-        }
-        function spMmInfo(m) {
-            var sh = document.getElementById('sp-mm-sheet'); if (!sh) return;
-            var h = '<div class="sp-mm-grip"></div><div class="sp-mm-info">';
-            h += '<div>👤 المرسل: <b>' + spEsc(m.name || '-') + '</b>' + (m.sender === 'admin' ? (m.role === 'senior' ? ' (كبار المسؤولين)' : ' (إداري)') : m.sender === 'ai' ? ' (المساعد الآلي)' : m.sender === 'user' ? ' (العضو)' : '') + '</div>';
-            h += '<div>🕒 أُرسلت: <b>' + exFull(m.at) + '</b></div>';
-            if (m.ed) { h += '<div>✏️ آخر تعديل: <b>' + exFull(m.edAt) + '</b></div>'; (m.edits || []).forEach(function (e, k) { h += '<div class="ed">النسخة ' + (k + 1) + ' (قبل التعديل — ' + spTime(e.at) + '): ' + spEsc(e.text || '') + '</div>'; }); }
-            if (m.del) { h += '<div style="color:#fca5a5;">🗑️ حذفها: <b>' + spEsc(m.delBy || '-') + '</b> — ' + exFull(m.delAt) + '</div><div>👁️ معروضة للعضو: <b>' + (m.rev ? 'نعم' : 'لا') + '</b></div>'; }
-            h += '</div><button class="sp-mm-it cancel" data-a="x">إغلاق</button>';
-            sh.innerHTML = h;
-        }
-        async function spMsgAct(a, i) {
-            var c = SP.cur;
-            if (a === 'x' || !c || !c.mm || !c.mm[i]) return spMmClose();
-            var m = c.mm[i];
-            if (a === 'info') return spMmInfo(m);
-            spMmClose();
-            var ta = document.getElementById('sp-in');
-            if (a === 'copy') return spCopyText(m.text);
-            if (a === 'reply') {
-                SP.edit = null;
-                SP.reply = { i: i, name: m.name || '', text: m.text || (m.aud ? '🎙️ رسالة صوتية' : (m.img ? '📷 صورة' : '')) };
-                spPaintCtx(); if (ta) ta.focus(); return;
-            }
-            if (a === 'edit') {
-                SP.reply = null; SP.edit = { i: i };
-                if (ta) { ta.value = m.text || ''; ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 110) + 'px'; ta.focus(); }
-                spPaintCtx(); return;
-            }
-            if (a === 'del') {
-                if (!(await confirmModal('متأكد تبي تحذف هذي الرسالة؟'))) return;
-                try { await spApi('/api/support/tickets/' + c.id + '/messages/' + i + '/delete', { method: 'POST', body: '{}' }); toast('تم حذف الرسالة'); await spLoadNew(); } catch (e) { toast(e.message); }
-                return;
-            }
-            if (a === 'reveal') return spRevealAsk(i);
-        }
-        async function spRevealAsk(i) {
-            var c = SP.cur; if (!c || !c.mm || !c.mm[i]) return;
-            var m = c.mm[i];
-            if (!(await confirmModal(m.rev ? 'تبي تخفي هذي الرسالة المحذوفة عن العضو؟' : 'تبي تعرض هذي الرسالة المحذوفة للعضو؟'))) return;
-            try {
-                await spApi('/api/support/tickets/' + c.id + '/messages/' + i + '/reveal', { method: 'POST', body: JSON.stringify({ show: !m.rev }) });
-                toast(m.rev ? 'تم إخفاؤها عن العضو' : 'تم عرضها للعضو');
-                await spLoadNew();
-            } catch (e) { toast(e.message); }
-        }
-        function spCopyText(txt) {
-            txt = String(txt || '');
-            function fb() {
-                var ta = document.createElement('textarea');
-                ta.value = txt; ta.style.cssText = 'position:fixed;top:-100px;opacity:0;';
-                document.body.appendChild(ta); ta.select();
-                try { document.execCommand('copy'); toast('تم نسخ الرسالة'); } catch (e) { toast('تعذر النسخ'); }
-                ta.remove();
-            }
-            if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(function () { toast('تم نسخ الرسالة'); }).catch(fb); else fb();
-        }
-        function spJumpTo(i) {
-            var el = document.querySelector('#sp-msgs .sp-msg[data-i="' + i + '"]');
-            if (!el) { toast('الرسالة غير موجودة'); return; }
-            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            el.classList.add('sp-flash');
-            setTimeout(function () { el.classList.remove('sp-flash'); }, 1400);
-        }
-        function spPaintCtx() {
-            var b = document.getElementById('sp-ctxbar'); if (!b) return;
-            if (SP.edit) { b.style.display = 'flex'; b.innerHTML = '<span>✏️ تعديل الرسالة</span><button class="sp-link" onclick="spCtxCancel()">✕ إلغاء</button>'; }
-            else if (SP.reply) { b.style.display = 'flex'; b.innerHTML = '<span>↩️ رد على <b>' + spEsc(SP.reply.name) + '</b>: ' + spEsc(String(SP.reply.text).slice(0, 50)) + '</span><button class="sp-link" onclick="spCtxCancel()">✕</button>'; }
-            else { b.style.display = 'none'; b.innerHTML = ''; }
-        }
-        function spCtxCancel() {
-            var wasEdit = !!SP.edit;
-            SP.edit = null; SP.reply = null; spPaintCtx();
-            if (wasEdit) { var ta = document.getElementById('sp-in'); if (ta) { ta.value = ''; ta.style.height = 'auto'; } }
-        }
-        function spMsgClick(e) {
-            if (SP.lpFired) { SP.lpFired = false; return; }
-            var t = e.target;
-            if (!t || !t.closest) return;
-            if (t.closest('.sp-img, .sp-vm, .sp-quote, button, a, audio, input, textarea')) return;
-            try { var sel = window.getSelection && window.getSelection().toString(); if (sel) return; } catch (x) {}
-            var el = t.closest('.sp-msg[data-i]'); if (!el) return;
-            var i = parseInt(el.getAttribute('data-i'), 10), c = SP.cur;
-            if (!c || !c.mm || !c.mm[i]) return;
-            if (c.mm[i].del && spIsSenior()) return spRevealAsk(i);
-            spMsgMenuOpen(i);
-        }
-        function spLpStart(e) {
-            var el = e.target && e.target.closest ? e.target.closest('.sp-msg[data-i]') : null;
-            clearTimeout(SP.lpT); SP.lpFired = false;
-            if (!el) return;
-            SP.lpT = setTimeout(function () { SP.lpFired = true; spMsgMenuOpen(parseInt(el.getAttribute('data-i'), 10)); }, 520);
-        }
-        function spLpCancel() { clearTimeout(SP.lpT); }
-        function spWireMsgs() {
-            var mb = document.getElementById('sp-msgs'); if (!mb) return;
-            mb.onclick = spMsgClick;
-            mb.oncontextmenu = function (e) {
-                var el = e.target && e.target.closest ? e.target.closest('.sp-msg[data-i]') : null;
-                if (!el) return;
-                e.preventDefault();
-                spMsgMenuOpen(parseInt(el.getAttribute('data-i'), 10));
-            };
-            mb.addEventListener('touchstart', spLpStart, { passive: true });
-            mb.addEventListener('touchend', spLpCancel, { passive: true });
-            mb.addEventListener('touchmove', spLpCancel, { passive: true });
-            mb.addEventListener('touchcancel', spLpCancel, { passive: true });
-        }
-        function spShowTyping() {
-            var c = SP.cur, box = document.getElementById('sp-msgs'); if (!c || !box) return;
-            var tp = document.getElementById('sp-typing'); if (tp) tp.remove();
-            if (c.typing) {
-                box.insertAdjacentHTML('beforeend', '<div class="sp-msg other ai" id="sp-typing"><div class="sp-who">🤖 المساعد الآلي</div><div class="sp-b sp-dots"><span></span><span></span><span></span></div></div>');
-                box.scrollTop = box.scrollHeight;
-            }
-        }
-        function spPaintState() {
-            var c = SP.cur; if (!c || !c.t) return;
-            var t = c.t, adm = c.mode === 'admin';
-            if (t.status !== 'ai' && c.typing) { c.typing = false; spShowTyping(); }
-            document.getElementById('sp-title').textContent = '#' + t.no + ' — ' + t.category + (adm ? ' — ' + t.name + (t.guest ? ' (زائر)' : '') : '');
-            var st = document.getElementById('sp-state'), html = '';
-            if (t.status === 'ai') {
-                html = adm ? '<span>🤖 التكت عند المساعد الآلي (العضو ما طلب إداري)</span><button class="sp-btn warn" onclick="spJoin()">استلام التكت</button>'
-                           : '<span>🤖 تتحدث مع المساعد الآلي</span><button class="sp-btn warn" id="sp-human" onclick="spHuman()">🧑‍💼 تحدث مع عضو حقيقي</button>';
-            } else if (t.status === 'waiting') {
-                html = adm ? '<span>⏳ العضو ينتظر إداري</span><button class="sp-btn warn pulse" onclick="spJoin()">✋ استلام التكت</button>'
-                           : '<span>⏳ بانتظار إداري، بيجيك الرد هنا مباشرة بدون ما تحدّث الصفحة</span>';
-            } else if (t.status === 'active') {
-                html = '<span>✅ الإداري ' + spEsc(t.adminName || '') + ' ' + (adm ? 'مستلم التكت' : 'معك الحين') + '</span>';
-            } else {
-                html = '<span>🔒 التكت مغلق' + (adm ? (t.rating ? ' — التقييم ⭐ ' + t.rating + '/5' : (t.needRate ? ' — بانتظار تقييم العضو' : '')) : '') + '</span>';
-            }
-            st.innerHTML = html;
-            var closed = t.status === 'closed';
-            var isSen = !!(ME && ME.isSeniorAdmin);
-            var canWrite = !closed && (!adm || t.status === 'active' || isSen);
-            document.getElementById('sp-compose').style.display = canWrite ? 'flex' : 'none';
-            var rb = document.getElementById('sp-rate');
-            if (rb) {
-                if (!adm && t.needRate) { rb.style.display = 'block'; if (!rb.firstChild) rb.innerHTML = spRateHtml(); }
-                else { rb.style.display = 'none'; rb.innerHTML = ''; }
-            }
-            document.getElementById('sp-close').style.display = (closed || !(adm || isSen)) ? 'none' : 'inline';
-            var banBtn = document.getElementById('sp-ban');
-            if (banBtn) banBtn.style.display = (adm && isSen) ? 'inline' : 'none';
-            var editBtn = document.getElementById('sp-edit');
-            if (editBtn) editBtn.style.display = (adm && isSen && !t.guest) ? 'inline' : 'none';
-            var delBtn = document.getElementById('sp-del');
-            if (delBtn) delBtn.style.display = (closed && adm && ME && ME.isSeniorAdmin) ? 'inline' : 'none';
-            var ib = document.getElementById('sp-inspect');
-            if (ib) ib.style.display = (adm && c.canInspect && !t.guest && !closed) ? 'inline' : 'none';
-            var nb = document.getElementById('sp-notify');
-            if (nb) nb.style.display = (adm && !t.guest && !closed) ? 'inline' : 'none';
-            var hb = document.getElementById('sp-human');
-            if (hb && c.suggest) hb.classList.add('pulse');
-        }
-        async function spSend() {
-            var c = SP.cur; if (!c) return;
-            var ta = document.getElementById('sp-in'), btn = document.getElementById('sp-send');
-            var text = ta.value.trim();
-            if (SP.edit) {
-                if (!text) { toast('اكتب النص الجديد'); return; }
-                btn.disabled = true;
-                try {
-                    await spApi('/api/support/tickets/' + c.id + '/messages/' + SP.edit.i + '/edit', { method: 'POST', body: JSON.stringify({ text: text }) });
-                    SP.edit = null; ta.value = ''; ta.style.height = 'auto'; spPaintCtx();
-                    toast('تم تعديل الرسالة');
-                    await spLoadNew();
-                } catch (e) { toast(e.message); }
-                btn.disabled = false; ta.focus();
-                return;
-            }
-            if (!text && !SP.img) return;
-            btn.disabled = true;
-            try {
-                if (SP.noteMode && SP.img) { toast('الملاحظة الداخلية نص فقط'); btn.disabled = false; return; }
-                var rpl = (!SP.noteMode && SP.reply) ? SP.reply.i : undefined;
-                await spApi('/api/support/tickets/' + c.id + (SP.noteMode ? '/note' : '/messages'), { method: 'POST', body: JSON.stringify(SP.noteMode ? { text: text } : { text: text, image: SP.img, replyTo: rpl }) });
-                ta.value = ''; ta.style.height = 'auto'; SP.img = null; spPaintPrev(); SP.reply = null; spPaintCtx();
-                await spLoadNew();
-                if (!SP.noteMode && c.mode === 'user' && c.t && c.t.status === 'ai') {
-                    c.typing = true; spShowTyping();
-                    setTimeout(function () { if (SP.cur === c && c.typing) { c.typing = false; spShowTyping(); } }, 40000);
-                }
-            } catch (e) { toast(e.message); }
-            btn.disabled = false; ta.focus();
-        }
-
-        /* ---------------- الرسائل الصوتية (مثل ديسكورد) ---------------- */
-        var SPV = { rec: null, stream: null, chunks: [], mime: '', t0: 0, timer: null, ctx: null, an: null, samples: [], blob: null, dur: 0, wf: '', cancelled: false, pa: null, praf: null };
-        var SPVP = { a: null, el: null, raf: null, rate: 1 };
-        var SPV_MAX_SEC = 600, SPV_LIVE_BARS = 36, SPV_BARS = 32;
-        function spFmtDur(sec) { sec = Math.max(0, Math.floor(sec || 0)); var s = sec % 60; return Math.floor(sec / 60) + ':' + (s < 10 ? '0' : '') + s; }
-        function spVoiceSupported() { return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder); }
-        function spVoicePickMime() {
-            var c = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
-            for (var i = 0; i < c.length; i++) { try { if (MediaRecorder.isTypeSupported(c[i])) return c[i]; } catch (e) {} }
-            return '';
-        }
-        function spWfDecode(wf) {
-            var out = [];
-            try { var s = atob(wf || ''); for (var i = 0; i < s.length; i++) out.push(s.charCodeAt(i) / 255); } catch (e) {}
-            return out;
-        }
-        function spWaveHtml(vals, n) {
-            var h = '';
-            for (var i = 0; i < n; i++) {
-                var v = 0.18;
-                if (vals.length) {
-                    var a = Math.floor(i * vals.length / n), b = Math.max(a + 1, Math.floor((i + 1) * vals.length / n)), sum = 0;
-                    for (var k = a; k < b; k++) sum += vals[k] || 0;
-                    v = sum / (b - a);
-                }
-                h += '<i style="height:' + Math.round(4 + Math.max(0.05, v) * 24) + 'px"></i>';
-            }
-            return h;
-        }
-        function spVoicePaint(mode) {
-            var cin = document.getElementById('sp-cin'), bar = document.getElementById('sp-vbar');
-            if (!cin || !bar) return;
-            if (!mode) { bar.style.display = 'none'; bar.innerHTML = ''; cin.style.display = 'flex'; return; }
-            cin.style.display = 'none'; bar.style.display = 'flex';
-            if (mode === 'rec') {
-                bar.innerHTML = '<button class="sp-vb-ic" title="إلغاء" onclick="spVoiceCancel()">🗑️</button><span class="sp-rec-dot"></span><span class="sp-rec-time" id="spv-time">0:00</span><div class="sp-wave" id="spv-live">' + spWaveHtml([], SPV_LIVE_BARS) + '</div><button class="sp-vb-stop" title="إيقاف التسجيل" onclick="spVoiceStop()">⏹</button>';
-            } else {
-                bar.innerHTML = '<button class="sp-vb-ic" title="حذف" onclick="spVoiceCancel()">🗑️</button><button class="sp-vm-play" id="spv-play" onclick="spVoicePreviewToggle()">▶</button><div class="sp-wave sp-vm-wave" id="spv-wave" onclick="spVoicePreviewSeek(event)">' + spWaveHtml(spWfDecode(SPV.wf), SPV_BARS) + '</div><span class="sp-rec-time" id="spv-dur">' + spFmtDur(SPV.dur) + '</span><button class="sp-btn" id="spv-send" onclick="spVoiceSend()">➤</button>';
-            }
-        }
-        async function spVoiceStart() {
-            if (SPV.rec || SPV.blob) return;
-            if (!spVoiceSupported()) { toast('متصفحك ما يدعم تسجيل الصوت'); return; }
-            spVmStopAll();
-            var stream;
-            try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
-            catch (e) { toast('اسمح للمايك من إعدادات المتصفح عشان تسجل رسالة صوتية'); return; }
-            var mime = spVoicePickMime(), rec;
-            try { rec = mime ? new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 32000 }) : new MediaRecorder(stream); }
-            catch (e) { stream.getTracks().forEach(function (t) { t.stop(); }); toast('تعذر بدء التسجيل'); return; }
-            SPV.stream = stream; SPV.rec = rec; SPV.chunks = []; SPV.samples = []; SPV.cancelled = false; SPV.blob = null;
-            SPV.mime = String(rec.mimeType || mime || 'audio/webm').split(';')[0];
-            rec.ondataavailable = function (e) { if (e.data && e.data.size) SPV.chunks.push(e.data); };
-            rec.onstop = spVoiceOnStop;
-            try {
-                var AC = window.AudioContext || window.webkitAudioContext;
-                SPV.ctx = new AC();
-                if (SPV.ctx.resume) SPV.ctx.resume();
-                var src = SPV.ctx.createMediaStreamSource(stream);
-                SPV.an = SPV.ctx.createAnalyser(); SPV.an.fftSize = 512;
-                src.connect(SPV.an);
-            } catch (e) { SPV.an = null; }
-            SPV.t0 = Date.now();
-            rec.start(250);
-            spVoicePaint('rec');
-            SPV.timer = setInterval(spVoiceTick, 100);
-        }
-        function spVoiceTick() {
-            var el = Date.now() - SPV.t0, v;
-            if (SPV.an) {
-                var buf = new Uint8Array(SPV.an.fftSize), sum = 0;
-                SPV.an.getByteTimeDomainData(buf);
-                for (var i = 0; i < buf.length; i++) { var d = (buf[i] - 128) / 128; sum += d * d; }
-                v = Math.min(1, Math.sqrt(Math.sqrt(sum / buf.length)) * 1.5);
-            } else { v = 0.2 + Math.random() * 0.3; }
-            SPV.samples.push(v);
-            var t = document.getElementById('spv-time'); if (t) t.textContent = spFmtDur(el / 1000);
-            var live = document.getElementById('spv-live');
-            if (live) {
-                var last = SPV.samples.slice(-SPV_LIVE_BARS), bars = live.children, off = SPV_LIVE_BARS - last.length;
-                for (var k = 0; k < bars.length; k++) { var x = k - off; bars[k].style.height = Math.round(4 + (x >= 0 ? Math.max(0.05, last[x]) : 0.05) * 24) + 'px'; }
-            }
-            if (el >= SPV_MAX_SEC * 1000) spVoiceStop();
-        }
-        function spVoiceStop() { try { if (SPV.rec && SPV.rec.state !== 'inactive') SPV.rec.stop(); } catch (e) {} }
-        function spVoiceRelease() {
-            if (SPV.timer) { clearInterval(SPV.timer); SPV.timer = null; }
-            try { if (SPV.stream) SPV.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-            try { if (SPV.ctx) SPV.ctx.close(); } catch (e) {}
-            SPV.stream = null; SPV.ctx = null; SPV.an = null;
-        }
-        function spVoiceOnStop() {
-            var dur = (Date.now() - SPV.t0) / 1000;
-            spVoiceRelease();
-            SPV.rec = null;
-            if (SPV.cancelled) { SPV.chunks = []; SPV.samples = []; return; }
-            if (dur < 1 || !SPV.chunks.length) { SPV.chunks = []; SPV.samples = []; spVoicePaint(null); toast('التسجيل قصير'); return; }
-            var blob = new Blob(SPV.chunks, { type: SPV.mime });
-            SPV.chunks = [];
-            if (blob.size > 3.8 * 1024 * 1024) { SPV.samples = []; spVoicePaint(null); toast('الرسالة الصوتية كبيرة، قصّر التسجيل'); return; }
-            var n = 64, vals = [], mx = 0.05;
-            for (var i = 0; i < n; i++) {
-                var a = Math.floor(i * SPV.samples.length / n), b = Math.max(a + 1, Math.floor((i + 1) * SPV.samples.length / n)), sum = 0;
-                for (var k = a; k < b; k++) sum += SPV.samples[k] || 0;
-                var v = sum / (b - a); vals.push(v); if (v > mx) mx = v;
-            }
-            var bytes = vals.map(function (v) { return Math.max(18, Math.min(255, Math.round(v / mx * 255))); });
-            SPV.wf = btoa(String.fromCharCode.apply(null, bytes));
-            SPV.samples = [];
-            SPV.blob = blob; SPV.dur = Math.min(SPV_MAX_SEC, Math.max(1, Math.round(dur)));
-            spVoicePaint('preview');
-        }
-        function spVoiceCancel() {
-            SPV.cancelled = true;
-            if (SPV.rec && SPV.rec.state !== 'inactive') { try { SPV.rec.stop(); } catch (e) {} }
-            spVoiceReset();
-        }
-        function spVoiceReset() {
-            if (SPV.rec) { SPV.cancelled = true; try { if (SPV.rec.state !== 'inactive') SPV.rec.stop(); } catch (e) {} SPV.rec = null; }
-            spVoiceRelease();
-            if (SPV.pa) { try { SPV.pa.pause(); } catch (e) {} if (SPV.pa.src) { try { URL.revokeObjectURL(SPV.pa.src); } catch (e) {} } SPV.pa = null; }
-            if (SPV.praf) { cancelAnimationFrame(SPV.praf); SPV.praf = null; }
-            SPV.blob = null; SPV.chunks = []; SPV.samples = []; SPV.wf = ''; SPV.dur = 0;
-            spVoicePaint(null);
-        }
-        function spVoicePreviewPaint(frac, playing) {
-            var w = document.getElementById('spv-wave'), p = document.getElementById('spv-play'), d = document.getElementById('spv-dur');
-            if (p) p.textContent = playing ? '⏸' : '▶';
-            if (w) { var on = Math.round(frac * w.children.length); for (var i = 0; i < w.children.length; i++) w.children[i].className = i < on ? 'on' : ''; }
-            if (d) d.textContent = spFmtDur(playing || frac > 0 ? frac * SPV.dur : SPV.dur);
-        }
-        function spVoicePreviewTick() {
-            var a = SPV.pa; if (!a) return;
-            spVoicePreviewPaint(Math.min(1, a.currentTime / SPV.dur), !a.paused);
-            if (!a.paused) SPV.praf = requestAnimationFrame(spVoicePreviewTick);
-        }
-        function spVoicePreviewToggle() {
-            if (!SPV.blob) return;
-            if (!SPV.pa) {
-                var a = new Audio(URL.createObjectURL(SPV.blob));
-                a.onended = function () { a.currentTime = 0; spVoicePreviewPaint(0, false); };
-                a.onpause = function () { spVoicePreviewTick(); };
-                a.onplay = function () { spVoicePreviewTick(); };
-                SPV.pa = a;
-            }
-            if (SPV.pa.paused) { spVmStopAll(); SPV.pa.play().catch(function () { toast('تعذر تشغيل التسجيل'); }); } else SPV.pa.pause();
-        }
-        function spVoicePreviewSeek(ev) {
-            var w = document.getElementById('spv-wave'); if (!w || !SPV.blob) return;
-            var r = w.getBoundingClientRect(), f = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
-            if (!SPV.pa) spVoicePreviewToggle();
-            var a = SPV.pa; if (!a) return;
-            try { a.currentTime = f * SPV.dur; } catch (e) {}
-            spVoicePreviewPaint(f, !a.paused);
-        }
-        function spBlobToB64(blob) {
-            return new Promise(function (res, rej) {
-                var fr = new FileReader();
-                fr.onload = function () { var s = String(fr.result); res(s.slice(s.indexOf(',') + 1)); };
-                fr.onerror = function () { rej(new Error('تعذر قراءة التسجيل')); };
-                fr.readAsDataURL(blob);
-            });
-        }
-        async function spVoiceSend() {
-            var c = SP.cur; if (!c || !SPV.blob) return;
-            var btn = document.getElementById('spv-send'); if (btn) btn.disabled = true;
-            if (SPV.pa) { try { SPV.pa.pause(); } catch (e) {} }
-            try {
-                var b64 = await spBlobToB64(SPV.blob);
-                await spApi('/api/support/tickets/' + c.id + '/messages', { method: 'POST', body: JSON.stringify({ audio: b64, audioMime: SPV.blob.type || SPV.mime, audioDuration: SPV.dur, audioWave: SPV.wf }) });
-                spVoiceReset();
-                await spLoadNew();
-            } catch (e) { toast(e.message); if (btn) btn.disabled = false; }
-        }
-        /* مشغّل الرسالة الصوتية داخل الشات */
-        function spVoiceHtml(m, c) {
-            var src = '/api/support/tickets/' + c.id + '/audio/' + m.i + '?gt=' + spGuestToken();
-            return '<div class="sp-vm" data-src="' + spEsc(src) + '" data-dur="' + (m.dur || 0) + '">' +
-                '<button class="sp-vm-play" onclick="spVmToggle(this.parentNode)">▶</button>' +
-                '<div class="sp-wave sp-vm-wave" onclick="spVmSeek(event, this)">' + spWaveHtml(spWfDecode(m.wf), SPV_BARS) + '</div>' +
-                '<span class="sp-vm-dur">' + spFmtDur(m.dur) + '</span>' +
-                '<button class="sp-vm-speed" onclick="spVmSpeed(this.parentNode)">' + SPVP.rate + 'x</button></div>';
-        }
-        function spVmDur(box) { return parseFloat(box.getAttribute('data-dur')) || 0; }
-        function spVmPaint(box, frac, playing) {
-            if (!box) return;
-            var p = box.querySelector('.sp-vm-play'), w = box.querySelector('.sp-vm-wave'), d = box.querySelector('.sp-vm-dur'), dur = spVmDur(box);
-            if (p) p.textContent = playing ? '⏸' : '▶';
-            if (w) { var on = Math.round(frac * w.children.length); for (var i = 0; i < w.children.length; i++) w.children[i].className = i < on ? 'on' : ''; }
-            if (d) d.textContent = spFmtDur(playing || frac > 0 ? frac * dur : dur);
-            var sp = box.querySelector('.sp-vm-speed'); if (sp) sp.textContent = SPVP.rate + 'x';
-        }
-        function spVmTick() {
-            var a = SPVP.a, box = SPVP.el; if (!a || !box) return;
-            var dur = spVmDur(box) || (isFinite(a.duration) ? a.duration : 0);
-            spVmPaint(box, dur ? Math.min(1, a.currentTime / dur) : 0, !a.paused);
-            if (!a.paused) SPVP.raf = requestAnimationFrame(spVmTick);
-        }
-        function spVmStopAll() {
-            if (SPVP.raf) { cancelAnimationFrame(SPVP.raf); SPVP.raf = null; }
-            if (SPVP.a) { try { SPVP.a.pause(); SPVP.a.removeAttribute('src'); SPVP.a.load(); } catch (e) {} }
-            if (SPVP.el) spVmPaint(SPVP.el, 0, false);
-            SPVP.a = null; SPVP.el = null;
-        }
-        function spVmToggle(box) {
-            if (SPVP.a && SPVP.el === box) { if (SPVP.a.paused) SPVP.a.play().catch(function () {}); else SPVP.a.pause(); return; }
-            spVmStopAll();
-            if (SPV.pa && !SPV.pa.paused) SPV.pa.pause();
-            var a = new Audio(box.getAttribute('data-src'));
-            a.preload = 'auto'; a.playbackRate = SPVP.rate;
-            a.onplay = function () { spVmTick(); };
-            a.onpause = function () { spVmTick(); };
-            a.onended = function () { a.currentTime = 0; spVmPaint(box, 0, false); };
-            a.onerror = function () { toast('تعذر تشغيل الرسالة الصوتية'); if (SPVP.a === a) { SPVP.a = null; SPVP.el = null; } spVmPaint(box, 0, false); };
-            SPVP.a = a; SPVP.el = box;
-            a.play().catch(function () { toast('تعذر تشغيل الرسالة الصوتية'); });
-        }
-        function spVmSeek(ev, wave) {
-            var box = wave.parentNode, r = wave.getBoundingClientRect(), f = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)), dur = spVmDur(box);
-            if (!(SPVP.a && SPVP.el === box)) spVmToggle(box);
-            var a = SPVP.a; if (!a || !dur) return;
-            var go = function () { try { a.currentTime = f * dur; } catch (e) {} spVmPaint(box, f, !a.paused); };
-            if (a.readyState >= 1) go(); else a.addEventListener('loadedmetadata', go, { once: true });
-        }
-        function spVmSpeed(box) {
-            SPVP.rate = SPVP.rate === 1 ? 1.5 : SPVP.rate === 1.5 ? 2 : 1;
-            if (SPVP.a) SPVP.a.playbackRate = SPVP.rate;
-            var sp = box.querySelector('.sp-vm-speed'); if (sp) sp.textContent = SPVP.rate + 'x';
-        }
-
-        /* ---------------- التقييم الإجباري + الردود الجاهزة + الملاحظات الداخلية ---------------- */
-        var SPR = { n: 0 };
-        function spRateHtml() {
-            SPR.n = 0;
-            return '<div style="font-weight:bold;">⭐ قيّم خدمة الدعم</div><div style="font-size:12px;color:var(--muted);margin-top:2px;">التقييم إجباري عشان تقدر تفتح تكت جديد</div>' +
-                '<div class="sp-stars" id="sp-stars">' + [1, 2, 3, 4, 5].map(function (n) { return '<button onclick="spRateStar(' + n + ')">★</button>'; }).join('') + '</div>' +
-                '<textarea id="sp-rate-c" class="sp-field" rows="2" maxlength="300" placeholder="تعليق (اختياري)" style="margin-bottom:8px;"></textarea>' +
-                '<button class="sp-btn" id="sp-rate-go" disabled onclick="spRateSend()">إرسال التقييم</button>';
-        }
-        function spRateStar(n) {
-            SPR.n = n;
-            var b = document.getElementById('sp-stars').children;
-            for (var i = 0; i < b.length; i++) b[i].className = i < n ? 'on' : '';
-            document.getElementById('sp-rate-go').disabled = false;
-        }
-        async function spRateSend() {
-            var c = SP.cur; if (!c || !SPR.n) return;
-            var btn = document.getElementById('sp-rate-go'); if (btn) btn.disabled = true;
-            try {
-                var cm = document.getElementById('sp-rate-c');
-                await spApi('/api/support/tickets/' + c.id + '/rate', { method: 'POST', body: JSON.stringify({ stars: SPR.n, comment: cm ? cm.value.trim() : '' }) });
-                toast('🙏 شكراً لتقييمك');
-                var rb = document.getElementById('sp-rate'); if (rb) { rb.style.display = 'none'; rb.innerHTML = ''; }
-                await spLoadNew();
-            } catch (e) { toast(e.message); if (btn) btn.disabled = false; }
-        }
-        async function spRatingAdmin(uid, name) {
-            var box = document.getElementById('spa-list'); if (!box) return;
-            box.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px;">جارِ التحميل...</div>';
-            try {
-                var d = await spApi('/api/support/admin/ratings/' + encodeURIComponent(uid));
-                var h = '<div class="sp-row" style="cursor:default;"><div class="t1"><span>🛡️ تقييمات ' + spEsc(name) + '</span><button class="sp-link" onclick="spLoadRatings()">‹ رجوع</button></div></div>';
-                h += d.list.length ? d.list.map(function (r) {
-                    return '<div class="sp-row" style="cursor:pointer;" data-id="' + spEsc(r.ticketId) + '" onclick="spOpenTicket(this.dataset.id, \\'admin\\', \\'spa-body\\')"><div class="t1"><span>#' + r.no + ' — ' + spEsc(r.name || '-') + '</span><span>' + '★'.repeat(r.stars) + '</span></div>' + (r.comment ? '<div class="t2">' + spEsc(r.comment) + '</div>' : '') + '<div class="t2">' + spEsc(r.category || '') + ' • ' + exFull(r.at) + ' • اضغط لفتح التكت</div></div>';
-                }).join('') : '<div style="color:var(--muted);text-align:center;padding:24px;">ما فيه تقييمات</div>';
-                box.innerHTML = h;
-            } catch (e) { box.innerHTML = '<div style="color:#fca5a5;">' + spEsc(e.message) + '</div>'; }
-        }
-        async function spLoadRatings() {
-            var box = document.getElementById('spa-list'); if (!box) return;
-            try {
-                var d = await spApi('/api/support/admin/ratings');
-                if (!d.total) { box.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px;">ما فيه تقييمات للحين</div>'; return; }
-                var html = '<div class="sp-row" style="cursor:default;"><div class="t1"><span>📊 الإجمالي</span><span>⭐ ' + d.avg.toFixed(2) + ' (' + d.total + ' تقييم)</span></div></div>';
-                html += d.admins.map(function (a) {
-                    var dist = [5, 4, 3, 2, 1].map(function (n) { return n + '★ ' + a.dist[n - 1]; }).join(' • ');
-                    return '<div class="sp-row" style="cursor:pointer;" data-u="' + spEsc(a.uid) + '" data-n="' + spEsc(a.name) + '" onclick="spRatingAdmin(this.dataset.u, this.dataset.n)"><div class="t1"><span>🛡️ ' + spEsc(a.name) + '</span><span>⭐ ' + a.avg.toFixed(2) + ' (' + a.count + ')</span></div><div class="t2">' + dist + '</div></div>';
-                }).join('');
-                if (d.recent.length) {
-                    html += '<div style="margin:12px 4px 6px;font-weight:bold;">💬 آخر التعليقات</div>' + d.recent.map(function (r) {
-                        return '<div class="sp-row" style="cursor:default;"><div class="t1"><span>#' + r.no + ' — ' + spEsc(r.name || '-') + '</span><span>' + '★'.repeat(r.stars) + '</span></div><div class="t2">' + spEsc(r.comment) + '</div><div class="t2">الإداري: ' + spEsc(r.adminName || '-') + '</div></div>';
-                    }).join('');
-                }
-                box.innerHTML = html;
-            } catch (e) { box.innerHTML = '<div style="color:#fca5a5;">' + spEsc(e.message) + '</div>'; }
-        }
-        function spNoteToggle() {
-            SP.noteMode = !SP.noteMode;
-            var b = document.getElementById('sp-note-btn'), ta = document.getElementById('sp-in');
-            if (b) b.className = 'sp-mic' + (SP.noteMode ? ' on' : '');
-            if (ta) { ta.className = 'sp-field' + (SP.noteMode ? ' note-mode' : ''); ta.placeholder = SP.noteMode ? '📝 ملاحظة داخلية، الإدارة فقط تشوفها...' : 'اكتب رسالتك...'; ta.focus(); }
-        }
-        function spCannedClose() { var b = document.getElementById('sp-canned'); if (b) b.remove(); }
-        async function spCannedOpen() {
-            if (document.getElementById('sp-canned')) { spCannedClose(); return; }
-            var comp = document.getElementById('sp-compose'); if (!comp) return;
-            var box = document.createElement('div'); box.id = 'sp-canned'; box.className = 'sp-canned';
-            box.innerHTML = '<div style="color:var(--muted);padding:10px;text-align:center;">جارِ التحميل...</div>';
-            comp.parentNode.insertBefore(box, comp);
-            await spCannedPaint();
-        }
-        async function spCannedPaint() {
-            var box = document.getElementById('sp-canned'); if (!box) return;
-            try {
-                var d = await spApi('/api/support/admin/canned');
-                SP.canned = d.list;
-                var sen = !!(ME && ME.isSeniorAdmin);
-                box.innerHTML = '<div class="sp-canned-h"><b>⚡ ردود جاهزة</b><button class="sp-link" onclick="spCannedClose()">✕</button></div>' +
-                    (d.list.length ? d.list.map(function (r, i) {
-                        return '<div class="sp-canned-r" onclick="spCannedUse(' + i + ')"><div><b>' + spEsc(r.title) + '</b><div style="font-size:12px;color:var(--muted);">' + spEsc(r.text) + '</div></div>' +
-                            (sen ? '<button class="sp-link" style="color:#fca5a5;" onclick="event.stopPropagation();spCannedDel(&quot;' + r.id + '&quot;)">🗑️</button>' : '') + '</div>';
-                    }).join('') : '<div style="padding:10px;color:var(--muted);">ما فيه ردود</div>') +
-                    (sen ? '<button class="sp-btn" style="margin:8px;width:calc(100% - 16px);" onclick="spCannedAdd()">➕ إضافة رد جاهز</button>' : '');
-            } catch (e) { box.innerHTML = '<div style="color:#fca5a5;padding:10px;">' + spEsc(e.message) + '</div>'; }
-        }
-        function spCannedUse(i) {
-            var r = SP.canned && SP.canned[i]; if (!r) return;
-            var ta = document.getElementById('sp-in'); if (!ta) return;
-            ta.value = (ta.value ? ta.value + ' ' : '') + r.text;
-            ta.dispatchEvent(new Event('input'));
-            spCannedClose(); ta.focus();
-        }
-        async function spCannedAdd() {
-            var title = await promptModal('عنوان الرد الجاهز'); if (!title || !title.trim()) return;
-            var text = await promptModal('نص الرد'); if (!text || !text.trim()) return;
-            try { await spApi('/api/support/admin/canned', { method: 'POST', body: JSON.stringify({ title: title.trim(), text: text.trim() }) }); toast('✅ تمت الإضافة'); spCannedPaint(); }
-            catch (e) { toast(e.message); }
-        }
-        async function spCannedDel(id) {
-            if (!(await confirmModal('تبي تحذف هذا الرد الجاهز؟'))) return;
-            try { await spApi('/api/support/admin/canned/' + id, { method: 'DELETE' }); toast('🗑️ تم الحذف'); spCannedPaint(); }
-            catch (e) { toast(e.message); }
-        }
-        async function spHuman() {
-            var c = SP.cur; if (!c) return;
-            try { await spApi('/api/support/tickets/' + c.id + '/human', { method: 'POST', body: '{}' }); toast('📨 تم إرسال طلبك للإدارة'); await spLoadNew(); }
-            catch (e) { toast(e.message); }
-        }
-        async function spJoin() {
-            var c = SP.cur; if (!c) return;
-            try { await spApi('/api/support/admin/tickets/' + c.id + '/join', { method: 'POST', body: '{}' }); await spLoadNew(); }
-            catch (e) { toast(e.message); }
-        }
-        async function spCloseTicket() {
-            var c = SP.cur; if (!c) return;
-            if (!(await confirmModal('تبي تسكّر هذا التكت؟'))) return;
-            try { await spApi('/api/support/tickets/' + c.id + '/close', { method: 'POST', body: '{}' }); await spLoadNew(); }
-            catch (e) { toast(e.message); }
-        }
-
-        async function spDeleteTicket() {
-            var c = SP.cur; if (!c) return;
-            if (!(await confirmModal('تبي تحذف هذا التكت نهائياً؟ ما يرجع بعد الحذف.'))) return;
-            try { await spApi('/api/support/admin/tickets/' + c.id, { method: 'DELETE' }); toast('🗑️ تم حذف التكت'); spBack(); }
-            catch (e) { toast(e.message); }
-        }
-        function spFmtDate(v) {
-            try { return new Date(v).toLocaleString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', year: 'numeric', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }); } catch (e) { return '—'; }
-        }
-        function spInfoRowHtml(r) {
-            if (r.at) return '<div class="sp-info-r"><span>' + spEsc(r.l) + (r.v && r.v !== '—' ? ' <small style="color:var(--muted);">— ' + spEsc(r.v) + '</small>' : '') + '</span><b>' + spEsc(spFmtDate(r.at)) + '</b></div>';
-            return '<div class="sp-info-r"><span>' + spEsc(r.l) + '</span><b>' + spEsc(r.d ? spFmtDate(r.v) : r.v) + '</b></div>';
-        }
-        async function spLoadInfo() {
-            var c = SP.cur; if (!c) return;
-            var box = document.getElementById('sp-info'); if (!box) return;
-            if (!c.shared || !c.shared.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
-            box.style.display = 'block';
-            if (!box.innerHTML) box.innerHTML = '<div style="font-size:12px;color:var(--muted);">جارِ التحميل...</div>';
-            try {
-                var d = await spApi('/api/support/tickets/' + c.id + '/info');
-                if (SP.cur !== c) return;
-                box = document.getElementById('sp-info'); if (!box) return;
-                var adm = c.mode === 'admin';
-                box.innerHTML = '<div class="sp-info-h"><b>🔎 ' + (adm ? 'المعروض للعضو' : 'معلومات من الإدارة') + '</b><button class="sp-link" style="font-size:12px;" onclick="spLoadInfo()">🔄 تحديث</button></div>' +
-                    d.items.map(function (it) {
-                        return '<div class="sp-info-c"><div class="sp-info-t">' + spEsc(it.title) + '</div>' + it.rows.map(spInfoRowHtml).join('') + '</div>';
-                    }).join('');
-            } catch (e) {
-                box = document.getElementById('sp-info');
-                if (box) box.innerHTML = '<div style="color:#fca5a5;font-size:12px;">' + spEsc(e.message) + '</div>';
-            }
-        }
-        function spInspect() {
-            var c = SP.cur; if (!c) return;
-            c.insp = null;
-            var cnt = {};
-            (c.shared || []).forEach(function (k) { var q = spCatOf(k); cnt[q] = (cnt[q] || 0) + 1; });
-            var box = document.getElementById('wf-box');
-            box.innerHTML = '<h3>🔍 فحص العضو</h3>' +
-                '<p style="font-size:12px;color:var(--muted);margin:0 0 8px;">اختر القسم، وبعدها تضغط على الخانة اللي تبي تظهر للعضو. ما يشوفها إلا العضو والإداري المستلم وكبار المسؤولين.</p>' +
-                SP_INS_CATS.map(function (x) {
-                    return '<button class="btn sm" style="width:100%;margin:4px 0;display:flex;justify-content:space-between;align-items:center;" data-c="' + x[0] + '" onclick="spInspectCat(this.dataset.c)"><span>' + x[1] + '</span>' + (cnt[x[0]] ? '<span style="color:#bbf7d0;">' + cnt[x[0]] + ' ظاهر</span>' : '') + '</button>';
-                }).join('') +
-                '<div class="wf-actions"><button class="btn danger sm" onclick="spInspectHideAll()">🙈 إخفاء الكل عن العضو</button><button class="btn gray sm" onclick="closeWarnForm()">إغلاق</button></div>';
-            document.getElementById('wf-overlay').classList.add('open');
-        }
-        async function spInspectCat(cat) {
-            var c = SP.cur; if (!c) return;
-            var box = document.getElementById('wf-box');
-            box.innerHTML = '<div style="padding:14px;color:var(--muted);">جارِ التحميل...</div>';
-            try {
-                var d = await spApi('/api/support/admin/tickets/' + c.id + '/inspect/' + cat);
-                c.insp = { cat: cat, title: d.title, rows: d.rows };
-                spInspectPaint();
-            } catch (e) { toast(e.message); spInspect(); }
-        }
-        function spInspectPaint() {
-            var c = SP.cur, I = c && c.insp; if (!I) return;
-            var box = document.getElementById('wf-box'); if (!box) return;
-            var sh = c.shared || [];
-            var shownN = I.rows.filter(function (r) { return sh.indexOf(r.k) >= 0; }).length;
-            var rows = I.rows.length ? I.rows.map(function (r) {
-                var on = sh.indexOf(r.k) >= 0;
-                var main = r.at
-                    ? '<div style="font-size:12px;color:var(--muted);">' + spEsc(spFmtDate(r.at)) + '</div><div style="font-size:13px;word-break:break-word;"><b>' + spEsc(r.l) + '</b>' + (r.v && r.v !== '—' ? ' — ' + spEsc(r.v) : '') + '</div>'
-                    : '<div style="font-size:12px;color:var(--muted);">' + spEsc(r.l) + '</div><div style="font-size:14px;word-break:break-word;">' + spEsc(r.d ? spFmtDate(r.v) : r.v) + '</div>';
-                return '<div class="sp-ins-r' + (on ? ' on' : '') + '"><div style="flex:1;min-width:0;">' + main + '</div><button class="btn sm ' + (on ? 'danger' : '') + '" data-k="' + spEsc(r.k) + '" onclick="spInspectToggle(this.dataset.k)">' + (on ? '🙈 إخفاء' : '👁 إظهار') + '</button></div>';
-            }).join('') : '<div style="color:var(--muted);font-size:13px;padding:10px 0;">ما فيه بيانات</div>';
-            box.innerHTML = '<h3>' + spEsc(I.title) + '</h3>' +
-                '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">اضغط على اللي تبي يشوفه العضو (' + shownN + ' من ' + I.rows.length + ' ظاهر)</div>' +
-                '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px;"><button class="btn sm" onclick="spInspectAll(true)">👁 إظهار الكل</button><button class="btn sm gray" onclick="spInspectAll(false)">🙈 إخفاء الكل</button></div>' +
-                '<div class="sp-ins-list">' + rows + '</div>' +
-                '<div class="wf-actions"><button class="btn gray sm" onclick="spInspect()">‹ رجوع</button><button class="btn gray sm" onclick="closeWarnForm()">إغلاق</button></div>';
-        }
-        async function spShare(body) {
-            var c = SP.cur; if (!c) return;
-            try {
-                var r = await spApi('/api/support/admin/tickets/' + c.id + '/share', { method: 'POST', body: JSON.stringify(body) });
-                c.shared = r.shared || []; c.sharedKey = c.shared.join(',');
-                if (c.insp) spInspectPaint();
-                spLoadInfo();
-            } catch (e) { toast(e.message); }
-        }
-        function spInspectToggle(k) {
-            var c = SP.cur; if (!c) return;
-            spShare((c.shared || []).indexOf(k) >= 0 ? { hide: [k] } : { show: [k] });
-        }
-        function spInspectAll(on) {
-            var c = SP.cur; if (!c || !c.insp) return;
-            var sh = c.shared || [];
-            var keys = c.insp.rows.map(function (r) { return r.k; }).filter(function (k) { return on ? sh.indexOf(k) < 0 : sh.indexOf(k) >= 0; });
-            if (!keys.length) return;
-            spShare(on ? { show: keys } : { hide: keys });
-        }
-        async function spInspectHideAll() {
-            var c = SP.cur; if (!c) return;
-            if (!(c.shared || []).length) { toast('ما فيه شي ظاهر للعضو'); return; }
-            c.insp = null;
-            await spShare({ hide: (c.shared || []).slice() });
-            spInspect();
-        }
-        function spTypingPing() {
-            var c = SP.cur; if (!c) return;
-            var ta = document.getElementById('sp-in'); if (!ta || !ta.value.trim()) return;
-            if (c.t && (c.t.status === 'closed' || (c.t.status === 'ai' && c.mode === 'user'))) return;
-            var now = Date.now();
-            if (now - (c.pingAt || 0) < 2500) return;
-            c.pingAt = now;
-            spApi('/api/support/tickets/' + c.id + '/typing', { method: 'POST', body: '{}' }).catch(function () {});
-        }
-        function spPeerTyping(d) {
-            var c = SP.cur; if (!c || c.id !== d.id) return;
-            if (!c.peers) c.peers = {};
-            c.peers[d.kind + '|' + d.name] = { name: d.name, tag: d.tag, kind: d.kind, t: Date.now() };
-            spShowPeers();
-            if (!c.peerT) c.peerT = setInterval(function () {
-                if (SP.cur !== c) { clearInterval(c.peerT); c.peerT = null; return; }
-                var now = Date.now(), any = false;
-                Object.keys(c.peers).forEach(function (k) { if (now - c.peers[k].t > 4500) delete c.peers[k]; else any = true; });
-                spShowPeers();
-                if (!any) { clearInterval(c.peerT); c.peerT = null; }
-            }, 1000);
-        }
-        function spShowPeers() {
-            var c = SP.cur, box = document.getElementById('sp-msgs'); if (!c || !box) return;
-            var old = document.getElementById('sp-peers');
-            var keys = Object.keys(c.peers || {});
-            if (!keys.length) { if (old) old.remove(); return; }
-            var near = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
-            var html = keys.map(function (k) {
-                var p = c.peers[k], cls = p.kind === 'senior' ? 'senior' : p.kind === 'admin' ? 'admin' : 'member';
-                return '<div class="sp-peer"><span class="sp-peer-n">' + spEsc(p.name) + '</span><span class="sp-role ' + cls + '">' + spEsc(p.tag) + '</span><span>يكتب</span><span class="sp-dots"><span></span><span></span><span></span></span></div>';
-            }).join('');
-            if (old) old.innerHTML = html; else box.insertAdjacentHTML('beforeend', '<div id="sp-peers" class="sp-peers">' + html + '</div>');
-            if (near) box.scrollTop = box.scrollHeight;
-        }
-        async function spBanUser() {
-            var c = SP.cur; if (!c) return;
-            var reason = await _fmOpen('حظر هذا المستخدم من الدعم الفني (حسابه وجهازه)؟ اكتب السبب (اختياري):', { isPrompt: true, okText: 'حظر' });
-            if (reason === null) return;
-            try { await spApi('/api/support/admin/tickets/' + c.id + '/ban', { method: 'POST', body: JSON.stringify({ reason: reason }) }); toast('🚫 تم حظر المستخدم من الدعم'); await spLoadNew(); }
-            catch (e) { toast(e.message); }
-        }
-        async function spLoadBans() {
-            var box = document.getElementById('spa-list'); if (!box) return;
-            try {
-                var d = await spApi('/api/support/admin/bans');
-                if (!d.bans.length) { box.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px;">ما فيه محظورين</div>'; return; }
-                box.innerHTML = d.bans.map(function (b) {
-                    return '<div class="sp-row" style="cursor:default;"><div class="t1"><span>🚫 ' + spEsc(b.name || '-') + (b.guest ? ' (زائر)' : '') + '</span><button class="sp-link" style="color:#86efac;" onclick="spUnban(&quot;' + b.id + '&quot;)">فك الحظر</button></div>' +
-                        '<div class="t2">' + (b.reason ? 'السبب: ' + spEsc(b.reason) : 'بدون سبب') + '</div>' +
-                        '<div class="t2">بواسطة ' + spEsc(b.by || '-') + '</div></div>';
-                }).join('');
-            } catch (e) { box.innerHTML = '<div style="color:#fca5a5;">' + spEsc(e.message) + '</div>'; }
-        }
-        async function spUnban(id) {
-            if (!(await confirmModal('تبي تفك الحظر عن هذا المستخدم؟'))) return;
-            try { await spApi('/api/support/admin/bans/' + id, { method: 'DELETE' }); toast('✅ تم فك الحظر'); spLoadBans(); }
-            catch (e) { toast(e.message); }
-        }
-        async function spDeleteRow(id) {
-            if (!(await confirmModal('تبي تحذف هذا التكت نهائياً؟ ما يرجع بعد الحذف.'))) return;
-            try { await spApi('/api/support/admin/tickets/' + id, { method: 'DELETE' }); toast('🗑️ تم حذف التكت'); spaLoadList(); }
-            catch (e) { toast(e.message); }
-        }
-        async function spDeleteAllClosed() {
-            if (!(await confirmModal('تبي تحذف كل التكتات المغلقة نهائياً؟ ما ترجع بعد الحذف.'))) return;
-            try { var d = await spApi('/api/support/admin/closed', { method: 'DELETE' }); toast('🗑️ انحذف ' + (d.deleted || 0) + ' تكت'); spaLoadList(); }
-            catch (e) { toast(e.message); }
-        }
-        function spaShowList() {
-            SP.cur = null; SP.img = null;
-            var senior = !!(ME && ME.isSeniorAdmin);
-            var tabs = senior ? [['waiting', '⏳ انتظار الإدارة'], ['active', '✅ قيد المتابعة'], ['ai', '🤖 عند المساعد'], ['closed', '🔒 مغلقة'], ['rates', '⭐ التقييمات'], ['bans', '🚫 المحظورين']] : [['waiting', '⏳ انتظار الإدارة']];
-            if (!senior) SP.atab = 'waiting';
-            document.getElementById('spa-tabs').innerHTML = tabs.map(function (t) {
-                return '<button class="sp-tab ' + (SP.atab === t[0] ? 'on' : '') + '" onclick="SP.atab=&quot;' + t[0] + '&quot;;spaShowList()">' + t[1] + '</button>';
-            }).join('');
-            document.getElementById('spa-body').innerHTML = '<div id="spa-list"><div style="color:var(--muted);text-align:center;padding:20px;">جارِ التحميل...</div></div>';
-            spaLoadList();
-        }
-        async function spaLoadList() {
-            var box = document.getElementById('spa-list'); if (!box) return;
-            if (SP.atab === 'bans') return spLoadBans();
-            if (SP.atab === 'rates') return spLoadRatings();
-            try {
-                var d = await spApi('/api/support/admin/tickets?status=' + SP.atab);
-                if (!d.tickets.length) { box.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px;">ما فيه تكتات هنا</div>'; return; }
-                var canDel = !!(ME && ME.isSeniorAdmin) && SP.atab === 'closed';
-                box.innerHTML = (canDel ? '<button class="sp-btn" style="margin-bottom:12px;background:#b91c1c;" onclick="spDeleteAllClosed()">🗑️ حذف كل التكتات المغلقة</button>' : '') + d.tickets.map(function (t) {
-                    return '<div class="sp-row" onclick="spOpenTicket(&quot;' + t.id + '&quot;,&quot;admin&quot;,&quot;spa-body&quot;)">' +
-                        '<div class="t1"><span>#' + t.no + ' — ' + spEsc(t.name) + (t.guest ? ' (زائر)' : '') + (t.unread ? '<span class="sp-badge">' + t.unread + '</span>' : '') + '</span><span class="sp-chip ' + t.status + '">' + SP_ST[t.status] + (t.adminName ? ' — ' + spEsc(t.adminName) : '') + '</span></div>' +
-                        '<div class="t2">' + spEsc(t.category) + (t.place ? ' • ' + spEsc(t.place) : '') + '</div>' +
-                        '<div class="t2">' + spEsc(t.last || '') + '</div>' +
-                        (canDel ? '<div style="margin-top:8px;"><button class="sp-link" style="color:#fca5a5;" onclick="event.stopPropagation();spDeleteRow(&quot;' + t.id + '&quot;)">🗑️ حذف</button></div>' : '') +
-                        '</div>';
-                }).join('');
-            } catch (e) { box.innerHTML = '<div style="color:#fca5a5;">' + spEsc(e.message) + '</div>'; }
-        }
-
-        // ═══════════ بطاقة بنك فلاش الجديدة ═══════════
-        var FBC_THEMES = {
-            blue:   { c1: '#1e40af', c2: '#0b1b44', ac: '#93c5fd' },
-            green:  { c1: '#15803d', c2: '#052e16', ac: '#86efac' },
-            red:    { c1: '#b91c1c', c2: '#3b0a0a', ac: '#fca5a5' },
-            gold:   { c1: '#b45309', c2: '#3b1d03', ac: '#fde68a' },
-            purple: { c1: '#6d28d9', c2: '#1e0a4a', ac: '#c4b5fd' },
-            black:  { c1: '#334155', c2: '#020617', ac: '#cbd5e1' }
-        };
-        function fbcFlip(el) { el.classList.toggle('flip'); }
-        function fbcEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
-        function bankCardHtml(c, o) {
-            o = o || {};
-            var th = FBC_THEMES[c.cardColor] || FBC_THEMES.blue;
-            var exp = o.expiryStr || (c.cardExpiry ? new Date(c.cardExpiry).toLocaleDateString('en-US', { month: '2-digit', year: '2-digit' }) : '--/--');
-            var cvv = o.hideCvv ? '•••' : fbcEsc(c.cardCVV || '---');
-            var logo = '<svg viewBox="0 0 100 100" width="34" height="34"><defs><linearGradient id="fbcg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fef08a"/><stop offset="1" stop-color="#f59e0b"/></linearGradient></defs><circle cx="50" cy="50" r="46" fill="rgba(255,255,255,.10)" stroke="rgba(255,255,255,.6)" stroke-width="3"/><path d="M57 10 28 55h19l-7 35 32-47H52z" fill="url(#fbcg)"/></svg>';
-            var chip = '<svg viewBox="0 0 50 38" width="46" height="35"><rect width="50" height="38" rx="7" fill="#e5c76b"/><rect x="1.5" y="1.5" width="47" height="35" rx="6" fill="none" stroke="rgba(0,0,0,.25)"/><path d="M0 13h14M0 25h14M36 13h14M36 25h14M14 0v38M36 0v38M14 19h22" stroke="rgba(0,0,0,.35)" fill="none"/></svg>';
-            var wifi = '<svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="rgba(255,255,255,.85)" stroke-width="2" stroke-linecap="round"><path d="M8.5 15.5a5 5 0 0 1 0-7"/><path d="M12 18.5a9 9 0 0 0 0-13"/><path d="M15.5 21.5a13 13 0 0 0 0-19"/></svg>';
-            var frozen = c.cardFrozen ? '<div class="fbc-frozen">🔒 مجمّدة</div>' : '';
-            return '<div class="fbc-wrap"><div class="fbc" style="--c1:' + th.c1 + ';--c2:' + th.c2 + ';--ac:' + th.ac + ';" onclick="fbcFlip(this)">' +
-                '<div class="fbc-face fbc-front"><div class="fbc-shine"></div>' + frozen +
-                '<div class="fbc-top"><div class="fbc-brand">' + logo + '<div><b>FLASH BANK</b><small>بنك فلاش</small></div></div>' + wifi + '</div>' +
-                '<div class="fbc-chip">' + chip + '<span>DEBIT</span></div>' +
-                '<div class="fbc-num">' + fbcEsc(c.cardNumber || '#### #### #### ####') + '</div>' +
-                '<div class="fbc-bot"><div><small>CARD HOLDER</small><div class="fbc-hn">' + fbcEsc(c.cardHolderName || '---') + '</div></div>' +
-                '<div><small>EXPIRES</small><div style="' + (o.expired ? 'color:#fca5a5;' : '') + '">' + exp + '</div></div></div></div>' +
-                '<div class="fbc-face fbc-back"><div class="fbc-strip"></div>' +
-                '<div class="fbc-sign"><div class="fbc-sigbox">⚡ FLASH BANK</div><div class="fbc-cvv"><small>CVV</small><b>' + cvv + '</b></div></div>' +
-                '<div class="fbc-note">🔒 الرقم السري غير مطبوع على البطاقة ولا يعرفه أحد، احفظه في ذاكرتك.</div>' +
-                '<div class="fbc-tap">اضغط لقلب البطاقة</div></div>' +
-                '</div></div>';
-        }
-        async function ccResetPin(id) {
-            if (!(await uiConfirm('تبي تعيد تعيين الرقم السري لهذه البطاقة؟', { title: '🔄 إعادة تعيين الرقم السري', okText: 'نعم، أعد التعيين', detail: 'الرقم القديم يتمسح، والعضو يحط رقم جديد بنفسه. الرقم السري ما يظهر لأحد.' }))) return;
-            const res = await fetch('/api/superadmin/cards/' + id + '/pin', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-            const data = await res.json();
-            showMsg('cc-msg-' + id, data.msg, data.success ? 'success' : 'danger');
-            if (data.success) loadCardControlPanel();
-        }
-
-
-        // ═══════════ سجل البنك: حذف شامل مرة وحدة + المالك يحذف سجل بالسحب لليمين ═══════════
-        let bankLogAllowClear = false, bankLogCanDeleteEach = false;
-        async function loadBankLog() {
-            const res = await fetch('/api/superadmin/logs');
-            const data = await res.json();
-            const logs = (data && data.list) || [];
-            bankLogAllowClear = !!(data && data.logClearAvailable);
-            bankLogCanDeleteEach = !!(data && data.canDeleteEach);
-            const container = document.getElementById('bank-log-container');
-            const clearBox = bankLogAllowClear
-                ? '<div class="card" style="border-color:#7f1d1d; display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;"><div><b style="color:#f87171;">🗑️ حذف اللوق الشامل</b><div style="font-size:0.8rem; color:#94a3b8; margin-top:3px;">يشتغل مرة وحدة بس، وبعدها الزر يختفي.</div></div><button class="btn btn-red" onclick="clearAllBankLogs()">🗑️ حذف الكل</button></div>'
-                : '';
-            if (!logs.length) { container.innerHTML = clearBox + '<p style="color:#64748b; text-align:center; padding:20px;">لا توجد أحداث مسجلة.</p>'; return; }
-            const actionColor = { register: '#4ade80', transfer: '#60a5fa', transfer_fee: '#94a3b8', loan_approve: '#4ade80', loan_reject: '#fca5a5', card_approve: '#4ade80', card_reject: '#fca5a5', manual_deposit: '#4ade80', manual_deduct: '#fca5a5', card_pin_reset: '#fde047', clear_log: '#f87171' };
-            container.innerHTML = clearBox + logs.map(function (l) {
-                var col = actionColor[l.action] || '#64748b';
-                return '<div class="blog-item" data-lid="' + l._id + '" style="padding:8px 12px; border-right:3px solid ' + col + '; background:rgba(255,255,255,0.02); border-radius:6px; margin-bottom:6px;">' +
-                    '<div style="display:flex; justify-content:space-between; flex-wrap:wrap; gap:4px;"><span style="color:' + col + '; font-size:0.8rem; font-weight:bold;">' + String(l.action || '').replace(/_/g, ' ').toUpperCase() + '</span>' +
-                    '<span style="color:#475569; font-size:0.75rem;">' + new Date(l.createdAt).toLocaleString('ar-SA') + '</span></div>' +
-                    '<p style="font-size:0.83rem; margin-top:3px;">' + fbcEsc(l.description) + '</p>' +
-                    (l.performedByTag ? '<p style="color:#64748b; font-size:0.75rem; margin-top:2px;">بواسطة: ' + fbcEsc(l.performedByTag) + '</p>' : '') + '</div>';
-            }).join('');
-            if (bankLogCanDeleteEach) bindBankLogSwipe(container);
-        }
-        async function clearAllBankLogs() {
-            if (!(await uiConfirm('بيتحذف كل اللوق الشامل نهائياً، والزر ما يرجع بعدها. متأكد؟', { title: '🗑️ حذف اللوق الشامل', danger: true, okText: 'نعم، احذف الكل' }))) return;
-            const res = await fetch('/api/superadmin/logs/clear', { method: 'POST' });
-            const data = await res.json();
-            if (data.success) { uiToast('تم حذف اللوق الشامل', 'success'); } else { uiToast(data.msg || 'تعذر الحذف', 'danger'); }
-            loadBankLog();
-        }
-        function bindBankLogSwipe(container) {
-            Array.prototype.forEach.call(container.querySelectorAll('.blog-item[data-lid]'), function (el) {
-                var sx = 0, sy = 0, dx = 0, on = false;
-                el.style.touchAction = 'pan-y';
-                el.addEventListener('pointerdown', function (e) { on = true; sx = e.clientX; sy = e.clientY; dx = 0; el.style.transition = 'none'; try { el.setPointerCapture(e.pointerId); } catch (x) {} });
-                el.addEventListener('pointermove', function (e) {
-                    if (!on) return;
-                    dx = e.clientX - sx;
-                    if (Math.abs(e.clientY - sy) > Math.abs(dx) + 12) { on = false; el.style.transform = ''; el.style.opacity = ''; return; }
-                    if (dx > 0) { el.style.transform = 'translateX(' + dx + 'px)'; el.style.opacity = String(Math.max(0.25, 1 - dx / 300)); }
-                });
-                var end = async function () {
-                    if (!on) return;
-                    on = false;
-                    el.style.transition = 'transform .2s, opacity .2s';
-                    if (dx < 120) { el.style.transform = ''; el.style.opacity = ''; return; }
-                    el.style.transform = 'translateX(110%)'; el.style.opacity = '0';
-                    try {
-                        const r = await fetch('/api/superadmin/logs/' + el.dataset.lid, { method: 'DELETE' });
-                        const d = await r.json();
-                        if (!d.success) throw new Error(d.msg || 'تعذر الحذف');
-                        setTimeout(function () { el.remove(); }, 200);
-                    } catch (e) { el.style.transform = ''; el.style.opacity = ''; uiToast(e.message, 'danger'); }
-                };
-                el.addEventListener('pointerup', end);
-                el.addEventListener('pointercancel', end);
-            });
-        }
-
-
-        // ═══════════ الملفات البنكية (كبار المسؤولين) ═══════════
-        var profTimer = null;
-        function fmtMoney(n) { return (Number(n) || 0).toLocaleString('en-US') + ' $'; }
-        function fmtDT(d) { try { return new Date(d).toLocaleString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); } catch (e) { return '—'; } }
-        function loadProfilesPanel() {
-            var box = document.getElementById('profiles-container');
-            box.innerHTML = '<div class="card card-blue"><h2>🗂️ الملفات البنكية</h2><p style="color:#94a3b8; font-size:0.85rem; margin-bottom:10px;">ابحث باسم العضو أو رقم حسابه أو رقم بطاقته أو رتبته، ويطلع لك ملفه البنكي كامل.</p>' +
-                '<input id="prof-q" placeholder="🔍 اسم / رقم حساب / رقم بطاقة / رتبة" autocomplete="off" oninput="profSearchSoon()" /><div id="prof-results"></div></div><div id="prof-view"></div>';
-        }
-        function profSearchSoon() { clearTimeout(profTimer); profTimer = setTimeout(profSearch, 300); }
-        async function profSearch() {
-            var q = (document.getElementById('prof-q') || {}).value || '';
-            var box = document.getElementById('prof-results'); if (!box) return;
-            if (q.trim().length < 2) { box.innerHTML = ''; return; }
-            box.innerHTML = '<p style="color:#64748b; padding:8px;">جارِ البحث...</p>';
-            try {
-                var res = await fetch('/api/senior/profiles?q=' + encodeURIComponent(q.trim()));
-                var list = await res.json();
-                if (!list.length) { box.innerHTML = '<p style="color:#64748b; padding:8px;">ما فيه نتائج.</p>'; return; }
-                box.innerHTML = list.map(function (a) {
-                    return '<div class="prof-row" data-uid="' + fbcEsc(a.uid) + '" onclick="loadProfile(this.dataset.uid)"><div><b>' + fbcEsc(a.name) + '</b> <span style="color:#64748b; font-size:0.78rem;">#' + fbcEsc(a.accountNumber) + '</span>' + (a.frozen ? ' <span class="frozen-badge">مجمّد</span>' : '') +
-                        '<div style="color:#94a3b8; font-size:0.78rem;">' + fbcEsc(a.rank || '—') + (a.unit ? ' • ' + fbcEsc(a.unit) : '') + (a.cards ? ' • 💳 ' + a.cards : '') + '</div></div><b style="color:#4ade80;">' + fmtMoney(a.balance) + '</b></div>';
-                }).join('');
-            } catch (e) { box.innerHTML = '<p style="color:#fca5a5;">تعذر البحث</p>'; }
-        }
-        function profTxRow(t) {
-            var inn = t.dir === 'in';
-            var labels = { transfer: 'حوالة', deposit: 'إيداع', withdraw: 'خصم', loan_receive: 'استلام قرض', loan_pay: 'سداد قرض', savings_deposit: 'إيداع توفير', savings_withdraw: 'سحب توفير', interest: 'فائدة', transfer_fee: 'رسوم تحويل', card_renewal_fee: 'رسوم تجديد بطاقة', violation_payment: 'سداد مخالفة' };
-            return '<div class="prof-tx"><div><b style="color:' + (inn ? '#4ade80' : '#f87171') + ';">' + (inn ? '⬇️ وارد' : '⬆️ صادر') + '</b> ' + fbcEsc(labels[t.type] || t.type) +
-                (t.otherName ? ' <span style="color:#94a3b8;">' + (inn ? 'من ' : 'إلى ') + fbcEsc(t.otherName) + '</span>' : '') +
-                (t.note ? '<div style="color:#64748b; font-size:0.75rem;">' + fbcEsc(t.note) + '</div>' : '') + '</div>' +
-                '<div style="text-align:left;"><b style="color:' + (inn ? '#4ade80' : '#f87171') + ';">' + (inn ? '+' : '-') + fmtMoney(t.amount) + '</b><div style="color:#475569; font-size:0.72rem;">' + fmtDT(t.at) + '</div></div></div>';
-        }
-        function profLastBox(title, t, color) {
-            if (!t) return '<div class="prof-last" style="border-color:#334155;"><small>' + title + '</small><div style="color:#64748b;">ما فيه</div></div>';
-            return '<div class="prof-last" style="border-color:' + color + ';"><small>' + title + '</small><b style="color:' + color + '; font-size:1.1rem;">' + fmtMoney(t.amount) + '</b><div style="font-size:0.78rem;">' + (t.dir === 'in' ? 'من ' : 'إلى ') + fbcEsc(t.otherName || t.otherAccount || '—') + '</div><div style="color:#64748b; font-size:0.72rem;">' + fmtDT(t.at) + '</div></div>';
-        }
-        async function loadProfile(uid) {
-            var view = document.getElementById('prof-view'); if (!view) return;
-            view.innerHTML = '<div class="card">جارِ تحميل الملف...</div>';
-            try {
-                var res = await fetch('/api/senior/profile/' + encodeURIComponent(uid));
-                var p = await res.json();
-                if (!p.success) { view.innerHTML = '<div class="card" style="color:#fca5a5;">' + fbcEsc(p.msg || 'تعذر التحميل') + '</div>'; return; }
-                var a = p.account, f = p.flash;
-                var roleNames = { user: 'عضو', staff: 'موظف', management: 'إدارة', admin: 'رئيس بنك', super_admin: 'كبار المسؤولين' };
-                var h = '<div class="card card-blue"><div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; align-items:flex-start;"><div><h2 style="border:none; margin:0 0 4px;">👤 ' + fbcEsc(a.name) + '</h2>' +
-                    '<div style="color:#94a3b8; font-size:0.85rem;">رقم الحساب: <b style="color:#e2e8f0;">' + fbcEsc(a.accountNumber) + '</b> • الصفة: ' + fbcEsc(roleNames[a.role] || a.role) + '</div>' +
-                    (f ? '<div style="color:#94a3b8; font-size:0.85rem;">⚡ فلاش: ' + fbcEsc(f.name || '') + ' • الرتبة: ' + fbcEsc(f.rank || '—') + ' • اليونت: ' + fbcEsc(f.unit || '—') + '</div>' : '') + '</div>' +
-                    (a.frozen ? '<span class="frozen-badge">🔒 الحساب مجمّد</span>' : '<span style="color:#4ade80; font-size:0.85rem;">✅ الحساب نشط</span>') + '</div></div>';
-                h += '<div class="card"><h2>🏦 حسابه البنكي الحين</h2><div class="prof-grid">' +
-                    '<div class="prof-stat"><small>الرصيد</small><b style="color:#4ade80;">' + fmtMoney(a.balance) + '</b></div>' +
-                    '<div class="prof-stat"><small>التوفير</small><b style="color:#60a5fa;">' + fmtMoney(a.savings) + '</b></div>' +
-                    '<div class="prof-stat"><small>إجمالي الوارد (حوالات)</small><b>' + fmtMoney(p.totals.in.total) + '</b><em>' + p.totals.in.n + ' حوالة</em></div>' +
-                    '<div class="prof-stat"><small>إجمالي الصادر (حوالات)</small><b>' + fmtMoney(p.totals.out.total) + '</b><em>' + p.totals.out.n + ' حوالة</em></div>' +
-                    '<div class="prof-stat"><small>فُتح الحساب</small><b style="font-size:0.85rem;">' + fmtDT(a.createdAt) + '</b></div>' +
-                    '<div class="prof-stat"><small>حد البطاقات</small><b>' + a.cardLimitEffective + '</b><em>' + (a.cardLimit === -1 ? 'حسب الإعداد العام' : 'مخصص') + '</em></div>' +
-                    '<div class="prof-stat"><small>حظر الدعم</small><b>' + (a.supportBanned ? '🚫 محظور' : 'لا') + '</b></div>' +
-                    '<div class="prof-stat"><small>تكتاته</small><b>' + p.tickets.total + '</b><em>' + p.tickets.open + ' مفتوح</em></div></div></div>';
-                h += '<div class="card"><h2>💳 البطاقات</h2>';
-                var shown = p.cards.filter(function (c) { return c.status === 'approved' || c.status === 'disabled'; });
-                if (!shown.length) h += '<p style="color:#64748b;">ما عنده بطاقة مفعّلة.</p>';
-                shown.forEach(function (c) {
-                    var st = c.status === 'disabled' ? '🚫 معطّلة من الإدارة' : (c.cardFrozen ? '🔒 مجمّدة' : '✅ مفعّلة');
-                    h += '<div style="margin-bottom:18px;">' + bankCardHtml(c, { hideCvv: true }) +
-                        '<div class="prof-cardinfo"><span>الحالة: <b>' + st + '</b></span><span>رقم البطاقة: <b dir="ltr">' + fbcEsc(c.cardNumber) + '</b></span><span>الحامل: <b>' + fbcEsc(c.cardHolderName) + '</b></span>' +
-                        '<span>الانتهاء: <b>' + (c.cardExpiry ? new Date(c.cardExpiry).toLocaleDateString('ar-SA-u-ca-gregory') : 'غير محدد') + '</b></span><span>اللون: <b>' + fbcEsc(c.cardColor) + '</b></span>' +
-                        '<span>الرقم السري: <b>' + (c.pinSet ? '🔒 معيّن (مخفي — ما أحد يعرفه)' : 'لم يُعيَّن بعد') + '</b></span><span>رتبته في الطلب: <b>' + fbcEsc(c.militaryRank || '—') + ' / ' + fbcEsc(c.militarySector || '—') + '</b></span></div></div>';
-                });
-                var others = p.cards.filter(function (c) { return c.status !== 'approved' && c.status !== 'disabled'; });
-                if (others.length) h += '<p style="color:#64748b; font-size:0.8rem;">طلبات أخرى: ' + others.map(function (c) { return ({ pending: 'معلّق', rejected: 'مرفوض', expired: 'منتهي' }[c.status] || c.status); }).join('، ') + '</p>';
-                h += '</div>';
-                h += '<div class="card"><h2>💸 آخر حوالة</h2><div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">' + profLastBox('⬇️ آخر حوالة واردة', p.lastIn, '#4ade80') + profLastBox('⬆️ آخر حوالة صادرة', p.lastOut, '#f87171') + '</div></div>';
-                if (p.loans.length) h += '<div class="card"><h2>📋 القروض</h2>' + p.loans.map(function (l) { return '<div class="prof-tx"><div>' + (l.status === 'pending' ? '⏳ معلّق' : '✅ شغّال') + ' — ' + fmtMoney(l.amount) + '</div><div>المتبقي: <b>' + fmtMoney(l.remaining) + '</b></div></div>'; }).join('') + '</div>';
-                h += '<div class="card"><h2>📜 سجل الحوالات والحركات (آخر ' + p.transfers.length + ')</h2>' + (p.transfers.length ? p.transfers.map(profTxRow).join('') : '<p style="color:#64748b;">ما فيه حركات.</p>') + '</div>';
-                view.innerHTML = h;
-                view.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            } catch (e) { view.innerHTML = '<div class="card" style="color:#fca5a5;">تعذر تحميل الملف</div>'; }
-        }
-
-
-        // ═══════════ التحديث التلقائي (بولنق) ═══════════
         function silentRefreshCurrentPage() {
             try {
                 if (document.hidden) { pendingSilentRefresh = true; return; }
@@ -6903,7 +5250,6 @@ app.use(async (req, res) => {
                 const typing = ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName);
                 let modalOpen = false;
                 document.querySelectorAll('.custom-modal').forEach(function(m) { if (getComputedStyle(m).display !== 'none') modalOpen = true; });
-                if (document.getElementById('sp-modal').classList.contains('open')) modalOpen = true;
                 if (typing || modalOpen) { pendingSilentRefresh = true; return; }
                 pendingSilentRefresh = false;
                 const pg = document.querySelector('.page.active');
@@ -6920,73 +5266,12 @@ app.use(async (req, res) => {
         }
         document.addEventListener('visibilitychange', function() { if (!document.hidden && pendingSilentRefresh) silentRefreshCurrentPage(); });
 
-        function startUserPolling() {
-            if (pollInterval) clearInterval(pollInterval);
-            pollInterval = setInterval(async () => {
-                try {
-                    const res = await fetch('/api/poll/user');
-                    const data = await res.json();
-                    if (!data || Object.keys(data).length === 0) return;
-                    if (data.unreadCount !== undefined && data.unreadCount !== lastUnreadCount) {
-                        lastUnreadCount = data.unreadCount;
-                        loadNotifCount();
-                    }
-                    if (data.latestUnreadId !== undefined) handleNotifPush(data.latestUnreadId);
-                    if (currentAccount && (data.balance !== undefined || data.isFrozen !== undefined)) {
-                        const changed = currentAccount.balance !== data.balance
-                            || currentAccount.savingsBalance !== data.savingsBalance
-                            || currentAccount.isFrozen !== data.isFrozen;
-                        currentAccount.balance = data.balance;
-                        currentAccount.savingsBalance = data.savingsBalance;
-                        currentAccount.isFrozen = data.isFrozen;
-                        if (changed) loadDashboard();
-                    }
-                    if (data.lastTicketActivity && lastSeenTicketActivity && data.lastTicketActivity !== lastSeenTicketActivity) {
-                        spBadges();
-                        if (SP.cur) spLoadNew();
-                        else if (document.getElementById('sp-list')) spLoadList();
-                    }
-                    if (data.lastTicketActivity) lastSeenTicketActivity = data.lastTicketActivity;
-                    if (data.lastActivity) {
-                        if (lastSeenActivity && data.lastActivity !== lastSeenActivity) silentRefreshCurrentPage();
-                        lastSeenActivity = data.lastActivity;
-                    }
-                    if (pendingSilentRefresh) silentRefreshCurrentPage();
-                } catch(e) {}
-            }, 2000);
-        }
 
-        function startAdminPolling() {
-            if (adminPollInterval) clearInterval(adminPollInterval);
-            adminPollInterval = setInterval(async () => {
-                try {
-                    const res = await fetch('/api/poll/admin');
-                    const data = await res.json();
-                    if (!data || Object.keys(data).length === 0) return;
-                    const supportTab = document.getElementById('atab-support');
-                    if (supportTab) supportTab.textContent = data.openTickets > 0 ? ('🎧 الدعم (' + data.openTickets + ')') : '🎧 الدعم';
-                    const ticketActivityChanged = data.lastTicketActivity && lastSeenAdminTicketActivity && data.lastTicketActivity !== lastSeenAdminTicketActivity;
-                    if (ticketActivityChanged) {
-                        spBadges();
-                        if (SP.cur) spLoadNew();
-                        else if (document.getElementById('spa-list')) spaLoadList();
-                    }
-                    const activityChanged = data.lastActivity && lastSeenAdminActivity && data.lastActivity !== lastSeenAdminActivity;
-                    if (activityChanged) {
-                        const vis = function (id) { const e = document.getElementById(id); return e && e.style.display !== 'none'; };
-                        if (vis('atab-accounts-section') && typeof loadAdminAccounts === 'function') loadAdminAccounts();
-                        if (vis('atab-loans-section') && typeof loadAdminLoans === 'function') loadAdminLoans();
-                        if (vis('atab-cards-section') && typeof loadAdminCards === 'function') loadAdminCards();
-                        if (vis('atab-bank-log-section') && typeof loadBankLog === 'function') loadBankLog();
-                    }
-                    if (data.lastActivity) lastSeenAdminActivity = data.lastActivity;
-                    if (data.lastTicketActivity) lastSeenAdminTicketActivity = data.lastTicketActivity;
-                } catch(e) {}
-            }, 2000);
-        }
+
 
         init();
     </script>
+    <script>${BANK_EXT_JS}</script>
 
 <footer style="text-align: center; padding: 1.5rem; margin-top: 2rem; border-top: 1px solid rgba(59,130,246,0.2); background: rgba(5,15,30,0.8); color: #475569; font-size: 0.9rem;">
     <p>جميع الحقوق محفوظة © 2026 | <span style="color: #3b82f6; font-weight: bold;">بنك فلاش — Flash Bank</span></p>
