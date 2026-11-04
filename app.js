@@ -98,9 +98,66 @@ const LoanSchema = new mongoose.Schema({
     status: { type: String, default: "pending" }, // pending / approved / rejected / paid / expired
     requestedAt: { type: Date, default: Date.now },
     approvedAt: Date,
-    expiresAt: Date  // تاريخ انتهاء صلاحية القرض (إن وجد)
+    expiresAt: Date,  // تاريخ انتهاء صلاحية القرض (إن وجد)
+    closedAt: Date,   // تاريخ إقفال القرض من الإدارة (سداد / إنهاء)
+    closedBy: String, // discord id للإداري اللي أقفله
+    closeType: String, // admin_pay (سداد من رصيد العميل) / admin_end (إنهاء من الإدارة) / auto_expiry (انتهاء بالتاريخ)
+    graceEndsAt: Date,       // نهاية مهلة السداد بعد انتهاء القرض (status = expired)؛ بعدها تتوقف خدمات العميل لين يسدد
+    suspendNotified: Boolean, // انرسل للعميل إشعار إيقاف الخدمات
+    lastRemindAt: Date        // آخر تذكير سداد أرسلته الإدارة للعميل
 });
 const Loan = mongoose.model("Loan", LoanSchema);
+
+// ═══ نظام انتهاء القرض ═══
+// القرض المنتهي (status = 'expired') وعليه متبقي: العميل عنده مهلة LOAN_GRACE_DAYS أيام يسدد فيها (يظل يقدر يسدد).
+// بعد المهلة = إيقاف خدمات: ما يحوّل، ما يطلب قرض، ما يطلب بطاقة جديدة. يقدر يستقبل حوالات بس كل حوالة ما تتجاوز المتبقي عليه.
+// الإيقاف يزول تلقائياً أول ما يسدد كامل المتبقي (القرض يصير paid).
+const LOAN_GRACE_DAYS = 5;
+const LOAN_GRACE_MS = LOAN_GRACE_DAYS * 24 * 60 * 60 * 1000;
+const LOAN_REMIND_BEFORE_MS = 2 * 24 * 60 * 60 * 1000; // زر «تذكير بالسداد» يفتح للإدارة قبل انتهاء القرض بيومين (نفس الرقم في الواجهة BK2_REMIND_BEFORE_DAYS)
+const LOAN_REMIND_COOLDOWN_MS = 60 * 60 * 1000;          // أقل مدة بين تذكيرين لنفس القرض
+const LOAN_AUTO_EXPIRE = true; // true = القرض اللي يعدّي تاريخ انتهائه (expiresAt) ينتهي تلقائياً بنفس النظام (مهلة 5 أيام من لحظة انتهائه). غيّرها لـ false لو تبي التاريخ للتذكير فقط
+async function getLoanSuspension(discord) {
+    return Loan.findOne({ discord, status: 'expired', remaining: { $gt: 0 }, graceEndsAt: { $lte: new Date() } }).lean();
+}
+async function startLoanGrace(id, actor) {
+    const now = new Date();
+    const l = await Loan.findOneAndUpdate(
+        { _id: id, status: 'approved', remaining: { $gt: 0 } },
+        { status: 'expired', closedAt: now, closedBy: actor ? actor.id : null, closeType: actor ? 'admin_end' : 'auto_expiry', graceEndsAt: new Date(now.getTime() + LOAN_GRACE_MS), suspendNotified: false },
+        { new: true }
+    );
+    if (!l) return null;
+    await Notification.create({
+        discord: l.discord,
+        message: `⚠️ انتهت صلاحية قرضك (المتبقي ${(l.remaining || 0).toLocaleString()} $). عندك مهلة ${LOAN_GRACE_DAYS} أيام للسداد (لين ${l.graceEndsAt.toLocaleDateString('ar-SA')}) وإلا تُوقف خدماتك: التحويل وطلب قرض وطلب بطاقة جديدة.`,
+        type: 'warning'
+    });
+    await BankLog.create({
+        action: 'loan_end',
+        description: `إنهاء قرض ${l.discordTag} (المتبقي ${(l.remaining || 0).toLocaleString()} $) — مهلة سداد ${LOAN_GRACE_DAYS} أيام${actor ? '' : ' (انتهاء تلقائي بالتاريخ)'}`,
+        performedBy: actor ? actor.id : 'system', performedByTag: actor ? actor.username : 'النظام',
+        targetDiscord: l.discord, targetTag: l.discordTag,
+        meta: { loanId: String(l._id), amount: l.amount, remaining: l.remaining, graceEndsAt: l.graceEndsAt }
+    });
+    return l;
+}
+// فحص دوري كل دقيقة: انتهاء القروض بالتاريخ + إشعار إيقاف الخدمات بعد انتهاء المهلة
+setInterval(async () => {
+    try {
+        const now = new Date();
+        if (LOAN_AUTO_EXPIRE) {
+            const due = await Loan.find({ status: 'approved', remaining: { $gt: 0 }, expiresAt: { $lte: now } }).limit(50).select('_id').lean();
+            for (const d of due) await startLoanGrace(d._id, null);
+        }
+        const over = await Loan.find({ status: 'expired', remaining: { $gt: 0 }, graceEndsAt: { $lte: now }, suspendNotified: { $ne: true } }).limit(50).lean();
+        for (const l of over) {
+            const u = await Loan.updateOne({ _id: l._id, suspendNotified: { $ne: true } }, { suspendNotified: true });
+            if (!u.modifiedCount) continue;
+            await Notification.create({ discord: l.discord, message: `🚫 انتهت مهلة سداد قرضك وتم إيقاف خدماتك (التحويل، طلب قرض، طلب بطاقة جديدة). سدّد المتبقي ${(l.remaining || 0).toLocaleString()} $ لإعادة تفعيلها. تقدر تستقبل حوالات بحد أقصى المتبقي عليك.`, type: 'danger' });
+        }
+    } catch (e) { console.log('❌ فحص انتهاء القروض:', e.message); }
+}, 60 * 1000);
 
 // الإشعارات
 const NotificationSchema = new mongoose.Schema({
@@ -1159,6 +1216,7 @@ loadAdminLoans = async function () {
     var cont = document.getElementById('admin-loans-container'); if (!cont) return;
     var pending = loans.filter(function (l) { return l.status === 'pending'; });
     var active = loans.filter(function (l) { return l.status === 'approved' && (l.remaining || 0) > 0; });
+    var ended = loans.filter(function (l) { return l.status === 'expired' && (l.remaining || 0) > 0; });
     var totRem = active.reduce(function (s, l) { return s + (l.remaining || 0); }, 0);
     function exp(l) {
         return l.expiresAt ? '<p style="color:' + (new Date(l.expiresAt) < new Date() ? '#fca5a5' : '#fde047') + ';font-size:.78rem;margin-top:3px">⏳ ينتهي: ' + new Date(l.expiresAt).toLocaleDateString('ar-SA') + '</p>' : '<p style="color:#64748b;font-size:.78rem;margin-top:3px">⏳ بدون تاريخ انتهاء</p>';
@@ -1176,10 +1234,64 @@ loadAdminLoans = async function () {
         return '<div class="card card-green" style="margin-bottom:10px"><b>' + bk2Esc(l.discordTag) + '</b>' +
             '<p style="margin-top:5px">المبلغ: <b style="color:#fde047">' + (l.amount || 0).toLocaleString() + ' $</b> — المتبقي: <b style="color:#fca5a5">' + (l.remaining || 0).toLocaleString() + ' $</b></p>' +
             '<div style="background:#0b1424;border-radius:6px;height:7px;margin-top:6px;overflow:hidden"><i style="display:block;height:100%;width:' + paidPct + '%;background:#4ade80"></i></div>' +
-            '<p style="color:#64748b;font-size:.76rem;margin-top:3px">مسدّد ' + paidPct + '% — بدأ ' + (l.approvedAt ? new Date(l.approvedAt).toLocaleDateString('ar-SA') : '—') + '</p>' + exp(l) + '</div>';
+            '<p style="color:#64748b;font-size:.76rem;margin-top:3px">مسدّد ' + paidPct + '% — بدأ ' + (l.approvedAt ? new Date(l.approvedAt).toLocaleDateString('ar-SA') : '—') + '</p>' + exp(l) +
+            (l.expiresAt ? '<p style="margin-top:4px;font-size:.85rem;color:#fde047">⏱️ باقي على انتهاء القرض: ' + bk2CdHtml(l.expiresAt, 'expiry') + '</p>' : '') +
+            '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">' +
+                bk2RemindBtn(l._id, l.expiresAt ? new Date(l.expiresAt).getTime() - BK2_REMIND_BEFORE_DAYS * 86400000 : null) +
+                (bk2IsSenior() ? '<button class="btn btn-green" style="padding:6px 14px" onclick="bk2LoanAct(\'' + l._id + '\',\'pay\')">💰 سداد القرض</button>' : '') +
+                '<button class="btn btn-red" style="padding:6px 14px" onclick="bk2LoanAct(\'' + l._id + '\',\'end\')">🛑 إنهاء القرض</button>' +
+            '</div>' +
+            '<p style="color:#64748b;font-size:.72rem;margin-top:6px">🔔 تذكير: مقفول لين يقرب انتهاء القرض (قبل ' + BK2_REMIND_BEFORE_DAYS + ' أيام) — ' + (bk2IsSenior() ? '💰 سداد: يُخصم المتبقي من رصيد العميل ويُقفل القرض — ' : '') + '🛑 إنهاء: ينتهي القرض ويعطي العميل مهلة 5 أيام للسداد وبعدها تتوقف خدماته</p></div>';
     }).join('') : '<p style="color:#64748b;text-align:center;padding:12px">ما فيه قروض نشطة.</p>';
+    // قروض منتهية عليها متبقي: مهلة 5 أيام ثم إيقاف خدمات العميل لين يسدد
+    h += '<h3 style="color:#fca5a5;margin:18px 0 8px">⚠️ قروض منتهية بانتظار السداد (' + ended.length + ')</h3>';
+    h += ended.length ? ended.map(function (l) {
+        var ge = l.graceEndsAt ? new Date(l.graceEndsAt) : null, susp = ge && ge.getTime() <= Date.now();
+        return '<div class="card" style="margin-bottom:10px;border-color:' + (susp ? '#ef4444' : '#f59e0b') + '"><b>' + bk2Esc(l.discordTag) + '</b>' +
+            '<p style="margin-top:5px">المبلغ: <b style="color:#fde047">' + (l.amount || 0).toLocaleString() + ' $</b> — المتبقي: <b style="color:#fca5a5">' + (l.remaining || 0).toLocaleString() + ' $</b></p>' +
+            '<p style="margin-top:4px;font-size:.82rem;color:' + (susp ? '#fca5a5' : '#fde047') + '">' + (susp ? '🚫 الخدمات موقوفة (انتهت المهلة ' + ge.toLocaleDateString('ar-SA') + ')' : '⏳ مهلة السداد لين ' + (ge ? ge.toLocaleString('ar-SA') : '—')) + '</p>' +
+            (ge && !susp ? '<p style="margin-top:4px;font-size:.85rem;color:#fde047">⏱️ باقي على إيقاف الخدمات: ' + bk2CdHtml(l.graceEndsAt, 'grace') + '</p>' : '') +
+            '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">' + bk2RemindBtn(l._id, 0) +
+                (bk2IsSenior() ? '<button class="btn btn-green" style="padding:6px 14px" onclick="bk2LoanAct(\'' + l._id + '\',\'pay\')">💰 سداد القرض</button>' : '') + '</div></div>';
+    }).join('') : '<p style="color:#64748b;text-align:center;padding:12px">ما فيه قروض منتهية.</p>';
+    window.BK2_LOANS = {}; loans.forEach(function (l) { window.BK2_LOANS[l._id] = l; });
     cont.innerHTML = h;
+    bk2CdTick();
 };
+// ── عدّاد مباشر (يوم/ساعة/دقيقة/ثانية) + زر «تذكير بالسداد» مقفول لين يقرب انتهاء القرض ──
+var BK2_REMIND_BEFORE_DAYS = 2; // لازم يطابق LOAN_REMIND_BEFORE_MS في السيرفر
+function bk2P2(n) { return (n < 10 ? '0' : '') + n; }
+function bk2CdHtml(ts, mode) { return '<span class="bk2-cd" data-t="' + ts + '" data-mode="' + mode + '" style="font-variant-numeric:tabular-nums;font-weight:800;direction:rtl;display:inline-block"></span>'; }
+function bk2RemindBtn(id, unlockAt) {
+    return '<button class="btn btn-yellow bk2-remind" data-unlock="' + (unlockAt === null ? 'never' : unlockAt) + '" style="padding:6px 14px" onclick="bk2LoanAct(\'' + id + '\',\'remind\')" disabled>🔒 تذكير بالسداد</button>';
+}
+function bk2CdTick() {
+    var now = Date.now();
+    document.querySelectorAll('.bk2-cd').forEach(function (n) {
+        var d = new Date(n.getAttribute('data-t')).getTime() - now;
+        if (!(d > 0)) { n.textContent = n.getAttribute('data-mode') === 'grace' ? '🚫 انتهت المهلة' : '⌛ انتهى القرض'; return; }
+        var s = Math.floor(d / 1000);
+        n.textContent = Math.floor(s / 86400) + ' يوم : ' + bk2P2(Math.floor(s % 86400 / 3600)) + ' ساعة : ' + bk2P2(Math.floor(s % 3600 / 60)) + ' دقيقة : ' + bk2P2(s % 60) + ' ثانية';
+    });
+    document.querySelectorAll('.bk2-remind').forEach(function (b) {
+        var u = b.getAttribute('data-unlock'), open = u !== 'never' && now >= Number(u);
+        b.disabled = !open; b.style.opacity = open ? '1' : '.55'; b.style.cursor = open ? 'pointer' : 'not-allowed';
+        b.textContent = open ? '🔔 تذكير بالسداد' : '🔒 تذكير بالسداد';
+        b.title = open ? 'يرسل تذكير للعميل' : (u === 'never' ? 'القرض بدون تاريخ انتهاء' : 'يفتح قبل انتهاء القرض بـ ' + BK2_REMIND_BEFORE_DAYS + ' أيام');
+    });
+}
+if (!window.BK2_CD_TIMER) window.BK2_CD_TIMER = setInterval(bk2CdTick, 1000);
+// سداد القرض (يخصم المتبقي من رصيد العميل) / إنهاء القرض (يعطي مهلة 5 أيام) / تذكير بالسداد
+async function bk2LoanAct(id, action) {
+    var l = (window.BK2_LOANS || {})[id] || {}, isPay = action === 'pay', rem = (l.remaining || 0).toLocaleString(), who = l.discordTag || 'العميل';
+    var msg = isPay ? 'سداد قرض ' + who + ': بيتم خصم ' + rem + ' $ من رصيده ويُقفل القرض.' : 'إنهاء قرض ' + who + ': بينتهي القرض وبيوصله تنبيه، وعنده مهلة 5 أيام يسدد فيها المتبقي (' + rem + ' $). بعد المهلة تتوقف خدماته (تحويل، قرض، بطاقة جديدة) لين يسدد. ما يُخصم شي من رصيده.';
+    var ok = true;
+    if (action !== 'remind') try { ok = await uiConfirm(msg, { title: isPay ? '💰 تأكيد سداد القرض' : '🛑 تأكيد إنهاء القرض', okText: isPay ? '💰 سداد' : '🛑 إنهاء', danger: !isPay }); } catch (e) { ok = confirm(msg); }
+    if (!ok) return;
+    var d = await fetch((window.BANK_BASE || '') + '/api/admin/loans/' + id + '/' + action, { method: 'PUT' }).then(function (r) { return r.json(); }).catch(function () { return { success: false, msg: 'تعذر الاتصال بالسيرفر' }; });
+    try { uiAlert(d.success ? (d.msg || 'تمت العملية') : (d.msg || 'تعذر التنفيذ'), d.success ? 'success' : 'danger'); } catch (e) {}
+    try { loadAdminLoans(); } catch (e) {}
+}
 
 // ── تمويل الرواتب (المالك يحدد الحساب، والباقي يشوفون الحالة فقط) ──
 (function () {
@@ -1709,10 +1821,14 @@ app.post('/api/account/transfer', checkMaintenance, async (req, res) => {
         if (!fromAcc) return res.json({ success: false, msg: "ليس لديك حساب" });
         if (fromAcc.isFrozen) return res.json({ success: false, msg: "حسابك مجمد، تواصل مع إدارة البنك" });
         if (fromAcc.accountNumber === toAccountNumber) return res.json({ success: false, msg: "لا يمكن التحويل لنفسك" });
+        if (await getLoanSuspension(req.user.id)) return res.json({ success: false, msg: "🚫 خدماتك موقوفة بسبب قرض منتهي لم يُسدَّد. سدّد القرض أولاً لإعادة تفعيل التحويل." });
 
         const toAcc = await Account.findOne({ accountNumber: toAccountNumber });
         if (!toAcc) return res.json({ success: false, msg: "رقم الحساب المستهدف غير موجود" });
         if (toAcc.isFrozen) return res.json({ success: false, msg: "الحساب المستهدف مجمد" });
+        // الحساب الموقوف بسبب قرض منتهي: يستقبل حوالات بس الحوالة ما تتجاوز المتبقي عليه من القرض
+        const toSus = await getLoanSuspension(toAcc.discord);
+        if (toSus && amountNum > (toSus.remaining || 0)) return res.json({ success: false, msg: `هذا الحساب موقوف بسبب قرض منتهي، أقصى مبلغ تقدر تحوله له ${(toSus.remaining || 0).toLocaleString()} $` });
 
         // رسوم التحويل
         let transferFee = settings?.transferFee || 0;
@@ -1835,7 +1951,8 @@ app.post('/api/account/loan/request', checkMaintenance, async (req, res) => {
         if (!acc) return res.json({ success: false, msg: "ليس لديك حساب" });
         if (acc.isFrozen) return res.json({ success: false, msg: "حسابك مجمد" });
 
-        const existLoan = await Loan.findOne({ discord: req.user.id, status: { $in: ['pending', 'approved'] } });
+        if (await getLoanSuspension(req.user.id)) return res.json({ success: false, msg: "🚫 خدماتك موقوفة بسبب قرض منتهي لم يُسدَّد، سدّده أولاً" });
+        const existLoan = await Loan.findOne({ discord: req.user.id, $or: [{ status: { $in: ['pending', 'approved'] } }, { status: 'expired', remaining: { $gt: 0 } }] });
         if (existLoan) return res.json({ success: false, msg: "عندك قرض قائم، سدد القرض الحالي أولاً" });
 
         await Loan.create({
@@ -1862,7 +1979,7 @@ app.post('/api/account/loan/pay', checkMaintenance, async (req, res) => {
         if (!acc) return res.json({ success: false, msg: "ليس لديك حساب" });
         if (acc.balance < amountNum) return res.json({ success: false, msg: "رصيدك غير كافٍ" });
 
-        const loan = await Loan.findOne({ discord: req.user.id, status: 'approved' });
+        const loan = await Loan.findOne({ discord: req.user.id, status: { $in: ['approved', 'expired'] }, remaining: { $gt: 0 } });
         if (!loan) return res.json({ success: false, msg: "ليس لديك قرض نشط" });
 
         const payAmount = Math.min(amountNum, loan.remaining);
@@ -1889,7 +2006,7 @@ app.post('/api/account/loan/pay', checkMaintenance, async (req, res) => {
 app.get('/api/account/loan', checkMaintenance, async (req, res) => {
     if (!req.isAuthenticated()) return res.json(null);
     try {
-        const loan = await Loan.findOne({ discord: req.user.id, status: { $in: ['pending', 'approved'] } });
+        const loan = await Loan.findOne({ discord: req.user.id, $or: [{ status: { $in: ['pending', 'approved'] } }, { status: 'expired', remaining: { $gt: 0 } }] });
         res.json(loan);
     } catch (e) { res.json(null); }
 });
@@ -2005,7 +2122,7 @@ app.post('/api/admin/accounts/:id/balance', isBankAdmin, async (req, res) => {
 
 app.get('/api/admin/loans', isStaffOrAbove, async (req, res) => {
     try {
-        const loans = await Loan.find({ status: { $in: ['pending', 'approved'] } }).sort({ requestedAt: -1 });
+        const loans = await Loan.find({ $or: [{ status: { $in: ['pending', 'approved'] } }, { status: 'expired', remaining: { $gt: 0 } }] }).sort({ requestedAt: -1 });
         res.json(loans);
     } catch (e) { res.json([]); }
 });
@@ -2038,6 +2155,76 @@ app.put('/api/admin/loans/:id/:action', isStaffOrAbove, async (req, res) => {
                 type: 'success'
             });
             await BankLog.create({ action: 'loan_approve', description: `موافقة على قرض ${loan.discordTag} بمبلغ ${loan.amount.toLocaleString()} $`, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: loan.discord, targetTag: loan.discordTag });
+        } else if (action === 'remind') {
+            // تذكير بالسداد: مقفول للإدارة لين يقرب انتهاء القرض (أو يكون منتهي بالمهلة)، وبعدها يرسل إشعار للعميل
+            const now = Date.now();
+            if (!(loan.remaining > 0)) return res.json({ success: false, msg: "ما فيه متبقي على هذا القرض" });
+            if (loan.status === 'approved') {
+                if (!loan.expiresAt) return res.json({ success: false, msg: "هذا القرض بدون تاريخ انتهاء" });
+                if (new Date(loan.expiresAt).getTime() - now > LOAN_REMIND_BEFORE_MS) return res.json({ success: false, msg: "🔒 التذكير ما يفتح إلا قبل انتهاء القرض بـ " + (LOAN_REMIND_BEFORE_MS / 86400000) + " أيام" });
+            } else if (loan.status !== 'expired') return res.json({ success: false, msg: "هذا القرض مو نشط" });
+            if (loan.lastRemindAt && now - new Date(loan.lastRemindAt).getTime() < LOAN_REMIND_COOLDOWN_MS) {
+                const wait = Math.ceil((LOAN_REMIND_COOLDOWN_MS - (now - new Date(loan.lastRemindAt).getTime())) / 60000);
+                return res.json({ success: false, msg: `تم إرسال تذكير قبل شوي، انتظر ${wait} دقيقة` });
+            }
+            const dueAt = loan.status === 'expired' ? loan.graceEndsAt : loan.expiresAt;
+            await Loan.findByIdAndUpdate(id, { lastRemindAt: new Date(now) });
+            await Notification.create({
+                discord: loan.discord,
+                message: loan.status === 'expired'
+                    ? `⏰ تذكير بسداد القرض: المتبقي ${(loan.remaining || 0).toLocaleString()} $ — مهلة السداد تنتهي ${dueAt ? new Date(dueAt).toLocaleString('ar-SA') : 'قريباً'} وبعدها تُوقف خدماتك.`
+                    : `⏰ تذكير بسداد القرض: المتبقي ${(loan.remaining || 0).toLocaleString()} $ — ينتهي القرض ${dueAt ? new Date(dueAt).toLocaleString('ar-SA') : 'قريباً'}، وبعدها عندك مهلة ${LOAN_GRACE_DAYS} أيام ثم تُوقف خدماتك.`,
+                type: 'warning'
+            });
+            await BankLog.create({ action: 'loan_remind', description: `تذكير بسداد قرض ${loan.discordTag} (المتبقي ${(loan.remaining || 0).toLocaleString()} $)`, performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: loan.discord, targetTag: loan.discordTag, meta: { loanId: String(loan._id) } });
+            bumpActivity();
+            return res.json({ success: true, msg: 'تم إرسال تذكير السداد للعميل' });
+        } else if (action === 'end') {
+            // إنهاء القرض: يصير «منتهي» والعميل ياخذ تنبيه + مهلة 5 أيام يسدد فيها، وبعدها إيقاف خدمات (بدون أي خصم من رصيده)
+            const l = await startLoanGrace(id, req.user);
+            if (!l) return res.json({ success: false, msg: "هذا القرض مو نشط (يمكن انسدد أو انتهى قبل)" });
+            bumpActivity();
+            return res.json({ success: true, msg: `تم إنهاء القرض — العميل عنده مهلة ${LOAN_GRACE_DAYS} أيام للسداد (لين ${l.graceEndsAt.toLocaleDateString('ar-SA')}) وبعدها تتوقف خدماته` });
+        } else if (action === 'pay') {
+            // سداد القرض: للكبار (super_admin) فقط — يخصم المتبقي من رصيد العميل ويقفل القرض (مسدّد)، ويشتغل على القرض النشط والمنتهي
+            if ((await getBankRole(req.user.id)) !== 'super_admin') return res.json({ success: false, msg: "سداد القرض للمسؤولين الكبار فقط" });
+            const remBefore = Math.max(0, Number(loan.remaining) || 0);
+            const now = new Date();
+            // نحجز القرض أولاً بشكل ذري عشان ما ينفذ مرتين لو انضغط الزر مرتين
+            const claimed = await Loan.findOneAndUpdate(
+                { _id: id, status: { $in: ['approved', 'expired'] }, remaining: { $gt: 0 } },
+                { status: 'paid', remaining: 0, closedAt: now, closedBy: req.user.id, closeType: 'admin_pay' }
+            );
+            if (!claimed) return res.json({ success: false, msg: "هذا القرض مو نشط (يمكن انسدد قبل)" });
+
+            const taken = await Account.findOneAndUpdate({ discord: loan.discord, balance: { $gte: remBefore } }, { $inc: { balance: -remBefore } });
+            if (!taken) {
+                // الرصيد ما يكفي أو ما فيه حساب: نرجّع القرض كما كان
+                const back = { $set: { status: claimed.status, remaining: remBefore }, $unset: {} };
+                for (const k of ['closedAt', 'closedBy', 'closeType']) { if (claimed[k] != null) back.$set[k] = claimed[k]; else back.$unset[k] = 1; }
+                await Loan.findByIdAndUpdate(id, back);
+                const acc0 = await Account.findOne({ discord: loan.discord });
+                return res.json({ success: false, msg: acc0 ? `رصيد العميل (${(acc0.balance || 0).toLocaleString()} $) أقل من المتبقي (${remBefore.toLocaleString()} $)` : "حساب العميل غير موجود" });
+            }
+            await Transaction.create({
+                fromDiscord: loan.discord, fromAccount: loan.accountNumber,
+                amount: remBefore, type: 'loan_pay', note: 'سداد قرض (من الإدارة)'
+            });
+            await Notification.create({
+                discord: loan.discord,
+                message: `✅ تم سداد قرضك بالكامل من الإدارة وخصم ${remBefore.toLocaleString()} $ من رصيدك.`,
+                type: 'success'
+            });
+            await BankLog.create({
+                action: 'loan_admin_pay',
+                description: `سداد قرض ${loan.discordTag} بمبلغ ${remBefore.toLocaleString()} $ (خصم من رصيده)`,
+                performedBy: req.user.id, performedByTag: req.user.username, targetDiscord: loan.discord, targetTag: loan.discordTag,
+                meta: { loanId: String(loan._id), amount: loan.amount, remaining: remBefore }
+            });
+            bumpActivity();
+            return res.json({ success: true, msg: `تم سداد القرض وخصم ${remBefore.toLocaleString()} $ من رصيد العميل` });
+        } else if (action !== 'reject') {
+            return res.json({ success: false, msg: "إجراء غير معروف" });
         } else {
             await Loan.findByIdAndUpdate(id, { status: 'rejected' });
             await Notification.create({
@@ -2292,6 +2479,7 @@ app.post('/api/account/card/request', checkMaintenance, async (req, res) => {
         const acc = await Account.findOne({ discord: req.user.id });
         if (!acc) return res.json({ success: false, msg: "ليس لديك حساب بنكي" });
         if (acc.isFrozen) return res.json({ success: false, msg: "حسابك مجمد، لا يمكن طلب بطاقة" });
+        if (await getLoanSuspension(req.user.id)) return res.json({ success: false, msg: "🚫 خدماتك موقوفة بسبب قرض منتهي لم يُسدَّد، سدّده أولاً لتقدر تطلب بطاقة" });
 
         // فحص عدد البطاقات المسموح
         const limit = (acc.cardLimit !== -1 ? acc.cardLimit : (settings?.globalCardLimit ?? 1));
@@ -4781,16 +4969,24 @@ app.use(async (req, res) => {
                 document.getElementById('loan-pay-section').style.display = 'none';
                 return;
             }
-            const color = loan.status === 'approved' ? '#4ade80' : loan.status === 'pending' ? '#fde047' : '#fca5a5';
-            const statusText = loan.status === 'approved' ? 'نشط ✅' : loan.status === 'pending' ? 'قيد المراجعة ⏳' : 'مرفوض ❌';
+            const isExp = loan.status === 'expired';
+            const graceEnd = isExp && loan.graceEndsAt ? new Date(loan.graceEndsAt) : null;
+            const suspended = !!(graceEnd && graceEnd.getTime() <= Date.now());
+            const hasDebt = loan.status === 'approved' || isExp;
+            const color = loan.status === 'approved' ? '#4ade80' : loan.status === 'pending' ? '#fde047' : isExp ? '#fca5a5' : '#fca5a5';
+            const statusText = loan.status === 'approved' ? 'نشط ✅' : loan.status === 'pending' ? 'قيد المراجعة ⏳' : isExp ? (suspended ? 'منتهي — الخدمات موقوفة 🚫' : 'انتهت صلاحيته ⚠️') : 'مرفوض ❌';
+            let notice = '';
+            if (isExp && suspended) notice = '<p style="margin-top:8px;color:#fca5a5;font-size:.85rem;">🚫 انتهت مهلة السداد وخدماتك موقوفة: ما تقدر تحوّل ولا تطلب قرض ولا بطاقة جديدة. سدّد المتبقي وترجع الخدمات مباشرة (تقدر تستقبل حوالات بحد أقصى المتبقي عليك).</p>';
+            else if (isExp) notice = '<p style="margin-top:8px;color:#fde047;font-size:.85rem;">⚠️ انتهت صلاحية القرض. عندك مهلة للسداد لين ' + (graceEnd ? graceEnd.toLocaleString('ar-SA') : '—') + ' وإلا تُوقف خدماتك (التحويل، طلب قرض، طلب بطاقة جديدة).</p>';
             container.innerHTML = \`
                 <div class="card card-yellow">
                     <p style="font-weight:bold; color:\${color};">القرض الحالي: \${statusText}</p>
                     <p style="margin-top:8px;">المبلغ الأصلي: <b>\${loan.amount.toLocaleString()} $</b></p>
-                    \${loan.status === 'approved' ? \`<p>المتبقي للسداد: <b style="color:#fca5a5;">\${loan.remaining.toLocaleString()} $</b></p>\` : ''}
+                    \${hasDebt ? \`<p>المتبقي للسداد: <b style="color:#fca5a5;">\${loan.remaining.toLocaleString()} $</b></p>\` : ''}
+                    \${notice}
                 </div>
             \`;
-            if (loan.status === 'approved') {
+            if (hasDebt) {
                 document.getElementById('loan-pay-section').style.display = 'block';
                 document.getElementById('loan-remaining-info').innerHTML = \`المتبقي: <b style="color:#fca5a5;">\${loan.remaining.toLocaleString()} $</b>\`;
             }
