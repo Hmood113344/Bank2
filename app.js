@@ -17,7 +17,7 @@ app.use((req, res, next) => {
 
 // ── إعدادات ──────────────────────────────────────────────────────────────
 // عنوان موقع فلاش (تطبيق الويب الأساسي) — يقدر ينغيّر من متغير البيئة FLASH_URL على Render
-const FLASH_API = String(process.env.FLASH_URL || 'https://flash-gpeb.onrender.com').replace(/\/+$/, '');
+const FLASH_API = String(process.env.FLASH_URL || 'https://flash-1lp1.onrender.com').replace(/\/+$/, '');
 
 // مفتاح سرّي مشترك مع فلاش (لازم نفس القيمة بالضبط في INTERNAL_API_KEY على موقع فلاش وعلى البنك)
 // يُستخدم لتوقيع رابط الدخول من فلاش، ولتأمين الطلبات بين الموقعين. بدونه الربط يتوقف (أمان).
